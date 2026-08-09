@@ -93,6 +93,8 @@ class SignalEnsemble:
             ) / active_weight
             if composite == _ZERO:
                 return None
+            if abs(composite) - self.NORMALIZED_COST < self.MIN_AFTER_COST_STRENGTH:
+                return None
             direction = (
                 SignalDirection.LONG if composite > _ZERO else SignalDirection.SHORT
             )

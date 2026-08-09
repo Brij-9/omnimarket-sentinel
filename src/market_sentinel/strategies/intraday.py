@@ -1,12 +1,14 @@
 """Deterministic opening-range and VWAP intraday breakout."""
 
-from datetime import time, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from market_sentinel.domain.enums import Horizon, SignalDirection
-from market_sentinel.domain.models import Bar, Signal
+from market_sentinel.domain.models import Signal
 from market_sentinel.strategies.base import StrategyContext, StrategyMetadata
 from market_sentinel.strategies.indicators import vwap
+from market_sentinel.strategies.validation import bars_are_strictly_valid
 
 _ZERO = Decimal("0")
 _BASIS_POINTS = Decimal("10000")
@@ -20,19 +22,35 @@ class OpeningRangeVwapStrategy:
         *,
         session_start: time = time(9, 30),
         session_end: time = time(16),
+        session_timezone: str = "America/New_York",
         opening_range_bars: int = 6,
         closeout_buffer: timedelta = timedelta(minutes=5),
         max_spread_bps: Decimal = Decimal("15"),
         min_average_volume: Decimal = Decimal("100"),
     ) -> None:
+        if session_start.tzinfo is not None or session_end.tzinfo is not None:
+            raise ValueError("session clock values must be timezone-naive")
         if session_start >= session_end:
             raise ValueError("session_start must precede session_end")
         if type(opening_range_bars) is not int or opening_range_bars <= 0:
             raise ValueError("opening_range_bars must be positive")
-        if closeout_buffer <= timedelta(0):
+        if not isinstance(closeout_buffer, timedelta) or closeout_buffer <= timedelta(0):
             raise ValueError("closeout_buffer must be positive")
+        session_duration = datetime.combine(date.min, session_end) - datetime.combine(
+            date.min, session_start
+        )
+        if closeout_buffer >= session_duration:
+            raise ValueError("closeout_buffer must be shorter than the session duration")
+        if not isinstance(session_timezone, str) or not session_timezone.strip():
+            raise ValueError("session_timezone must name a valid IANA timezone")
+        try:
+            session_zone = ZoneInfo(session_timezone)
+        except (ValueError, ZoneInfoNotFoundError) as error:
+            raise ValueError("session_timezone must name a valid IANA timezone") from error
         self.session_start = session_start
         self.session_end = session_end
+        self.session_timezone = session_timezone
+        self.session_zone = session_zone
         self.opening_range_bars = opening_range_bars
         self.closeout_buffer = closeout_buffer
         self.max_spread_bps = _positive_decimal(max_spread_bps)
@@ -49,28 +67,40 @@ class OpeningRangeVwapStrategy:
     def evaluate(self, context: StrategyContext) -> Signal | None:
         """Evaluate the current session prefix, never prior or future session bars."""
         try:
-            if context.horizon is not Horizon.INTRADAY or not _bars_are_valid(context.bars):
+            if (
+                context.horizon is not Horizon.INTRADAY
+                or not bars_are_strictly_valid(context.bars)
+            ):
                 return None
             if context.spread_bps >= self.max_spread_bps or not context.bars:
                 return None
             current = context.bars[-1]
-            current_clock = current.at.timetz().replace(tzinfo=None)
-            cutoff = _subtract_time(self.session_end, self.closeout_buffer)
-            if not self.session_start <= current_clock < cutoff:
+            localized = tuple((bar, bar.at.astimezone(self.session_zone)) for bar in context.bars)
+            current_local = localized[-1][1]
+            session_date = current_local.date()
+            session_open = datetime.combine(
+                session_date, self.session_start, tzinfo=self.session_zone
+            )
+            session_close = datetime.combine(
+                session_date, self.session_end, tzinfo=self.session_zone
+            )
+            cutoff = session_close - self.closeout_buffer
+            if not session_open <= current_local < cutoff:
                 return None
 
-            session_bars = tuple(
-                bar
-                for bar in context.bars
-                if bar.at.date() == current.at.date()
-                and self.session_start <= bar.at.timetz().replace(tzinfo=None) < self.session_end
+            localized_session = tuple(
+                (bar, local_at)
+                for bar, local_at in localized
+                if local_at.date() == session_date
+                and session_open <= local_at < session_close
             )
             if (
-                len(session_bars) <= self.opening_range_bars
-                or session_bars[-1] != current
-                or session_bars[0].at.timetz().replace(tzinfo=None) != self.session_start
+                len(localized_session) <= self.opening_range_bars
+                or localized_session[-1][0] != current
+                or localized_session[0][1] != session_open
             ):
                 return None
+            session_bars = tuple(bar for bar, _ in localized_session)
             opening_range = session_bars[: self.opening_range_bars]
             opening_high = max(bar.high for bar in opening_range)
             opening_low = min(bar.low for bar in opening_range)
@@ -109,38 +139,11 @@ class OpeningRangeVwapStrategy:
                 research_required=False,
                 evidence_uris=(),
             )
-        except (InvalidOperation, TypeError, ValueError, ZeroDivisionError):
+        except (AttributeError, InvalidOperation, TypeError, ValueError, ZeroDivisionError):
             return None
-
-
-def _subtract_time(value: time, delta: timedelta) -> time:
-    anchor_minutes = value.hour * 60 + value.minute
-    delta_minutes = int(delta.total_seconds() // 60)
-    result = anchor_minutes - delta_minutes
-    if result < 0:
-        raise ValueError("closeout buffer exceeds session day")
-    return time(result // 60, result % 60)
 
 
 def _positive_decimal(value: Decimal) -> Decimal:
     if not isinstance(value, Decimal) or not value.is_finite() or value <= _ZERO:
         raise ValueError("strategy thresholds must be finite positive Decimals")
     return value
-
-
-def _bars_are_valid(bars: tuple[Bar, ...]) -> bool:
-    previous_at = None
-    for bar in bars:
-        prices = (bar.open, bar.high, bar.low, bar.close)
-        if (
-            any(not price.is_finite() or price <= _ZERO for price in prices)
-            or not bar.volume.is_finite()
-            or bar.volume < _ZERO
-            or bar.low > min(bar.open, bar.close)
-            or bar.high < max(bar.open, bar.close)
-            or bar.high < bar.low
-            or (previous_at is not None and bar.at <= previous_at)
-        ):
-            return False
-        previous_at = bar.at
-    return True

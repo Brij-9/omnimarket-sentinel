@@ -97,6 +97,26 @@ def test_ensemble_rejects_weak_after_cost_signal() -> None:
     )
 
 
+def test_research_cannot_promote_a_deterministically_ineligible_signal() -> None:
+    """Maximum-support research must not create an after-cost edge absent in the composite."""
+    weak = _signal("swing-breakout", "0.29")
+    supportive = research_packet(instrument_id="AAPL@alpaca", confidence="1")
+
+    ensemble = SignalEnsemble()
+    assert ensemble.combine([weak], research=None) is None
+    assert ensemble.combine([weak], research=supportive) is None
+
+
+def test_adverse_research_can_suppress_a_deterministically_eligible_signal() -> None:
+    """The post-adjustment threshold must still suppress a weakened eligible composite."""
+    eligible = _signal("swing-breakout", "0.35")
+    adverse = research_packet(instrument_id="AAPL@alpaca", confidence="0")
+
+    ensemble = SignalEnsemble()
+    assert ensemble.combine([eligible], research=None) is not None
+    assert ensemble.combine([eligible], research=adverse) is None
+
+
 def test_ensemble_only_requires_research_for_selected_strategy() -> None:
     """A non-selected strategy must not impose its research policy on the winner."""
     selected_requires = [_signal("swing-breakout", "0.8", research_required=True)]

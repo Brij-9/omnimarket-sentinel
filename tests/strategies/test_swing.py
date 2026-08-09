@@ -113,3 +113,19 @@ def test_swing_fails_closed_for_malformed_ohlc() -> None:
     malformed[-1] = malformed[-1].model_copy(update={"high": Decimal("NaN")})
 
     assert SwingBreakoutStrategy().evaluate(_context(bars=tuple(malformed))) is None
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"close": 179.25},
+        {"volume": "1000"},
+        {"at": "2026-08-10T10:00:00Z"},
+    ],
+)
+def test_swing_abstains_for_bypassed_malformed_bar_fields(update: dict[str, object]) -> None:
+    """Bypassed model validation must never make malformed fields raise from evaluation."""
+    malformed = list(trending_bars(80))
+    malformed[-1] = malformed[-1].model_copy(update=update)
+
+    assert SwingBreakoutStrategy().evaluate(_context(bars=tuple(malformed))) is None

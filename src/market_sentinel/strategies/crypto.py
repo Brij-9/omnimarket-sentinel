@@ -3,9 +3,10 @@
 from decimal import Decimal, InvalidOperation
 
 from market_sentinel.domain.enums import Horizon, SignalDirection
-from market_sentinel.domain.models import Bar, Signal
+from market_sentinel.domain.models import Signal
 from market_sentinel.strategies.base import StrategyContext, StrategyMetadata
 from market_sentinel.strategies.indicators import atr
+from market_sentinel.strategies.validation import bars_are_strictly_valid
 
 _ZERO = Decimal("0")
 
@@ -42,7 +43,10 @@ class CryptoVolatilityBreakoutStrategy:
         try:
             if context.horizon is not Horizon.SWING or len(context.bars) < 21:
                 return None
-            if not _bars_are_valid(context.bars) or context.spread_bps >= self.max_spread_bps:
+            if (
+                not bars_are_strictly_valid(context.bars)
+                or context.spread_bps >= self.max_spread_bps
+            ):
                 return None
             average_true_range = atr(context.bars, 14)
             current = context.bars[-1]
@@ -77,7 +81,7 @@ class CryptoVolatilityBreakoutStrategy:
                 research_required=False,
                 evidence_uris=(),
             )
-        except (InvalidOperation, TypeError, ValueError, ZeroDivisionError):
+        except (AttributeError, InvalidOperation, TypeError, ValueError, ZeroDivisionError):
             return None
 
 
@@ -85,21 +89,3 @@ def _positive_decimal(value: Decimal) -> Decimal:
     if not isinstance(value, Decimal) or not value.is_finite() or value <= _ZERO:
         raise ValueError("strategy thresholds must be finite positive Decimals")
     return value
-
-
-def _bars_are_valid(bars: tuple[Bar, ...]) -> bool:
-    previous_at = None
-    for bar in bars:
-        prices = (bar.open, bar.high, bar.low, bar.close)
-        if (
-            any(not price.is_finite() or price <= _ZERO for price in prices)
-            or not bar.volume.is_finite()
-            or bar.volume < _ZERO
-            or bar.low > min(bar.open, bar.close)
-            or bar.high < max(bar.open, bar.close)
-            or bar.high < bar.low
-            or (previous_at is not None and bar.at <= previous_at)
-        ):
-            return False
-        previous_at = bar.at
-    return True

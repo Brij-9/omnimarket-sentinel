@@ -2,6 +2,8 @@
 
 from decimal import Decimal
 
+import pytest
+
 from market_sentinel.domain.enums import Horizon, SignalDirection
 from market_sentinel.strategies.base import StrategyContext
 from market_sentinel.strategies.crypto import CryptoVolatilityBreakoutStrategy
@@ -98,5 +100,21 @@ def test_crypto_fails_closed_for_malformed_prices() -> None:
     """Nonfinite market input must never generate a spot signal."""
     malformed = list(_context().bars)
     malformed[-1] = malformed[-1].model_copy(update={"close": Decimal("NaN")})
+
+    assert CryptoVolatilityBreakoutStrategy().evaluate(_context(bars=tuple(malformed))) is None
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"close": 139.25},
+        {"volume": "1000"},
+        {"at": "2026-08-10T10:00:00Z"},
+    ],
+)
+def test_crypto_abstains_for_bypassed_malformed_bar_fields(update: dict[str, object]) -> None:
+    """Bypassed model validation must never make malformed fields raise from evaluation."""
+    malformed = list(_context().bars)
+    malformed[-1] = malformed[-1].model_copy(update=update)
 
     assert CryptoVolatilityBreakoutStrategy().evaluate(_context(bars=tuple(malformed))) is None
