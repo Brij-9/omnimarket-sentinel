@@ -495,6 +495,54 @@ def test_snapshot_cutoff_and_latest_source_date_are_validated() -> None:
         _provider(tauric_state(), trace).analyze(instrument(), AS_OF)
 
 
+def test_normal_pinned_snapshot_accepts_two_ascending_recent_rows() -> None:
+    packet = _provider(tauric_state(), tauric_trace()).analyze(instrument(), AS_OF)
+
+    assert packet.evidence[0].published_at == datetime(2026, 8, 8, tzinfo=UTC)
+
+
+def test_snapshot_reversed_recent_rows_are_rejected() -> None:
+    trace = tauric_trace()
+    trace[2]["content"] = trace[2]["content"].replace(
+        "| 2026-08-06 | 221.00 |\n| 2026-08-07 | 223.00 |",
+        "| 2026-08-07 | 223.00 |\n| 2026-08-06 | 221.00 |",
+    )
+
+    with pytest.raises(ResearchUnavailable, match=re.escape(INVALID_RESEARCH_STATE_REASON)):
+        _provider(tauric_state(), trace).analyze(instrument(), AS_OF)
+
+
+def test_snapshot_duplicate_recent_row_is_rejected() -> None:
+    trace = tauric_trace()
+    trace[2]["content"] = trace[2]["content"].replace(
+        "| 2026-08-06 | 221.00 |", "| 2026-08-07 | 221.00 |"
+    )
+
+    with pytest.raises(ResearchUnavailable, match=re.escape(INVALID_RESEARCH_STATE_REASON)):
+        _provider(tauric_state(), trace).analyze(instrument(), AS_OF)
+
+
+def test_snapshot_last_recent_row_must_match_latest() -> None:
+    trace = tauric_trace()
+    trace[2]["content"] = trace[2]["content"].replace(
+        "| 2026-08-06 | 221.00 |\n| 2026-08-07 | 223.00 |",
+        "| 2026-08-05 | 219.00 |\n| 2026-08-06 | 221.00 |",
+    )
+
+    with pytest.raises(ResearchUnavailable, match=re.escape(INVALID_RESEARCH_STATE_REASON)):
+        _provider(tauric_state(), trace).analyze(instrument(), AS_OF)
+
+
+def test_snapshot_future_recent_row_is_rejected() -> None:
+    trace = tauric_trace()
+    trace[2]["content"] = trace[2]["content"].replace(
+        "| 2026-08-07 | 223.00 |", "| 2026-08-08 | 223.00 |"
+    )
+
+    with pytest.raises(ResearchUnavailable, match=re.escape(INVALID_RESEARCH_STATE_REASON)):
+        _provider(tauric_state(), trace).analyze(instrument(), AS_OF)
+
+
 @pytest.mark.parametrize(
     "field", ["news_report", "sentiment_report", "fundamentals_report", "past_context"]
 )

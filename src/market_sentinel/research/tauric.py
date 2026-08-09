@@ -520,10 +520,10 @@ def _validated_snapshot_trace(entry: Mapping[str, Any], symbol: str, cutoff: dat
             recent_dates.append(observed)
     if (
         not recent_dates
-        or recent_dates[0] != latest
+        or recent_dates[-1] != latest
         or len(recent_dates) != len(set(recent_dates))
         or any(
-            current >= previous
+            current <= previous
             for previous, current in zip(recent_dates, recent_dates[1:], strict=False)
         )
     ):
