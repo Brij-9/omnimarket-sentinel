@@ -1,6 +1,7 @@
 """Append-only repository for immutable audit events."""
 
 import json
+import math
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -11,6 +12,12 @@ from sqlalchemy import select, update
 from sqlalchemy.engine import Engine
 
 from market_sentinel.storage.db import event_sequence, events
+
+_MAX_PAYLOAD_DEPTH = 16
+_MAX_PAYLOAD_NODES = 4_096
+_MAX_COLLECTION_ITEMS = 512
+_MAX_SCALAR_BYTES = 4_096
+_MAX_TOTAL_SCALAR_BYTES = 65_536
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +74,7 @@ class EventStore:
                 raise ValueError("event identity fields must be nonempty")
             if item.occurred_at.tzinfo is None or item.occurred_at.utcoffset() is None:
                 raise ValueError("occurred_at must be timezone-aware")
+            validate_event_payload(item.payload)
             canonical_payload = json.dumps(
                 dict(item.payload),
                 allow_nan=False,
@@ -108,19 +116,72 @@ class EventStore:
             .order_by(events.c.sequence)
         )
         with self._engine.connect() as connection:
-            rows = connection.execute(statement).mappings().all()
-        for row in rows:
-            payload = json.loads(cast(str, row["payload_json"]))
-            if not isinstance(payload, dict):
-                raise ValueError("event payload must be a JSON object")
-            yield EventRecord(
-                event_id=cast(str, row["event_id"]),
-                kind=cast(str, row["kind"]),
-                aggregate_id=cast(str, row["aggregate_id"]),
-                payload=_freeze_mapping(payload),
-                occurred_at=cast(datetime, row["occurred_at"]).astimezone(UTC),
-                sequence=cast(int, row["sequence"]),
-            )
+            for row in connection.execute(statement).mappings():
+                payload = json.loads(cast(str, row["payload_json"]))
+                if not isinstance(payload, dict):
+                    raise ValueError("event payload must be a JSON object")
+                validate_event_payload(payload)
+                yield EventRecord(
+                    event_id=cast(str, row["event_id"]),
+                    kind=cast(str, row["kind"]),
+                    aggregate_id=cast(str, row["aggregate_id"]),
+                    payload=_freeze_mapping(payload),
+                    occurred_at=cast(datetime, row["occurred_at"]).astimezone(UTC),
+                    sequence=cast(int, row["sequence"]),
+                )
+
+
+def validate_event_payload(payload: Mapping[str, object]) -> None:
+    """Iteratively reject resource-hostile values before canonical JSON work."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("event payload must be a bounded mapping")
+    stack: list[tuple[object, int]] = [(payload, 0)]
+    seen_containers: set[int] = set()
+    nodes = 0
+    scalar_bytes = 0
+    while stack:
+        value, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_PAYLOAD_NODES or depth > _MAX_PAYLOAD_DEPTH:
+            raise ValueError("event payload exceeds bounded canonical JSON contract")
+        if isinstance(value, Mapping):
+            identity = id(value)
+            if identity in seen_containers or len(value) > _MAX_COLLECTION_ITEMS:
+                raise ValueError("event payload exceeds bounded canonical JSON contract")
+            seen_containers.add(identity)
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError("event payload keys must be strings")
+                key_bytes = len(key.encode("utf-8"))
+                if key_bytes > _MAX_SCALAR_BYTES:
+                    raise ValueError("event payload exceeds bounded canonical JSON contract")
+                scalar_bytes += key_bytes
+                stack.append((item, depth + 1))
+        elif isinstance(value, (list, tuple)):
+            identity = id(value)
+            if identity in seen_containers or len(value) > _MAX_COLLECTION_ITEMS:
+                raise ValueError("event payload exceeds bounded canonical JSON contract")
+            seen_containers.add(identity)
+            stack.extend((item, depth + 1) for item in value)
+        elif value is None or type(value) is bool:
+            scalar_bytes += 4
+        elif type(value) is int:
+            if value.bit_length() > 63:
+                raise ValueError("event payload integer exceeds bounded range")
+            scalar_bytes += len(str(value))
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("event payload float must be finite")
+            scalar_bytes += len(repr(value))
+        elif isinstance(value, str):
+            item_bytes = len(value.encode("utf-8"))
+            if item_bytes > _MAX_SCALAR_BYTES:
+                raise ValueError("event payload exceeds bounded canonical JSON contract")
+            scalar_bytes += item_bytes
+        else:
+            raise ValueError("event payload contains a non-JSON scalar")
+        if scalar_bytes > _MAX_TOTAL_SCALAR_BYTES:
+            raise ValueError("event payload exceeds bounded canonical JSON contract")
 
 
 def _freeze_mapping(value: Mapping[str, object]) -> Mapping[str, object]:

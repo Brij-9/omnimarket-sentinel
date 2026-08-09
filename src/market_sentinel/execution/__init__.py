@@ -1,7 +1,11 @@
 """Durable order states and deterministic paper execution."""
 
 from market_sentinel.execution.base import BrokerAdapter, BrokerCapabilities
-from market_sentinel.execution.paper import DuplicateIntentConflict, PaperBroker
+from market_sentinel.execution.paper import (
+    DuplicateIntentConflict,
+    PaperBroker,
+    SessionHead,
+)
 from market_sentinel.execution.state_machine import (
     InvalidOrderTransition,
     OrderStateMachine,
@@ -16,4 +20,5 @@ __all__ = [
     "OrderStateMachine",
     "OrderTransitionEvent",
     "PaperBroker",
+    "SessionHead",
 ]

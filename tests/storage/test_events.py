@@ -158,3 +158,29 @@ def test_audit_record_many_persists_first_class_redacted_rows_at_supplied_times(
         ("fill", second_at),
     ]
     assert rows[0].payload["api_key"] == "[REDACTED]"
+
+
+@pytest.mark.parametrize("payload_kind", ["huge_scalar", "deep", "cycle"])
+def test_event_store_rejects_resource_hostile_payloads_before_json(
+    payload_kind: str,
+) -> None:
+    """Payload bounds fail closed without recursive JSON allocation or mutation."""
+    store = EventStore(create_engine_and_schema("sqlite+pysqlite:///:memory:"))
+    at = datetime(2026, 8, 9, 10, tzinfo=UTC)
+    if payload_kind == "huge_scalar":
+        payload: dict[str, object] = {"value": "x" * 70_000}
+    elif payload_kind == "deep":
+        payload = {}
+        cursor = payload
+        for _ in range(40):
+            nested: dict[str, object] = {}
+            cursor["next"] = nested
+            cursor = nested
+    else:
+        payload = {}
+        payload["self"] = payload
+
+    with pytest.raises(ValueError, match="payload"):
+        store.append("hostile", "recorded", "aggregate", payload, at)
+
+    assert tuple(store.stream("aggregate")) == ()
