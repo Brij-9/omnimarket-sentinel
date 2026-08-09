@@ -1,6 +1,6 @@
 """Validated immutable records shared by market, research, risk, and broker code."""
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Self
 
@@ -24,8 +24,10 @@ class FrozenModel(BaseModel):
     @field_validator("*", mode="after")
     @classmethod
     def require_aware_datetimes(cls, value: Any) -> Any:
-        if isinstance(value, datetime) and value.tzinfo is None:
-            raise ValueError("datetime fields must be timezone-aware")
+        if isinstance(value, datetime):
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("datetime fields must be timezone-aware")
+            return value.astimezone(UTC)
         return value
 
 

@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 
 import pytest
@@ -12,6 +12,17 @@ from market_sentinel.domain.models import (
     OrderIntent,
     ResearchPacket,
 )
+
+
+class UndefinedOffsetTimezone(tzinfo):
+    def utcoffset(self, dt: datetime | None) -> None:
+        return None
+
+    def dst(self, dt: datetime | None) -> None:
+        return None
+
+    def tzname(self, dt: datetime | None) -> None:
+        return None
 
 
 def test_instrument_rejects_nonpositive_precision() -> None:
@@ -47,6 +58,47 @@ def test_snapshot_staleness_uses_source_timestamp() -> None:
         max_age_seconds=60,
     )
     assert snapshot.is_stale(now) is True
+
+
+def test_aware_datetimes_normalize_to_utc() -> None:
+    india = timezone(timedelta(hours=5, minutes=30))
+    source_at = datetime(2026, 8, 9, 10, tzinfo=india)
+    bar = Bar(
+        at=source_at,
+        open=Decimal("10"),
+        high=Decimal("11"),
+        low=Decimal("9"),
+        close=Decimal("10.5"),
+        volume=Decimal("1000"),
+    )
+    snapshot = MarketSnapshot(
+        instrument_id="AAPL@alpaca",
+        observed_at=source_at,
+        source_at=source_at,
+        bars=(bar,),
+        provider="fixture",
+        max_age_seconds=60,
+    )
+    expected = datetime(2026, 8, 9, 4, 30, tzinfo=UTC)
+
+    assert bar.at == expected
+    assert bar.at.tzinfo is UTC
+    assert snapshot.observed_at == expected
+    assert snapshot.observed_at.tzinfo is UTC
+    assert snapshot.source_at == expected
+    assert snapshot.source_at.tzinfo is UTC
+
+
+def test_datetime_with_undefined_offset_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        Bar(
+            at=datetime(2026, 8, 9, 10, tzinfo=UndefinedOffsetTimezone()),
+            open=Decimal("10"),
+            high=Decimal("11"),
+            low=Decimal("9"),
+            close=Decimal("10.5"),
+            volume=Decimal("1000"),
+        )
 
 
 def test_models_are_immutable() -> None:
