@@ -6,15 +6,20 @@ import inspect
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
 from market_sentinel.backtest.engine import CostModel, FillModel
+from market_sentinel.domain.clock import FrozenClock
 from market_sentinel.domain.enums import AssetClass, OrderStatus, OrderType, Side
 from market_sentinel.domain.models import Bar, Instrument, MarketSnapshot, OrderIntent
-from market_sentinel.execution.base import BrokerAdapter
+from market_sentinel.execution.base import BrokerAdapter, BrokerCapabilities
 from market_sentinel.execution.paper import DuplicateIntentConflict, PaperBroker
 from market_sentinel.execution.state_machine import InvalidOrderTransition
+from market_sentinel.operations.audit import AuditEvent, AuditLog
+from market_sentinel.storage.db import create_engine_and_schema
+from market_sentinel.storage.events import EventStore
 
 AT = datetime(2026, 8, 9, 10, tzinfo=UTC)
 
@@ -27,18 +32,12 @@ class _FailingAudit:
         self.occurrence = occurrence
         self._seen = 0
 
-    def record(
-        self,
-        event_id: str,
-        kind: str,
-        aggregate_id: str,
-        payload: dict[str, object],
-    ) -> None:
-        del event_id, aggregate_id, payload
-        if kind == self.failing_kind:
-            self._seen += 1
-        if kind == self.failing_kind and self._seen == self.occurrence:
-            raise RuntimeError("audit unavailable")
+    def record_many(self, events: tuple[AuditEvent, ...]) -> None:
+        for event in events:
+            if event.kind == self.failing_kind:
+                self._seen += 1
+            if event.kind == self.failing_kind and self._seen == self.occurrence:
+                raise RuntimeError("audit unavailable")
 
 
 def _instrument(
@@ -110,6 +109,7 @@ def _intent(
     notional: Decimal | None = None,
     order_type: OrderType = OrderType.MARKET,
     limit_price: Decimal | None = None,
+    trigger_price: Decimal | None = None,
     stop_loss: Decimal | None = Decimal("90"),
     take_profit: Decimal | None = Decimal("120"),
     created_at: datetime = AT,
@@ -123,6 +123,7 @@ def _intent(
         notional=notional,
         order_type=order_type,
         limit_price=limit_price,
+        trigger_price=trigger_price,
         stop_loss=stop_loss,
         take_profit=take_profit,
         time_in_force="day",
@@ -179,11 +180,38 @@ def test_paper_broker_satisfies_immutable_credential_free_contract() -> None:
     with pytest.raises(FrozenInstanceError):
         capabilities.supports_leverage = True  # type: ignore[misc]
     public_surface = " ".join(
-        [str(inspect.signature(PaperBroker)), *vars(broker), repr(broker)]
+        [
+            str(inspect.signature(PaperBroker)),
+            *vars(broker),
+            *dir(PaperBroker),
+            repr(broker),
+        ]
     ).lower()
-    assert "api_key" not in public_surface
-    assert "secret" not in public_surface
-    assert "credential" not in public_surface
+    for credential_name in ("api_key", "secret", "credential", "password", "token"):
+        assert credential_name not in public_surface
+
+
+def test_broker_capabilities_reject_whitespace_names_and_non_bool_flags() -> None:
+    """Truthiness must not make a malformed live capability appear enabled."""
+    values = {
+        "broker": "paper",
+        "supported_asset_classes": frozenset({AssetClass.EQUITY}),
+        "supported_order_types": frozenset({OrderType.MARKET}),
+        "supports_fractional_quantity": True,
+        "supports_notional_orders": True,
+        "supports_partial_fills": True,
+        "supports_shorting": False,
+        "supports_leverage": False,
+        "supports_derivatives": False,
+        "supports_cancel": True,
+        "is_paper": True,
+    }
+    with pytest.raises(ValueError, match="broker"):
+        BrokerCapabilities(**(values | {"broker": " paper "}))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="bool"):
+        BrokerCapabilities(
+            **(values | {"supports_leverage": 1})  # type: ignore[arg-type]
+        )
 
 
 def test_market_order_never_fills_on_submission_snapshot_and_uses_next_event_costs() -> None:
@@ -296,7 +324,12 @@ def test_stop_order_triggers_and_fills_only_on_a_subsequent_event() -> None:
     bar0 = _bar(0, open_price="100", high="110", low="99")
     broker = PaperBroker(starting_cash=Decimal("1000"))
     order = broker.submit(
-        _intent(order_type=OrderType.STOP, stop_loss=Decimal("105"), take_profit=Decimal("120")),
+        _intent(
+            order_type=OrderType.STOP,
+            trigger_price=Decimal("105"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("120"),
+        ),
         _snapshot(bar0),
     )
 
@@ -317,7 +350,8 @@ def test_stop_limit_uses_separate_later_trigger_and_cross_events() -> None:
     order = broker.submit(
         _intent(
             order_type=OrderType.STOP_LIMIT,
-            stop_loss=Decimal("105"),
+            trigger_price=Decimal("105"),
+            stop_loss=Decimal("90"),
             limit_price=Decimal("106"),
             take_profit=Decimal("120"),
         ),
@@ -421,9 +455,15 @@ def test_cancel_reject_unknown_and_expire_paths_are_terminal_and_audited() -> No
         OrderStatus.UNKNOWN,
         OrderStatus.EXPIRED,
     ]
-    for terminal in (cancelled, rejected, unknown, expired):
+    for terminal in (cancelled, rejected, expired):
         with pytest.raises(InvalidOrderTransition):
             broker.cancel(terminal.order_id, at=AT + timedelta(seconds=2))
+    reconciled = broker.reconcile_unknown(
+        unknown.order_id,
+        OrderStatus.CANCELLED,
+        at=AT + timedelta(seconds=2),
+    )
+    assert reconciled.status is OrderStatus.CANCELLED
     transitions = [event for event in broker.audit_events if event.kind == "paper.order.transition"]
     assert {event.new_status for event in transitions[-4:]} == {
         OrderStatus.CANCELLED,
@@ -452,7 +492,7 @@ def test_order_expires_before_a_later_event_can_fill_it() -> None:
     [
         _intent().model_copy(update={"quantity": Decimal("NaN")}),
         _intent().model_copy(update={"quantity": Decimal("0")}),
-        _intent(order_type=OrderType.LIMIT, limit_price=None),
+        _intent().model_copy(update={"order_type": OrderType.LIMIT}),
         _intent().model_copy(update={"expires_at": AT - timedelta(seconds=1)}),
     ],
 )
@@ -547,7 +587,7 @@ def test_failed_fill_audit_is_atomic_for_order_cash_fills_and_internal_events() 
     bar0 = _bar(0, open_price="100")
     broker = PaperBroker(
         starting_cash=Decimal("1000"),
-        audit_log=_FailingAudit("paper.audit.batch", occurrence=2),
+        audit_log=_FailingAudit("paper.order.fill"),
     )
     order = broker.submit(_intent(), _snapshot(bar0))
     before_events = broker.audit_events
@@ -566,7 +606,7 @@ def test_failed_submit_audit_batch_creates_no_order_or_internal_event() -> None:
     """A lifecycle audit outage must not leave a partially acknowledged local order."""
     broker = PaperBroker(
         starting_cash=Decimal("1000"),
-        audit_log=_FailingAudit("paper.audit.batch"),
+        audit_log=_FailingAudit("paper.order.submitted"),
     )
 
     with pytest.raises(RuntimeError, match="audit unavailable"):
@@ -629,12 +669,16 @@ def test_fill_and_transition_audit_payloads_are_safe_and_complete() -> None:
     assert fill_event.new_status is OrderStatus.FILLED
     assert fill_event.occurred_at == AT + timedelta(minutes=1)
     assert fill_event.payload == {
-        "fill_id": "paper-fill-1",
+        "fill_id": broker.fills[0].fill_id,
         "quantity": "1",
         "price": "100",
         "fee": "0",
         "cumulative_filled_quantity": "1",
         "remaining_quantity": "0",
+        "requested_notional": None,
+        "cumulative_filled_notional": "100",
+        "remaining_notional": None,
+        "cumulative_fees": "0",
     }
     assert "secret" not in repr(broker.audit_events).lower()
 
@@ -654,4 +698,412 @@ def test_notional_order_never_exceeds_requested_notional() -> None:
 
     assert fill.quantity == Decimal("0.10")
     assert fill.quantity * fill.price <= Decimal("10.05")
+    assert broker.get_order(order.order_id).status is OrderStatus.PARTIALLY_FILLED
+
+
+def test_stop_partial_fill_latches_trigger_and_remainder_becomes_market() -> None:
+    """A triggered stop must not require the trigger to cross again after a partial fill."""
+    bar0 = _bar(0, open_price="100")
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    order = broker.submit(
+        _intent(
+            order_type=OrderType.STOP,
+            trigger_price=Decimal("105"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("120"),
+        ),
+        _snapshot(bar0),
+    )
+    trigger = _snapshot(bar0, _bar(1, open_price="106", high="107", low="105", volume="0.4"))
+    [first] = broker.on_snapshot(trigger, _instrument())
+    later = _snapshot(
+        *trigger.bars,
+        _bar(2, open_price="104", high="104", low="103", volume="1"),
+    )
+    [second] = broker.on_snapshot(later, _instrument())
+
+    assert (first.quantity, second.quantity) == (Decimal("0.4"), Decimal("0.6"))
     assert broker.get_order(order.order_id).status is OrderStatus.FILLED
+    trigger_events = [
+        event for event in broker.audit_events if event.kind == "paper.order.stop_triggered"
+    ]
+    assert len(trigger_events) == 1
+    assert trigger_events[0].payload["trigger_price"] == "105"
+
+
+def test_event_liquidity_budget_is_shared_across_all_sorted_orders() -> None:
+    """Reusing full bar volume per order would create impossible aggregate liquidity."""
+    bar0 = _bar(0, open_price="100")
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    orders = [
+        broker.submit(_intent(intent_id=f"liquidity-{index}"), _snapshot(bar0))
+        for index in range(2)
+    ]
+
+    fills = broker.on_snapshot(
+        _snapshot(bar0, _bar(1, open_price="100", volume="1")),
+        _instrument(),
+    )
+
+    assert sum((fill.quantity for fill in fills), Decimal("0")) == Decimal("1")
+    assert sum(
+        (broker.get_order(order.order_id).filled_quantity for order in orders),
+        Decimal("0"),
+    ) == Decimal("1")
+
+
+def test_notional_residual_is_retained_for_a_later_lower_price() -> None:
+    """Current-price lot dust may become executable when a later price is lower."""
+    bar0 = _bar(0, open_price="100")
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    order = broker.submit(
+        _intent(
+            quantity=None,
+            notional=Decimal("19"),
+            stop_loss=Decimal("70"),
+        ),
+        _snapshot(bar0),
+    )
+    first_snapshot = _snapshot(bar0, _bar(1, open_price="100", volume="0.1"))
+    [first] = broker.on_snapshot(first_snapshot, _instrument())
+    assert first.quantity == Decimal("0.1")
+    assert broker.get_order(order.order_id).status is OrderStatus.PARTIALLY_FILLED
+
+    lower = _snapshot(*first_snapshot.bars, _bar(2, open_price="80", volume="0.1"))
+    [second] = broker.on_snapshot(lower, _instrument())
+
+    assert second.quantity == Decimal("0.1")
+    assert broker.get_order(order.order_id).status is OrderStatus.PARTIALLY_FILLED
+    fill_events = [event for event in broker.audit_events if event.kind == "paper.order.fill"]
+    assert fill_events[-1].payload["requested_notional"] == "19"
+    assert fill_events[-1].payload["cumulative_filled_notional"] == "18.0"
+    assert fill_events[-1].payload["remaining_notional"] == "1.0"
+    assert fill_events[-1].payload["cumulative_fees"] == "0.0"
+
+
+def test_unknown_order_can_only_be_resolved_by_reconciliation() -> None:
+    """UNKNOWN must reconcile to broker truth without any resubmission transition."""
+    bar0 = _bar(0, open_price="100")
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    order = broker.submit(_intent(), _snapshot(bar0))
+    unknown = broker.mark_unknown(order.order_id, at=AT + timedelta(seconds=1))
+
+    with pytest.raises(InvalidOrderTransition):
+        broker.reconcile_unknown(
+            unknown.order_id,
+            OrderStatus.SUBMITTING,
+            at=AT + timedelta(seconds=2),
+        )
+    resolved = broker.reconcile_unknown(
+        unknown.order_id,
+        OrderStatus.ACKNOWLEDGED,
+        at=AT + timedelta(seconds=2),
+    )
+
+    assert resolved.status is OrderStatus.ACKNOWLEDGED
+
+
+def test_protocol_exposes_client_lookup_and_deterministic_order_lists() -> None:
+    """Task 14 reconciliation needs stable client lookup and ordered open-order discovery."""
+    bar0 = _bar(0, open_price="100")
+    broker: BrokerAdapter = PaperBroker(starting_cash=Decimal("1000"))
+    first = broker.submit(_intent(intent_id="list-2"), _snapshot(bar0))
+    second = broker.submit(_intent(intent_id="list-1"), _snapshot(bar0))
+
+    assert broker.get_order_by_client_id("list-2") == first
+    assert broker.list_orders() == tuple(sorted((first, second), key=lambda item: item.order_id))
+    assert broker.open_orders() == broker.list_orders()
+
+
+def test_observation_time_drives_expiry_before_source_bar_fill() -> None:
+    """A source bar from before expiry cannot execute when observed after expiry."""
+    bar0 = _bar(0, open_price="100")
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    order = broker.submit(
+        _intent(expires_at=AT + timedelta(minutes=1, seconds=30)),
+        _snapshot(bar0),
+    )
+    source_bar = _bar(1, open_price="100")
+    observed_after_expiry = _snapshot(
+        bar0,
+        source_bar,
+        observed_at=AT + timedelta(minutes=2),
+        max_age_seconds=60,
+    )
+
+    assert broker.on_snapshot(observed_after_expiry, _instrument()) == ()
+    expired = broker.get_order(order.order_id)
+    assert expired.status is OrderStatus.EXPIRED
+    assert expired.updated_at == AT + timedelta(minutes=2)
+    assert broker.audit_events[-1].occurred_at == AT + timedelta(minutes=2)
+
+
+def test_fill_and_audit_time_are_observation_time_not_source_time() -> None:
+    """Paper evidence must record when data became available, not its provider source stamp."""
+    bar0 = _bar(0, open_price="100")
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    broker.submit(_intent(), _snapshot(bar0))
+    source_bar = _bar(1, open_price="100")
+    observed = AT + timedelta(minutes=1, seconds=20)
+    [fill] = broker.on_snapshot(
+        _snapshot(bar0, source_bar, observed_at=observed, max_age_seconds=30),
+        _instrument(),
+    )
+
+    assert fill.filled_at == observed
+    assert broker.audit_events[-1].occurred_at == observed
+
+
+def test_same_time_multi_instrument_batch_is_permutation_invariant() -> None:
+    """Shared cash allocation must not depend on caller input order."""
+    aapl = _instrument(instrument_id="AAPL@alpaca")
+    msft = _instrument(instrument_id="MSFT@alpaca")
+    aapl0 = _snapshot(_bar(0, open_price="100"), instrument_id="AAPL@alpaca")
+    msft0 = _snapshot(_bar(0, open_price="100"), instrument_id="MSFT@alpaca")
+    event_aapl = _snapshot(
+        *aapl0.bars,
+        _bar(1, open_price="100"),
+        instrument_id="AAPL@alpaca",
+    )
+    event_msft = _snapshot(
+        *msft0.bars,
+        _bar(1, open_price="100"),
+        instrument_id="MSFT@alpaca",
+    )
+
+    outcomes = []
+    for batch in (
+        ((event_aapl, aapl), (event_msft, msft)),
+        ((event_msft, msft), (event_aapl, aapl)),
+    ):
+        broker = PaperBroker(starting_cash=Decimal("100"))
+        broker.submit(_intent(intent_id="aapl", instrument_id="AAPL@alpaca"), aapl0)
+        broker.submit(_intent(intent_id="msft", instrument_id="MSFT@alpaca"), msft0)
+        fills = broker.on_snapshots(batch)
+        outcomes.append(
+            (
+                tuple((fill.instrument_id, fill.quantity, fill.price) for fill in fills),
+                tuple((order.client_order_id, order.status) for order in broker.list_orders()),
+                broker.cash,
+            )
+        )
+
+    assert outcomes[0] == outcomes[1]
+    assert len(outcomes[0][0]) == 1
+
+
+def test_global_event_regression_rejects_without_mutation() -> None:
+    """A past cross-instrument event must not value prior cash with future prices."""
+    aapl = _instrument(instrument_id="AAPL@alpaca")
+    msft = _instrument(instrument_id="MSFT@alpaca")
+    aapl0 = _snapshot(_bar(0, open_price="100"), instrument_id="AAPL@alpaca")
+    msft0 = _snapshot(_bar(0, open_price="100"), instrument_id="MSFT@alpaca")
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    aapl_order = broker.submit(_intent(intent_id="aapl", instrument_id="AAPL@alpaca"), aapl0)
+    broker.submit(_intent(intent_id="msft", instrument_id="MSFT@alpaca"), msft0)
+    later = _snapshot(
+        *msft0.bars,
+        _bar(2, open_price="100"),
+        instrument_id="MSFT@alpaca",
+    )
+    broker.on_snapshot(later, msft)
+    before = (broker.list_orders(), broker.fills, broker.cash, broker.audit_events)
+    earlier = _snapshot(
+        *aapl0.bars,
+        _bar(1, open_price="100"),
+        instrument_id="AAPL@alpaca",
+    )
+
+    with pytest.raises(ValueError, match="global chronology"):
+        broker.on_snapshot(earlier, aapl)
+
+    assert (broker.list_orders(), broker.fills, broker.cash, broker.audit_events) == before
+    assert broker.get_order(aapl_order.order_id).status is OrderStatus.ACKNOWLEDGED
+
+
+class _RecordManyFailure:
+    def __init__(self, *, fail_on: int) -> None:
+        self.fail_on = fail_on
+        self.calls = 0
+
+    def record_many(self, events: tuple[AuditEvent, ...]) -> None:
+        del events
+        self.calls += 1
+        if self.calls == self.fail_on:
+            raise RuntimeError("record_many failed")
+
+
+def test_later_invalid_order_rolls_back_entire_snapshot_then_retry_is_exactly_once() -> None:
+    """One later validation error must not retain an earlier order fill."""
+    bar0 = _bar(0, open_price="100")
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    valid = broker.submit(_intent(intent_id="valid-a", quantity=Decimal("0.1")), _snapshot(bar0))
+    invalid = broker.submit(
+        _intent(intent_id="bad-z", quantity=Decimal("0.15")),
+        _snapshot(bar0),
+    )
+    assert valid.order_id < invalid.order_id
+    event = _snapshot(bar0, _bar(1, open_price="100"))
+    before = (broker.list_orders(), broker.fills, broker.cash, broker.audit_events)
+
+    with pytest.raises(ValueError, match="step"):
+        broker.on_snapshot(event, _instrument(quantity_step=Decimal("0.1")))
+
+    assert (broker.list_orders(), broker.fills, broker.cash, broker.audit_events) == before
+    fills = broker.on_snapshot(event, _instrument(quantity_step=Decimal("0.05")))
+    assert len(fills) == 2
+    assert len(broker.fills) == 2
+
+
+def test_record_many_failure_rolls_back_snapshot_and_safe_retry_is_exactly_once() -> None:
+    """Durable persistence failure must precede every in-memory event commit."""
+    bar0 = _bar(0, open_price="100")
+    recorder = _RecordManyFailure(fail_on=2)
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=recorder,
+        durable=True,
+        session_id="audit-failure-session",
+    )
+    order = broker.submit(_intent(), _snapshot(bar0))
+    event = _snapshot(bar0, _bar(1, open_price="100"))
+    before = (broker.list_orders(), broker.fills, broker.cash, broker.audit_events)
+
+    with pytest.raises(RuntimeError, match="record_many"):
+        broker.on_snapshot(event, _instrument())
+
+    assert (broker.list_orders(), broker.fills, broker.cash, broker.audit_events) == before
+    [fill] = broker.on_snapshot(event, _instrument())
+    assert fill.order_id == order.order_id
+    assert len(broker.fills) == 1
+
+
+def test_durable_mode_persists_rows_and_rehydrates_idempotently(tmp_path: Path) -> None:
+    """Crash durability requires first-class rows plus a replayable committed state."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'paper-events.db'}")
+    )
+    clock = FrozenClock(AT + timedelta(days=1))
+    audit = AuditLog(store, clock)
+    bar0 = _bar(0, open_price="100")
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=audit,
+        durable=True,
+        session_id="durable-session",
+    )
+    value = _intent()
+    order = broker.submit(value, _snapshot(bar0))
+    event = _snapshot(bar0, _bar(1, open_price="100"))
+    broker.on_snapshot(event, _instrument())
+    rows = tuple(store.stream("durable-session"))
+
+    assert [(row.sequence, row.kind, row.occurred_at) for row in rows] == [
+        (1, "paper.order.submitted", AT),
+        (2, "paper.order.transition", AT),
+        (3, "paper.order.transition", AT),
+        (4, "paper.order.transition", AT),
+        (5, "paper.order.transition", AT),
+        (6, "paper.state.committed", AT),
+        (7, "paper.order.transition", AT + timedelta(minutes=1)),
+        (8, "paper.order.fill", AT + timedelta(minutes=1)),
+        (9, "paper.state.committed", AT + timedelta(minutes=1)),
+    ]
+    assert all(row.occurred_at != clock.now() for row in rows)
+    assert len({row.event_id for row in rows}) == len(rows)
+    restored = PaperBroker.rehydrate(
+        rows,
+        audit_log=audit,
+        starting_cash=Decimal("1000"),
+        session_id="durable-session",
+    )
+
+    assert restored.get_order(order.order_id) == broker.get_order(order.order_id)
+    assert restored.fills == broker.fills
+    assert restored.cash == broker.cash
+    assert restored.submit(value, _snapshot(bar0)) == restored.get_order(order.order_id)
+    assert restored.on_snapshot(event, _instrument()) == ()
+
+
+def test_two_durable_brokers_never_collide_event_or_fill_ids(tmp_path: Path) -> None:
+    """Per-instance counters alone collide when sessions share one durable store."""
+    store = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'shared.db'}"))
+    audit = AuditLog(store, FrozenClock(AT))
+    bar0 = _bar(0, open_price="100")
+    fill_ids = []
+    event_ids = []
+    for index in range(2):
+        session_id = f"session-{index}"
+        broker = PaperBroker(
+            starting_cash=Decimal("1000"),
+            audit_log=audit,
+            durable=True,
+            session_id=session_id,
+        )
+        broker.submit(_intent(), _snapshot(bar0))
+        [fill] = broker.on_snapshot(
+            _snapshot(bar0, _bar(1, open_price="100")),
+            _instrument(),
+        )
+        fill_ids.append(fill.fill_id)
+        event_ids.extend(row.event_id for row in store.stream(session_id))
+
+    assert len(set(fill_ids)) == 2
+    assert len(set(event_ids)) == len(event_ids)
+
+
+def test_rehydrate_uses_append_sequence_when_event_times_arrive_out_of_order(
+    tmp_path: Path,
+) -> None:
+    """A late broker update with an older source time must still survive replay."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'late-update.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=audit,
+        durable=True,
+        session_id="late-update-session",
+    )
+    aapl0 = _snapshot(_bar(0, open_price="100"), instrument_id="AAPL@alpaca")
+    msft0 = _snapshot(_bar(0, open_price="100"), instrument_id="MSFT@alpaca")
+    aapl_order = broker.submit(
+        _intent(intent_id="aapl", instrument_id="AAPL@alpaca"),
+        aapl0,
+    )
+    broker.submit(_intent(intent_id="msft", instrument_id="MSFT@alpaca"), msft0)
+    broker.on_snapshot(
+        _snapshot(
+            *msft0.bars,
+            _bar(2, open_price="100"),
+            instrument_id="MSFT@alpaca",
+        ),
+        _instrument(instrument_id="MSFT@alpaca"),
+    )
+    cancelled = broker.cancel(aapl_order.order_id, at=AT + timedelta(minutes=1))
+
+    rows = tuple(store.stream("late-update-session"))
+    restored = PaperBroker.rehydrate(
+        rows,
+        audit_log=audit,
+        starting_cash=Decimal("1000"),
+        session_id="late-update-session",
+    )
+
+    assert restored.get_order(aapl_order.order_id) == cancelled
+
+
+def test_runtime_durability_semantics_are_explicit_and_validated() -> None:
+    """A default in-memory broker must not be mislabeled crash-durable."""
+    assert PaperBroker().durability_mode == "current_session"
+    with pytest.raises(ValueError, match="durable"):
+        PaperBroker(durable=True, session_id="runtime-session")
+    with pytest.raises(ValueError, match="session_id"):
+        PaperBroker(durable=True, audit_log=_RecordManyFailure(fail_on=99))
+    with pytest.raises(ValueError, match="record_many"):
+        PaperBroker(
+            durable=True,
+            audit_log=object(),  # type: ignore[arg-type]
+            session_id="runtime-session",
+        )

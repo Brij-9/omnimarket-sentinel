@@ -25,6 +25,17 @@ class EventRecord:
     sequence: int
 
 
+@dataclass(frozen=True, slots=True)
+class EventAppend:
+    """One validated event requested as part of an atomic append group."""
+
+    event_id: str
+    kind: str
+    aggregate_id: str
+    payload: Mapping[str, object]
+    occurred_at: datetime
+
+
 class EventStore:
     """Store events without mutation or deletion operations."""
 
@@ -40,37 +51,54 @@ class EventStore:
         occurred_at: datetime,
     ) -> None:
         """Append one event in a transaction, preserving the supplied UTC instant."""
-        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
-            raise ValueError("occurred_at must be timezone-aware")
-        canonical_payload = json.dumps(
-            dict(payload),
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
+        self.append_many(
+            (EventAppend(event_id, kind, aggregate_id, payload, occurred_at),)
         )
+
+    def append_many(self, batch: tuple[EventAppend, ...]) -> None:
+        """Append first-class events atomically in caller order with contiguous sequences."""
+        if not isinstance(batch, tuple) or not batch:
+            raise ValueError("event batch must be a nonempty tuple")
+        prepared: list[dict[str, object]] = []
+        for item in batch:
+            if not isinstance(item, EventAppend):
+                raise ValueError("event batch must contain EventAppend records")
+            if not item.event_id or not item.kind or not item.aggregate_id:
+                raise ValueError("event identity fields must be nonempty")
+            if item.occurred_at.tzinfo is None or item.occurred_at.utcoffset() is None:
+                raise ValueError("occurred_at must be timezone-aware")
+            canonical_payload = json.dumps(
+                dict(item.payload),
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            prepared.append(
+                {
+                    "event_id": item.event_id,
+                    "kind": item.kind,
+                    "aggregate_id": item.aggregate_id,
+                    "payload_json": canonical_payload,
+                    "occurred_at": item.occurred_at.astimezone(UTC),
+                }
+            )
         with self._engine.begin() as connection:
-            sequence = cast(
+            final_sequence = cast(
                 int | None,
                 connection.scalar(
                     update(event_sequence)
                     .where(event_sequence.c.counter_id == 1)
-                    .values(next_sequence=event_sequence.c.next_sequence + 1)
+                    .values(next_sequence=event_sequence.c.next_sequence + len(prepared))
                     .returning(event_sequence.c.next_sequence)
                 ),
             )
-            if sequence is None:
+            if final_sequence is None:
                 raise RuntimeError("event sequence counter is not initialized")
-            connection.execute(
-                events.insert().values(
-                    event_id=event_id,
-                    kind=kind,
-                    aggregate_id=aggregate_id,
-                    payload_json=canonical_payload,
-                    occurred_at=occurred_at.astimezone(UTC),
-                    sequence=sequence,
-                )
-            )
+            first_sequence = final_sequence - len(prepared) + 1
+            for offset, values in enumerate(prepared):
+                values["sequence"] = first_sequence + offset
+            connection.execute(events.insert(), prepared)
 
     def stream(self, aggregate_id: str) -> Iterator[EventRecord]:
         """Yield aggregate events in deterministic temporal order."""

@@ -10,9 +10,9 @@ from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
 from market_sentinel.domain.clock import FrozenClock
-from market_sentinel.operations.audit import AuditLog
+from market_sentinel.operations.audit import AuditEvent, AuditLog
 from market_sentinel.storage.db import create_engine_and_schema
-from market_sentinel.storage.events import EventStore
+from market_sentinel.storage.events import EventAppend, EventStore
 
 
 def test_event_store_is_ordered_and_event_ids_are_immutable() -> None:
@@ -109,3 +109,52 @@ def test_audit_log_redacts_payload_and_uses_its_clock() -> None:
         "api_key": "[REDACTED]",
         "details": {"access_token": "[REDACTED]", "safe": "yes"},
     }
+
+
+def test_append_many_is_atomic_and_preserves_order_and_supplied_utc_times() -> None:
+    """A bad later row must roll back every event and allocated sequence in the batch."""
+    store = EventStore(create_engine_and_schema("sqlite+pysqlite:///:memory:"))
+    first_at = datetime(2026, 8, 9, 10, tzinfo=UTC)
+    second_at = datetime(2026, 8, 9, 10, 1, tzinfo=UTC)
+    batch = (
+        EventAppend("batch-1", "first", "aggregate", {"value": "one"}, first_at),
+        EventAppend("batch-1", "duplicate", "aggregate", {"value": "two"}, second_at),
+    )
+
+    with pytest.raises(IntegrityError):
+        store.append_many(batch)
+    assert tuple(store.stream("aggregate")) == ()
+
+    store.append_many(
+        (
+            EventAppend("batch-1", "first", "aggregate", {}, first_at),
+            EventAppend("batch-2", "second", "aggregate", {}, second_at),
+        )
+    )
+    rows = tuple(store.stream("aggregate"))
+    assert [(row.event_id, row.sequence, row.occurred_at) for row in rows] == [
+        ("batch-1", 1, first_at),
+        ("batch-2", 2, second_at),
+    ]
+
+
+def test_audit_record_many_persists_first_class_redacted_rows_at_supplied_times() -> None:
+    """A transactional audit group must not become one opaque surrogate batch event."""
+    store = EventStore(create_engine_and_schema("sqlite+pysqlite:///:memory:"))
+    audit = AuditLog(store, FrozenClock(datetime(2030, 1, 1, tzinfo=UTC)))
+    first_at = datetime(2026, 8, 9, 10, tzinfo=UTC)
+    second_at = datetime(2026, 8, 9, 10, 1, tzinfo=UTC)
+
+    audit.record_many(
+        (
+            AuditEvent("audit-1", "transition", "order", {"api_key": "hidden"}, first_at),
+            AuditEvent("audit-2", "fill", "order", {"safe": "yes"}, second_at),
+        )
+    )
+
+    rows = tuple(store.stream("order"))
+    assert [(row.kind, row.occurred_at) for row in rows] == [
+        ("transition", first_at),
+        ("fill", second_at),
+    ]
+    assert rows[0].payload["api_key"] == "[REDACTED]"

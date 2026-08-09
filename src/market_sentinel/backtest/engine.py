@@ -195,6 +195,44 @@ class FillModel:
             raise ValueError("event_at must not precede submitted_at")
         return event_instant >= submitted_instant + self.costs.latency
 
+    def liquidity_budget(
+        self,
+        *,
+        event_volume: Decimal,
+        max_participation: Decimal,
+        quantity_step: Decimal,
+    ) -> Decimal:
+        """Return the conservative step-aligned quantity available to one market event."""
+        if not _finite_nonnegative(event_volume):
+            raise ValueError("event_volume must be a finite nonnegative Decimal")
+        if (
+            not _finite_positive(max_participation)
+            or max_participation > Decimal("1")
+        ):
+            raise ValueError("max_participation must be a Decimal in (0, 1]")
+        if not _finite_positive(quantity_step):
+            raise ValueError("quantity_step must be a finite positive Decimal")
+        return _floor_quantity(event_volume * max_participation, quantity_step)
+
+    def allocate_quantity(
+        self,
+        *,
+        remaining_quantity: Decimal,
+        available_liquidity: Decimal,
+        quantity_step: Decimal,
+    ) -> Decimal:
+        """Allocate at most one shared event budget without exceeding remaining quantity."""
+        if not _finite_nonnegative(remaining_quantity):
+            raise ValueError("remaining_quantity must be a finite nonnegative Decimal")
+        if not _finite_nonnegative(available_liquidity):
+            raise ValueError("available_liquidity must be a finite nonnegative Decimal")
+        if not _finite_positive(quantity_step):
+            raise ValueError("quantity_step must be a finite positive Decimal")
+        return _floor_quantity(
+            min(remaining_quantity, available_liquidity),
+            quantity_step,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class _PendingOrder:
@@ -587,3 +625,10 @@ def _step_aligned(value: Decimal, step: Decimal) -> bool:
         return quotient.is_finite() and quotient == quotient.to_integral_value()
     except (InvalidOperation, ValueError, ZeroDivisionError):
         return False
+
+
+def _floor_quantity(value: Decimal, step: Decimal) -> Decimal:
+    try:
+        return (value / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    except (InvalidOperation, OverflowError, ZeroDivisionError) as error:
+        raise ValueError("quantity step arithmetic must remain finite") from error

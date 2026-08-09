@@ -304,10 +304,18 @@ def portfolio_hash(portfolio: PortfolioSnapshot) -> str:
 def _intent_size(
     intent: OrderIntent, instrument: Instrument, market: MarketSnapshot
 ) -> tuple[Decimal | None, Decimal | None, Decimal | None, bool]:
-    price = intent.limit_price if intent.limit_price is not None else _market_price(market)
+    price = (
+        intent.limit_price
+        if intent.limit_price is not None
+        else intent.trigger_price
+        if intent.trigger_price is not None
+        else _market_price(market)
+    )
     if price is None or not _finite_positive(price) or not _valid_instrument(instrument):
         return None, None, price, False
-    if intent.limit_price is not None and not _is_step_aligned(price, instrument.price_tick):
+    if (
+        intent.limit_price is not None or intent.trigger_price is not None
+    ) and not _is_step_aligned(price, instrument.price_tick):
         return None, None, price, False
     if intent.quantity is not None:
         if not _finite_positive(intent.quantity) or not _is_step_aligned(

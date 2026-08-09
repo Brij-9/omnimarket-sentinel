@@ -376,6 +376,43 @@ def test_fill_model_public_latency_rule_rejects_predeadline_and_accepts_deadline
         )
 
 
+def test_fill_model_allocates_conservative_step_aligned_event_liquidity() -> None:
+    """Paper and replay callers must share one conservative partial-quantity rule."""
+    model = FillModel()
+
+    assert model.liquidity_budget(
+        event_volume=Decimal("1.27"),
+        max_participation=Decimal("0.5"),
+        quantity_step=Decimal("0.1"),
+    ) == Decimal("0.6")
+    assert model.allocate_quantity(
+        remaining_quantity=Decimal("1"),
+        available_liquidity=Decimal("0.35"),
+        quantity_step=Decimal("0.1"),
+    ) == Decimal("0.3")
+
+
+@pytest.mark.parametrize(
+    ("remaining", "liquidity", "step"),
+    [
+        (Decimal("NaN"), Decimal("1"), Decimal("0.1")),
+        (Decimal("1"), Decimal("-1"), Decimal("0.1")),
+        (Decimal("1"), Decimal("1"), Decimal("0")),
+    ],
+)
+def test_fill_model_liquidity_allocation_rejects_invalid_decimals(
+    remaining: Decimal,
+    liquidity: Decimal,
+    step: Decimal,
+) -> None:
+    with pytest.raises(ValueError):
+        FillModel().allocate_quantity(
+            remaining_quantity=remaining,
+            available_liquidity=liquidity,
+            quantity_step=step,
+        )
+
+
 @pytest.mark.parametrize(
     ("quantity", "reference_price", "venue", "side", "filled_at"),
     [

@@ -169,11 +169,36 @@ class OrderIntent(FrozenModel):
     snapshot_hash: str
     created_at: datetime
     expires_at: datetime
+    trigger_price: Decimal | None = None
+
+    @field_validator("limit_price", "trigger_price", "stop_loss", "take_profit")
+    @classmethod
+    def require_positive_order_prices(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and (not value.is_finite() or value <= Decimal("0")):
+            raise ValueError("order prices must be finite and positive")
+        return value
 
     @model_validator(mode="after")
     def require_single_size_and_consistent_protective_prices(self) -> Self:
         if (self.quantity is None) == (self.notional is None):
             raise ValueError("exactly one of quantity or notional must be populated")
+        expected_fields = {
+            OrderType.MARKET: (False, False),
+            OrderType.LIMIT: (True, False),
+            OrderType.STOP: (False, True),
+            OrderType.STOP_LIMIT: (True, True),
+        }
+        expected_limit, expected_trigger = expected_fields[self.order_type]
+        if (self.limit_price is not None) is not expected_limit or (
+            (self.trigger_price is not None) is not expected_trigger
+        ):
+            raise ValueError("order type requires its exact limit/trigger price fields")
+        if self.order_type is OrderType.STOP_LIMIT:
+            assert self.limit_price is not None and self.trigger_price is not None
+            if self.side is Side.BUY and self.limit_price < self.trigger_price:
+                raise ValueError("buy stop-limit requires limit at or above trigger")
+            if self.side is Side.SELL and self.limit_price > self.trigger_price:
+                raise ValueError("sell stop-limit requires limit at or below trigger")
         if self.stop_loss is not None and self.take_profit is not None:
             if self.side is Side.BUY and self.stop_loss >= self.take_profit:
                 raise ValueError("buy intent requires stop_loss below take_profit")

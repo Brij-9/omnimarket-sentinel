@@ -61,6 +61,12 @@ def _order(status: OrderStatus = OrderStatus.PROPOSED) -> BrokerOrder:
         (OrderStatus.PARTIALLY_FILLED, OrderStatus.REJECTED),
         (OrderStatus.PARTIALLY_FILLED, OrderStatus.EXPIRED),
         (OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN),
+        (OrderStatus.UNKNOWN, OrderStatus.ACKNOWLEDGED),
+        (OrderStatus.UNKNOWN, OrderStatus.PARTIALLY_FILLED),
+        (OrderStatus.UNKNOWN, OrderStatus.FILLED),
+        (OrderStatus.UNKNOWN, OrderStatus.REJECTED),
+        (OrderStatus.UNKNOWN, OrderStatus.CANCELLED),
+        (OrderStatus.UNKNOWN, OrderStatus.EXPIRED),
     ],
 )
 def test_transition_table_allows_only_explicit_forward_and_resolution_paths(
@@ -86,7 +92,6 @@ def test_transition_table_allows_only_explicit_forward_and_resolution_paths(
         OrderStatus.REJECTED,
         OrderStatus.CANCELLED,
         OrderStatus.EXPIRED,
-        OrderStatus.UNKNOWN,
     ],
 )
 @pytest.mark.parametrize("target", list(OrderStatus))
@@ -181,3 +186,78 @@ def test_transition_rejects_naive_or_backward_timestamp_without_audit(at: dateti
         )
 
     assert events == []
+
+
+def test_every_order_status_pair_matches_the_explicit_transition_matrix() -> None:
+    """An untested enum pair could silently add a resubmission or backward edge."""
+    allowed = {
+        OrderStatus.PROPOSED: {
+            OrderStatus.RISK_APPROVED,
+            OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
+        },
+        OrderStatus.RISK_APPROVED: {
+            OrderStatus.CONFIRMED,
+            OrderStatus.REJECTED,
+            OrderStatus.CANCELLED,
+            OrderStatus.EXPIRED,
+        },
+        OrderStatus.CONFIRMED: {
+            OrderStatus.SUBMITTING,
+            OrderStatus.CANCELLED,
+            OrderStatus.EXPIRED,
+        },
+        OrderStatus.SUBMITTING: {
+            OrderStatus.ACKNOWLEDGED,
+            OrderStatus.REJECTED,
+            OrderStatus.CANCELLED,
+            OrderStatus.EXPIRED,
+            OrderStatus.UNKNOWN,
+        },
+        OrderStatus.ACKNOWLEDGED: {
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.REJECTED,
+            OrderStatus.CANCELLED,
+            OrderStatus.EXPIRED,
+            OrderStatus.UNKNOWN,
+        },
+        OrderStatus.PARTIALLY_FILLED: {
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.REJECTED,
+            OrderStatus.CANCELLED,
+            OrderStatus.EXPIRED,
+            OrderStatus.UNKNOWN,
+        },
+        OrderStatus.UNKNOWN: {
+            OrderStatus.ACKNOWLEDGED,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.REJECTED,
+            OrderStatus.CANCELLED,
+            OrderStatus.EXPIRED,
+        },
+    }
+
+    for prior in OrderStatus:
+        for new in OrderStatus:
+            events: list[OrderTransitionEvent] = []
+            if new in allowed.get(prior, set()):
+                result = OrderStateMachine.transition(
+                    _order(prior),
+                    new,
+                    at=AT,
+                    emit=events.append,
+                )
+                assert result.status is new
+                assert len(events) == 1
+            else:
+                with pytest.raises(InvalidOrderTransition):
+                    OrderStateMachine.transition(
+                        _order(prior),
+                        new,
+                        at=AT,
+                        emit=events.append,
+                    )
+                assert events == []

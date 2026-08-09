@@ -8,6 +8,7 @@ from typing import Protocol, runtime_checkable
 
 from market_sentinel.domain.enums import AssetClass, OrderType
 from market_sentinel.domain.models import BrokerOrder, MarketSnapshot, OrderIntent, Position
+from market_sentinel.operations.audit import AuditEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,8 +28,12 @@ class BrokerCapabilities:
     is_paper: bool
 
     def __post_init__(self) -> None:
-        if not isinstance(self.broker, str) or not self.broker:
-            raise ValueError("broker capability identity must be nonempty")
+        if (
+            not isinstance(self.broker, str)
+            or not self.broker
+            or self.broker != self.broker.strip()
+        ):
+            raise ValueError("broker capability identity must be nonempty and trimmed")
         if not isinstance(self.supported_asset_classes, frozenset) or not all(
             isinstance(item, AssetClass) for item in self.supported_asset_classes
         ):
@@ -37,6 +42,18 @@ class BrokerCapabilities:
             isinstance(item, OrderType) for item in self.supported_order_types
         ):
             raise ValueError("supported_order_types must be a frozenset of OrderType")
+        flag_names = (
+            "supports_fractional_quantity",
+            "supports_notional_orders",
+            "supports_partial_fills",
+            "supports_shorting",
+            "supports_leverage",
+            "supports_derivatives",
+            "supports_cancel",
+            "is_paper",
+        )
+        if not all(type(getattr(self, name)) is bool for name in flag_names):
+            raise ValueError("broker capability flags must be exact bool values")
 
 
 @runtime_checkable
@@ -52,6 +69,12 @@ class BrokerAdapter(Protocol):
 
     def get_order(self, order_id: str) -> BrokerOrder: ...
 
+    def get_order_by_client_id(self, client_intent_id: str) -> BrokerOrder: ...
+
+    def list_orders(self) -> tuple[BrokerOrder, ...]: ...
+
+    def open_orders(self) -> tuple[BrokerOrder, ...]: ...
+
     def cancel(self, order_id: str, *, at: datetime) -> BrokerOrder: ...
 
     def positions(self) -> tuple[Position, ...]: ...
@@ -60,10 +83,4 @@ class BrokerAdapter(Protocol):
 class AuditRecorder(Protocol):
     """Structural subset of the application audit facade used by execution."""
 
-    def record(
-        self,
-        event_id: str,
-        kind: str,
-        aggregate_id: str,
-        payload: dict[str, object],
-    ) -> None: ...
+    def record_many(self, batch: tuple[AuditEvent, ...]) -> None: ...

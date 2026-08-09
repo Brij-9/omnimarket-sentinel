@@ -155,8 +155,9 @@ def intent(
     side: Side = Side.BUY,
     quantity: Decimal | str | None = None,
     notional: Decimal | str | None = Decimal("10"),
-    order_type: OrderType = OrderType.MARKET,
+    order_type: OrderType | None = None,
     limit_price: Decimal | str | None = None,
+    trigger_price: Decimal | str | None = None,
     stop_loss: Decimal | str | None = Decimal("95"),
     take_profit: Decimal | str | None = Decimal("110"),
     time_in_force: str = "day",
@@ -172,8 +173,12 @@ def intent(
         side=side,
         quantity=None if quantity is None else Decimal(quantity),
         notional=None if notional is None else Decimal(notional),
-        order_type=order_type,
+        order_type=(
+            OrderType.LIMIT if order_type is None and limit_price is not None else order_type
+        )
+        or OrderType.MARKET,
         limit_price=None if limit_price is None else Decimal(limit_price),
+        trigger_price=None if trigger_price is None else Decimal(trigger_price),
         stop_loss=None if stop_loss is None else Decimal(stop_loss),
         take_profit=None if take_profit is None else Decimal(take_profit),
         time_in_force=time_in_force,
