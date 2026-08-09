@@ -68,6 +68,11 @@ def bar_series(
     )
 
 
+def trending_bars(count: int = 80) -> tuple[Bar, ...]:
+    """Return a liquid, steady uptrend suitable for deterministic strategy fixtures."""
+    return bar_series(count=count, start_price="100", increment="1", volume="1000")
+
+
 def snapshot(
     instrument_id: str = "AAPL@alpaca",
     observed_at: datetime = DEFAULT_INSTANT,
