@@ -14,7 +14,7 @@ import re
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
@@ -38,7 +38,9 @@ _DEPENDENCY_REASON = (
 _UPSTREAM_FAILURE_REASON = "Tauric research failed closed"
 _TIMEOUT_REASON = "Tauric research timed out and failed closed"
 _CONFIDENCE_METHOD = "unit_interval:evidence=0.50,thesis=0.25,bear_case=0.25"
+_EVIDENCE_AVAILABILITY_METHOD = "completed_daily_bar_next_utc_day_v1"
 _CONFIG_PROFILE = "tauric-audited-v1"
+_MAX_STOCK_RECORDS = 100_000
 
 _SUPPORTED_ENDPOINTS = {
     "openai": "https://api.openai.com/v1",
@@ -123,6 +125,7 @@ _PUBLIC_CONFIGURATION_FIELDS = frozenset(
         "selected_analysts",
         "storage_scope",
         "confidence_method",
+        "evidence_availability_method",
     }
 )
 
@@ -260,36 +263,41 @@ def _validate_state(value: Any, symbol: str, requested_date: str) -> dict[str, A
     return state
 
 
-def _stock_call(
-    message: Mapping[str, Any], symbol: str, requested: date
-) -> dict[str, tuple[date, date]]:
-    calls: dict[str, tuple[date, date]] = {}
-    tool_calls = message.get("tool_calls")
-    if not isinstance(tool_calls, Sequence) or isinstance(tool_calls, (str, bytes, bytearray)):
+def _validated_stock_call(
+    call: Mapping[str, Any], symbol: str, requested: date
+) -> tuple[str, date, date]:
+    if set(call) != {"name", "args", "id", "type"} or call.get("type") != "tool_call":
         raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-    for call in tool_calls:
-        if not isinstance(call, Mapping) or call.get("name") != "get_stock_data":
-            continue
-        if set(call) != {"name", "args", "id", "type"} or call.get("type") != "tool_call":
-            continue
-        call_id = call.get("id")
-        args = call.get("args")
-        if not _is_safe_id(call_id) or not isinstance(args, Mapping):
-            continue
-        if set(args) != {"symbol", "start_date", "end_date"} or args.get("symbol") != symbol:
-            continue
-        start = _exact_iso_date(args.get("start_date"))
-        end = _exact_iso_date(args.get("end_date"))
-        if start is None or end is None or start > end or end > requested:
-            continue
-        assert isinstance(call_id, str)
-        if call_id in calls:
-            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-        calls[call_id] = (start, end)
-    return calls
+    call_id = call.get("id")
+    args = call.get("args")
+    if not _is_safe_id(call_id) or not isinstance(args, Mapping):
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    if set(args) != {"symbol", "start_date", "end_date"} or args.get("symbol") != symbol:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    start = _exact_iso_date(args.get("start_date"))
+    end = _exact_iso_date(args.get("end_date"))
+    if start is None or end is None or start > end or end > requested:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    assert isinstance(call_id, str)
+    return call_id, start, end
 
 
 def _parse_stock_tool_result(
+    content: Any,
+    symbol: str,
+    start: date,
+    end: date,
+    requested: date,
+) -> date:
+    try:
+        return _parse_stock_tool_result_strict(content, symbol, start, end, requested)
+    except ResearchUnavailable:
+        raise
+    except Exception:
+        raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON) from None
+
+
+def _parse_stock_tool_result_strict(
     content: Any,
     symbol: str,
     start: date,
@@ -312,7 +320,11 @@ def _parse_stock_tool_result(
         header_lines[1] != f"# Total records: {total_text}"
         or not total_text.isascii()
         or not total_text.isdecimal()
+        or len(total_text) > 6
     ):
+        raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+    total_records = int(total_text)
+    if total_records > _MAX_STOCK_RECORDS:
         raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
     retrieved_text = header_lines[2].removeprefix("# Data retrieved on: ")
     try:
@@ -324,6 +336,8 @@ def _parse_stock_tool_result(
         or retrieved_at.strftime("%Y-%m-%d %H:%M:%S") != retrieved_text
     ):
         raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+    # The pinned tool emits a naive local retrieval clock. It is syntax-checked
+    # above but cannot establish an aware source-publication instant.
     reader = csv.DictReader(io.StringIO(sections[1]))
     required = {"Date", "Open", "High", "Low", "Close", "Volume"}
     if reader.fieldnames is None or not required.issubset(reader.fieldnames):
@@ -339,6 +353,8 @@ def _parse_stock_tool_result(
             raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
         if observed_date > requested:
             raise ResearchUnavailable(LOOK_AHEAD_EVIDENCE_REASON)
+        if observed_date > end or observed_date == requested:
+            raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
         if observed and observed_date <= observed[-1]:
             raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
         for field in required - {"Date"}:
@@ -349,7 +365,7 @@ def _parse_stock_tool_result(
             if not number.is_finite():
                 raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
         observed.append(observed_date)
-    if len(observed) != int(total_text) or not observed:
+    if len(observed) != total_records or not observed:
         raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
     return max(observed)
 
@@ -357,33 +373,68 @@ def _parse_stock_tool_result(
 def _extract_evidence(
     messages: Sequence[Any], symbol: str, requested: date, as_of: datetime
 ) -> tuple[Evidence, ...]:
-    calls: dict[str, tuple[date, date]] = {}
+    pending: dict[str, tuple[date, date]] = {}
+    consumed: set[str] = set()
+    seen_call_ids: set[str] = set()
+    seen_result_ids: set[str] = set()
+    latest: date | None = None
     for message in messages:
         if not isinstance(message, Mapping):
             raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-        if message.get("type") == "ai":
-            calls.update(_stock_call(message, symbol, requested))
-
-    latest: date | None = None
-    for message in messages:
-        if not isinstance(message, Mapping) or message.get("type") != "tool":
+        message_type = message.get("type")
+        if message_type == "ai":
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, Sequence) or isinstance(
+                tool_calls, (str, bytes, bytearray)
+            ):
+                raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+            for call in tool_calls:
+                if not isinstance(call, Mapping):
+                    raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+                call_id = call.get("id")
+                if isinstance(call_id, str):
+                    if call_id in seen_call_ids or call_id in seen_result_ids:
+                        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+                    seen_call_ids.add(call_id)
+                if call.get("name") != "get_stock_data":
+                    continue
+                validated_id, start, end = _validated_stock_call(call, symbol, requested)
+                pending[validated_id] = (start, end)
             continue
-        if message.get("name") != "get_stock_data":
+        if message_type != "tool":
             continue
         call_id = message.get("tool_call_id")
-        if not isinstance(call_id, str) or call_id not in calls:
+        if isinstance(call_id, str):
+            if call_id in seen_result_ids:
+                raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+            seen_result_ids.add(call_id)
+        if message.get("name") != "get_stock_data":
+            if isinstance(call_id, str) and (call_id in pending or call_id in consumed):
+                raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
             continue
-        start, end = calls[call_id]
+        if (
+            set(message) != {"type", "content", "name", "tool_call_id"}
+            or not _is_safe_id(call_id)
+            or call_id not in pending
+        ):
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        assert isinstance(call_id, str)
+        start, end = pending.pop(call_id)
         observed = _parse_stock_tool_result(
             message.get("content"), symbol, start, end, requested
         )
+        consumed.add(call_id)
         if latest is None or observed > latest:
             latest = observed
+    if pending:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
     if latest is None:
         raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
-    published_at = datetime.combine(latest, datetime.min.time(), tzinfo=UTC)
+    published_at = datetime.combine(
+        latest + timedelta(days=1), datetime.min.time(), tzinfo=UTC
+    )
     if published_at > as_of:
-        raise ResearchUnavailable(LOOK_AHEAD_EVIDENCE_REASON)
+        raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
     uri = _canonical_evidence_uri(
         f"https://finance.yahoo.com/quote/{quote(symbol, safe='')}/history"
     )
@@ -443,6 +494,7 @@ def _public_configuration(value: Any) -> dict[str, Any]:
     if (
         public["upstream_commit"] != PINNED_TRADINGAGENTS_COMMIT
         or public["confidence_method"] != _CONFIDENCE_METHOD
+        or public["evidence_availability_method"] != _EVIDENCE_AVAILABILITY_METHOD
     ):
         raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
     return public
@@ -562,7 +614,7 @@ def _message_mapping(message: Any) -> dict[str, Any]:
                     "name": call.get("name"),
                     "args": call.get("args"),
                     "id": call.get("id"),
-                    "type": call.get("type", "tool_call"),
+                    "type": call.get("type"),
                 }
             )
         return {"type": "ai", "content": content, "tool_calls": sanitized_calls}
@@ -711,6 +763,7 @@ def _provenance(config: Mapping[str, Any], selected_analysts: tuple[str, ...]) -
         "selected_analysts": list(selected_analysts),
         "storage_scope": "isolated-per-run",
         "confidence_method": _CONFIDENCE_METHOD,
+        "evidence_availability_method": _EVIDENCE_AVAILABILITY_METHOD,
     }
 
 

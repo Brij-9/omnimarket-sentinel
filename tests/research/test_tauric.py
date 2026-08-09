@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from functools import partial
@@ -66,10 +67,11 @@ def _arbitrary_failure_worker(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _delayed_side_effect_worker(
-    request: dict[str, Any], *, state: dict[str, Any], marker_path: str
+    request: dict[str, Any], *, state: dict[str, Any], marker_path: str, started: Any
 ) -> dict[str, Any]:
     del request
-    time.sleep(0.5)
+    started.set()
+    time.sleep(5)
     Path(marker_path).write_text("continued", encoding="utf-8")
     return copy.deepcopy(state)
 
@@ -111,6 +113,37 @@ def test_actual_agent_state_becomes_sourced_research_packet() -> None:
     assert re.fullmatch(r"[0-9a-f]{64}", packet.configuration_hash)
     assert len(packet.evidence) == 1
     assert packet.evidence[0].uri == "https://finance.yahoo.com/quote/AAPL/history"
+    assert packet.evidence[0].published_at == datetime(2026, 8, 8, tzinfo=UTC)
+
+
+def test_prior_completed_bar_is_available_at_next_utc_day_boundary() -> None:
+    boundary = datetime(2026, 8, 8, tzinfo=UTC)
+    packet = _provider(tauric_state()).analyze(instrument(), boundary)
+    assert packet.evidence[0].published_at == boundary
+
+
+@pytest.mark.parametrize("hour,minute", [(0, 1), (13, 0), (23, 59)])
+def test_same_day_bar_is_rejected_at_all_times_without_session_cutoff(
+    hour: int, minute: int
+) -> None:
+    state = tauric_state()
+    state["trade_date"] = "2026-08-07"
+    state["messages"][1]["tool_calls"][0]["args"]["end_date"] = "2026-08-07"
+    state["messages"][2]["content"] = state["messages"][2]["content"].replace(
+        "to 2026-08-08", "to 2026-08-07"
+    )
+    as_of = datetime(2026, 8, 7, hour, minute, tzinfo=UTC)
+    with pytest.raises(ResearchUnavailable, match=re.escape(NO_TRUSTWORTHY_EVIDENCE_REASON)):
+        _provider(state).analyze(instrument(), as_of)
+
+
+def test_naive_retrieval_clock_is_validated_but_not_used_as_publication_time() -> None:
+    state = tauric_state()
+    state["messages"][2]["content"] = state["messages"][2]["content"].replace(
+        "Data retrieved on: 2026-08-08 19:20:00",
+        "Data retrieved on: 2026-08-09 23:59:59",
+    )
+    packet = _provider(state).analyze(instrument(), AS_OF)
     assert packet.evidence[0].published_at == datetime(2026, 8, 8, tzinfo=UTC)
 
 
@@ -181,10 +214,6 @@ def test_future_row_in_structured_tool_result_is_rejected() -> None:
     [
         ("from 2026-08-01 to 2026-08-08", "from 2026-08-01 to 2026-08-07"),
         ("Data retrieved on: 2026-08-08 19:20:00", "Data retrieved on: someday"),
-        (
-            "2026-08-08,223.00,226.00,222.00,225.00,1100",
-            "2026-08-07,223.00,226.00,222.00,225.00,1100",
-        ),
     ],
 )
 def test_pinned_stock_output_rejects_mismatched_headers_and_ambiguous_rows(
@@ -194,6 +223,42 @@ def test_pinned_stock_output_rejects_mismatched_headers_and_ambiguous_rows(
     state["messages"][2]["content"] = state["messages"][2]["content"].replace(old, new)
     with pytest.raises(ResearchUnavailable, match=re.escape(NO_TRUSTWORTHY_EVIDENCE_REASON)):
         _provider(state).analyze(instrument(), AS_OF)
+
+
+def test_duplicate_csv_observation_is_rejected() -> None:
+    state = tauric_state()
+    state["messages"][2]["content"] = state["messages"][2]["content"].replace(
+        "# Total records: 1", "# Total records: 2"
+    )
+    state["messages"][2]["content"] += (
+        "2026-08-07,221.00,225.00,220.00,224.00,1001\n"
+    )
+    with pytest.raises(ResearchUnavailable, match=re.escape(NO_TRUSTWORTHY_EVIDENCE_REASON)):
+        _provider(state).analyze(instrument(), AS_OF)
+
+
+def test_observation_after_paired_end_date_is_rejected() -> None:
+    state = tauric_state()
+    state["messages"][1]["tool_calls"][0]["args"]["end_date"] = "2026-08-07"
+    content = state["messages"][2]["content"].replace(
+        "to 2026-08-08", "to 2026-08-07"
+    ).replace("# Total records: 1", "# Total records: 2")
+    state["messages"][2]["content"] = content + (
+        "2026-08-08,223.00,226.00,222.00,225.00,1100\n"
+    )
+    with pytest.raises(ResearchUnavailable, match=re.escape(NO_TRUSTWORTHY_EVIDENCE_REASON)):
+        _provider(state).analyze(instrument(), AS_OF)
+
+
+def test_pathological_total_record_count_fails_closed_without_raw_parse_error() -> None:
+    state = tauric_state()
+    secret = "7" * 5000
+    state["messages"][2]["content"] = state["messages"][2]["content"].replace(
+        "# Total records: 1", f"# Total records: {secret}"
+    )
+    with pytest.raises(ResearchUnavailable, match=re.escape(NO_TRUSTWORTHY_EVIDENCE_REASON)) as exc:
+        _provider(state).analyze(instrument(), AS_OF)
+    assert secret not in str(exc.value)
 
 
 def test_missing_trustworthy_tool_evidence_fails_closed() -> None:
@@ -208,7 +273,57 @@ def test_missing_trustworthy_tool_evidence_fails_closed() -> None:
 def test_tool_result_must_pair_with_call_id() -> None:
     state = tauric_state()
     state["messages"][2]["tool_call_id"] = "different-call"
-    with pytest.raises(ResearchUnavailable, match=re.escape(NO_TRUSTWORTHY_EVIDENCE_REASON)):
+    with pytest.raises(ResearchUnavailable, match=re.escape(INVALID_RESEARCH_STATE_REASON)):
+        _provider(state).analyze(instrument(), AS_OF)
+
+
+def test_result_before_call_is_rejected() -> None:
+    state = tauric_state()
+    state["messages"][1], state["messages"][2] = state["messages"][2], state["messages"][1]
+    with pytest.raises(ResearchUnavailable, match=re.escape(INVALID_RESEARCH_STATE_REASON)):
+        _provider(state).analyze(instrument(), AS_OF)
+
+
+def test_duplicate_call_id_across_messages_is_rejected() -> None:
+    state = tauric_state()
+    state["messages"].insert(2, copy.deepcopy(state["messages"][1]))
+    with pytest.raises(ResearchUnavailable, match=re.escape(INVALID_RESEARCH_STATE_REASON)):
+        _provider(state).analyze(instrument(), AS_OF)
+
+
+def test_duplicate_result_is_rejected() -> None:
+    state = tauric_state()
+    state["messages"].insert(3, copy.deepcopy(state["messages"][2]))
+    with pytest.raises(ResearchUnavailable, match=re.escape(INVALID_RESEARCH_STATE_REASON)):
+        _provider(state).analyze(instrument(), AS_OF)
+
+
+def test_allowlisted_call_requires_exact_fields_and_explicit_type() -> None:
+    state = tauric_state()
+    state["messages"][1]["tool_calls"][0].pop("type")
+    with pytest.raises(ResearchUnavailable, match=re.escape(INVALID_RESEARCH_STATE_REASON)):
+        _provider(state).analyze(instrument(), AS_OF)
+
+
+def test_unconsumed_allowlisted_call_is_rejected() -> None:
+    state = tauric_state()
+    extra = copy.deepcopy(state["messages"][1])
+    extra["tool_calls"][0]["id"] = "call-market-2"
+    state["messages"].append(extra)
+    with pytest.raises(ResearchUnavailable, match=re.escape(INVALID_RESEARCH_STATE_REASON)):
+        _provider(state).analyze(instrument(), AS_OF)
+
+
+def test_unallowlisted_tool_cannot_spoof_allowlisted_call_id() -> None:
+    state = tauric_state()
+    spoof = {
+        "type": "tool",
+        "name": "get_news",
+        "tool_call_id": "call-market-1",
+        "content": "irrelevant",
+    }
+    state["messages"].insert(2, spoof)
+    with pytest.raises(ResearchUnavailable, match=re.escape(INVALID_RESEARCH_STATE_REASON)):
         _provider(state).analyze(instrument(), AS_OF)
 
 
@@ -223,7 +338,14 @@ def test_unallowlisted_tool_result_is_not_evidence() -> None:
 def test_tool_call_symbol_and_cutoff_must_match_request() -> None:
     state = tauric_state()
     state["messages"][1]["tool_calls"][0]["args"]["symbol"] = "MSFT"
-    with pytest.raises(ResearchUnavailable, match=re.escape(NO_TRUSTWORTHY_EVIDENCE_REASON)):
+    with pytest.raises(ResearchUnavailable, match=re.escape(INVALID_RESEARCH_STATE_REASON)):
+        _provider(state).analyze(instrument(), AS_OF)
+
+
+def test_tool_call_after_requested_cutoff_is_rejected() -> None:
+    state = tauric_state()
+    state["messages"][1]["tool_calls"][0]["args"]["end_date"] = "2026-08-09"
+    with pytest.raises(ResearchUnavailable, match=re.escape(INVALID_RESEARCH_STATE_REASON)):
         _provider(state).analyze(instrument(), AS_OF)
 
 
@@ -307,6 +429,9 @@ def test_audited_config_ignores_env_mutated_upstream_defaults_and_isolates_paths
         assert result["configuration"]["confidence_method"] == (
             "unit_interval:evidence=0.50,thesis=0.25,bear_case=0.25"
         )
+        assert result["configuration"]["evidence_availability_method"] == (
+            "completed_daily_bar_next_utc_day_v1"
+        )
 
     for capture in captures:
         config = capture["config"]
@@ -345,16 +470,22 @@ def test_timeout_terminates_work_and_repeated_deadlines_do_not_accumulate_worker
     tmp_path: Path,
 ) -> None:
     marker = tmp_path / "continued.txt"
-    worker = partial(
-        _delayed_side_effect_worker,
-        state=tauric_state(),
-        marker_path=str(marker),
-    )
-    runner = _runner(worker, timeout_seconds=0.15)
+    context = multiprocessing.get_context("spawn")
 
     for _ in range(3):
-        with pytest.raises(ResearchUnavailable, match="timed out"):
-            runner.propagate("AAPL", "2026-08-08")
+        started = context.Event()
+        worker = partial(
+            _delayed_side_effect_worker,
+            state=tauric_state(),
+            marker_path=str(marker),
+            started=started,
+        )
+        runner = _runner(worker, timeout_seconds=2)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(runner.propagate, "AAPL", "2026-08-08")
+            assert started.wait(timeout=10), "worker body never started"
+            with pytest.raises(ResearchUnavailable, match="timed out"):
+                future.result(timeout=10)
 
     time.sleep(0.65)
     assert not marker.exists()

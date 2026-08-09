@@ -45,7 +45,8 @@ FIXTURE_CONFIGURATION: dict[str, Any] = {
     "benchmark_map": {"": "SPY"},
     "selected_analysts": ["market", "news", "fundamentals"],
     "storage_scope": "isolated-per-run",
-    "confidence_method": "unit_interval:evidence=0.50,thesis=0.25,bear_case=0.25"
+    "confidence_method": "unit_interval:evidence=0.50,thesis=0.25,bear_case=0.25",
+    "evidence_availability_method": "completed_daily_bar_next_utc_day_v1"
 }
 
 
