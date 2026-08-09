@@ -14,3 +14,7 @@ data/
 logs/
 work/
 outputs/
+requirements*.txt
+.coverage
+dist/
+*.egg-info/
