@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import Column, Index, Integer, MetaData, String, Table, create_engine
+from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.engine import Dialect, Engine
 from sqlalchemy.types import TypeDecorator
 
@@ -43,9 +44,22 @@ events = Table(
     Index("ix_events_aggregate_id", "aggregate_id"),
 )
 
+event_sequence = Table(
+    "event_sequence",
+    metadata,
+    Column("counter_id", Integer, primary_key=True),
+    Column("next_sequence", Integer, nullable=False),
+)
+
 
 def create_engine_and_schema(url: str) -> Engine:
     """Create an engine and install the event-ledger schema."""
     engine = create_engine(url)
     metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            insert(event_sequence)
+            .values(counter_id=1, next_sequence=0)
+            .on_conflict_do_nothing(index_elements=[event_sequence.c.counter_id])
+        )
     return engine

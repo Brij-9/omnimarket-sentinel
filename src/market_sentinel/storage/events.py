@@ -7,10 +7,10 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import cast
 
-from sqlalchemy import func, select
+from sqlalchemy import select, update
 from sqlalchemy.engine import Engine
 
-from market_sentinel.storage.db import events
+from market_sentinel.storage.db import event_sequence, events
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,11 +43,24 @@ class EventStore:
         if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
         canonical_payload = json.dumps(
-            dict(payload), ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            dict(payload),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
         )
         with self._engine.begin() as connection:
-            last_sequence = cast(int | None, connection.scalar(select(func.max(events.c.sequence))))
-            sequence = 1 if last_sequence is None else last_sequence + 1
+            sequence = cast(
+                int | None,
+                connection.scalar(
+                    update(event_sequence)
+                    .where(event_sequence.c.counter_id == 1)
+                    .values(next_sequence=event_sequence.c.next_sequence + 1)
+                    .returning(event_sequence.c.next_sequence)
+                ),
+            )
+            if sequence is None:
+                raise RuntimeError("event sequence counter is not initialized")
             connection.execute(
                 events.insert().values(
                     event_id=event_id,
