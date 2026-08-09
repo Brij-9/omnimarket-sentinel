@@ -35,6 +35,22 @@ def _fill(
     )
 
 
+def _unvalidated_fill(
+    fill_id: str, quantity: str, price: str, fee: str
+) -> Fill:
+    """Construct an invalid domain record to exercise the ledger's defensive boundary."""
+    return Fill.model_construct(
+        fill_id=fill_id,
+        order_id=f"order-{fill_id}",
+        instrument_id="AAPL@alpaca",
+        side=Side.BUY,
+        quantity=Decimal(quantity),
+        price=Decimal(price),
+        fee=Decimal(fee),
+        filled_at=datetime(2026, 8, 9, 10, tzinfo=UTC),
+    )
+
+
 def test_buy_then_partial_sell_updates_cash_position_and_realized_pnl() -> None:
     """Charging a fee twice or folding it into cost basis changes these hand-calculated totals."""
     at = datetime(2026, 8, 9, 10, tzinfo=UTC)
@@ -163,3 +179,76 @@ def test_position_hash_is_stable_for_equal_economic_state() -> None:
 
     assert first.position_hash() == second.position_hash()
     assert len(first.position_hash()) == 64
+
+
+@pytest.mark.parametrize(
+    ("quantity", "price", "fee", "field_name"),
+    [
+        ("0", "10", "0", "quantity"),
+        ("-1", "10", "0", "quantity"),
+        ("NaN", "10", "0", "quantity"),
+        ("Infinity", "10", "0", "quantity"),
+        ("1", "0", "0", "price"),
+        ("1", "-10", "0", "price"),
+        ("1", "NaN", "0", "price"),
+        ("1", "Infinity", "0", "price"),
+        ("1", "10", "-0.01", "fee"),
+        ("1", "10", "NaN", "fee"),
+        ("1", "10", "Infinity", "fee"),
+    ],
+)
+def test_apply_fill_rejects_invalid_numbers_without_changing_or_reserving_state(
+    quantity: str, price: str, fee: str, field_name: str
+) -> None:
+    """Accepting any invalid numeric fill would corrupt cash, positions, or duplicate protection."""
+    at = datetime(2026, 8, 9, 10, tzinfo=UTC)
+    ledger = PortfolioLedger(starting_cash=Decimal("10"), currency="USD")
+    ledger.apply_fill(_fill("seed", Side.BUY, "0.5", "10"))
+    before = ledger.mark({"AAPL@alpaca": Decimal("12")}, at)
+    before_hash = ledger.position_hash()
+    before_drawdown = ledger.drawdown
+
+    with pytest.raises(ValueError, match=field_name):
+        ledger.apply_fill(_unvalidated_fill("rejected", quantity, price, fee))
+
+    after = ledger.snapshot(at)
+    assert after.cash == before.cash
+    assert after.positions == before.positions
+    assert after.peak_equity == before.peak_equity
+    assert ledger.position_hash() == before_hash
+    assert ledger.drawdown == before_drawdown
+
+    ledger.apply_fill(_fill("rejected", Side.BUY, "0.1", "10"))
+    assert ledger.snapshot(at).positions[0].quantity == Decimal("0.6")
+
+
+@pytest.mark.parametrize(
+    "prices",
+    [
+        {"AAPL@alpaca": Decimal("NaN")},
+        {"AAPL@alpaca": Decimal("Infinity")},
+        {"AAPL@alpaca": Decimal("0")},
+        {"AAPL@alpaca": Decimal("-1")},
+        {"AAPL@alpaca": "12"},
+        {"AAPL@alpaca": Decimal("12"), "MSFT@alpaca": Decimal("NaN")},
+    ],
+)
+def test_mark_rejects_each_unusable_supplied_price_without_changing_valuation(
+    prices: dict[str, object],
+) -> None:
+    """Committing an invalid mark before valuation would corrupt later snapshots and hashes."""
+    at = datetime(2026, 8, 9, 10, tzinfo=UTC)
+    ledger = PortfolioLedger(starting_cash=Decimal("10"), currency="USD")
+    ledger.apply_fill(_fill("seed", Side.BUY, "0.5", "10"))
+    ledger.mark({"AAPL@alpaca": Decimal("12")}, at)
+    before = ledger.mark({"AAPL@alpaca": Decimal("8")}, at)
+    before_hash = ledger.position_hash()
+    before_drawdown = ledger.drawdown
+
+    with pytest.raises(ValueError, match="price"):
+        ledger.mark(prices, at)  # type: ignore[arg-type]
+
+    after = ledger.snapshot(at)
+    assert after == before
+    assert ledger.position_hash() == before_hash
+    assert ledger.drawdown == before_drawdown
