@@ -2,85 +2,127 @@
 
 from __future__ import annotations
 
-import copy
+import csv
 import hashlib
 import importlib
+import io
+import ipaddress
 import json
 import math
-from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeoutError
+import multiprocessing
+import re
+import tempfile
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
+from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
+from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import SplitResult, urlsplit
+from urllib.parse import SplitResult, quote, urlsplit
 
 from market_sentinel.domain.models import Evidence, Instrument, ResearchPacket
 
 PINNED_TRADINGAGENTS_COMMIT = "a33fd4c0f134485a43553a2c23a63cb14adbd88f"
 RESEARCH_INSTALL_COMMAND = 'python -m pip install -e ".[research]"'
+INVALID_RESEARCH_STATE_REASON = "Tauric research failed closed: invalid pinned upstream state"
+NO_TRUSTWORTHY_EVIDENCE_REASON = (
+    "Tauric research failed closed: no trustworthy timestamped evidence"
+)
+LOOK_AHEAD_EVIDENCE_REASON = "Tauric research failed closed: look-ahead evidence"
+_DEPENDENCY_REASON = (
+    "TradingAgents research dependency is unavailable; install it with: "
+    f"{RESEARCH_INSTALL_COMMAND}"
+)
+_UPSTREAM_FAILURE_REASON = "Tauric research failed closed"
+_TIMEOUT_REASON = "Tauric research timed out and failed closed"
+_CONFIDENCE_METHOD = "unit_interval:evidence=0.50,thesis=0.25,bear_case=0.25"
+_CONFIG_PROFILE = "tauric-audited-v1"
 
-_SUPPORTED_LLM_PROVIDERS = frozenset(
-    {
-        "anthropic",
-        "azure",
-        "bedrock",
-        "deepseek",
-        "glm",
-        "glm-cn",
-        "google",
-        "groq",
-        "kimi",
-        "minimax",
-        "minimax-cn",
-        "mistral",
-        "nvidia",
-        "ollama",
-        "openai",
-        "openai_compatible",
-        "openrouter",
-        "qwen",
-        "qwen-cn",
-        "xai",
-    }
-)
+_SUPPORTED_ENDPOINTS = {
+    "openai": "https://api.openai.com/v1",
+    "ollama": "http://127.0.0.1:11434/v1",
+}
 _SUPPORTED_ANALYSTS = frozenset({"market", "social", "news", "fundamentals"})
-_PAYLOAD_FIELDS = frozenset(
+_SAFE_SYMBOL = re.compile(r"^[A-Za-z0-9.^=_+-]{1,32}$")
+_SAFE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
+_DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_SECRET_KEY_PARTS = ("authorization", "credential", "password", "secret", "token", "key")
+
+_AGENT_STATE_FIELDS = frozenset(
     {
-        "thesis",
-        "bear_case",
-        "catalysts",
-        "risks",
-        "confidence",
-        "confidence_scale",
-        "model_id",
-        "configuration",
-        "evidence",
+        "messages",
+        "company_of_interest",
+        "asset_type",
+        "instrument_context",
+        "trade_date",
+        "sender",
+        "market_report",
+        "sentiment_report",
+        "news_report",
+        "fundamentals_report",
+        "investment_debate_state",
+        "investment_plan",
+        "trader_investment_plan",
+        "risk_debate_state",
+        "final_trade_decision",
+        "past_context",
     }
 )
-_TRADE_FIELD_FRAGMENTS = (
-    "action",
-    "allocation",
-    "buy",
-    "notional",
-    "order",
-    "position",
-    "quantity",
-    "sell",
-    "side",
-    "size",
-    "stop_loss",
-    "take_profit",
-    "trade",
+_INVEST_DEBATE_FIELDS = frozenset(
+    {"bull_history", "bear_history", "history", "current_response", "judge_decision", "count"}
 )
+_RISK_DEBATE_FIELDS = frozenset(
+    {
+        "aggressive_history",
+        "conservative_history",
+        "neutral_history",
+        "history",
+        "latest_speaker",
+        "current_aggressive_response",
+        "current_conservative_response",
+        "current_neutral_response",
+        "judge_decision",
+        "count",
+    }
+)
+_STATE_TEXT_FIELDS = _AGENT_STATE_FIELDS - {
+    "messages",
+    "investment_debate_state",
+    "risk_debate_state",
+}
 _PUBLIC_CONFIGURATION_FIELDS = frozenset(
     {
-        "checkpoint_enabled",
-        "deep_think_llm",
-        "llm_provider",
-        "quick_think_llm",
-        "selected_analysts",
+        "profile",
         "upstream_commit",
+        "llm_provider",
+        "deep_think_llm",
+        "quick_think_llm",
+        "backend_url",
+        "google_thinking_level",
+        "openai_reasoning_effort",
+        "anthropic_effort",
+        "temperature",
+        "llm_max_retries",
+        "checkpoint_enabled",
+        "memory_log_max_entries",
+        "output_language",
+        "max_debate_rounds",
+        "max_risk_discuss_rounds",
+        "max_recur_limit",
+        "news_article_limit",
+        "global_news_article_limit",
+        "global_news_lookback_days",
+        "global_news_queries",
+        "data_vendors",
+        "tool_vendors",
+        "benchmark_ticker",
+        "benchmark_map",
+        "selected_analysts",
+        "storage_scope",
+        "confidence_method",
     }
 )
 
@@ -89,144 +131,320 @@ class ResearchUnavailable(RuntimeError):
     """Research could not be produced safely, so callers must fail closed."""
 
 
+class ResearchDependencyUnavailable(ResearchUnavailable):
+    """The exact optional dependency is unavailable, with fixed safe guidance."""
+
+    def __init__(self, *_untrusted: object) -> None:
+        super().__init__(_DEPENDENCY_REASON)
+
+
 class TauricRunner(Protocol):
     """Injected boundary that keeps unit tests independent of TradingAgents."""
 
     def propagate(self, symbol: str, date: str) -> Mapping[str, Any]: ...
 
 
-def _valid_plain_text(value: Any, *, allow_empty: bool = False) -> str:
+Worker = Callable[[dict[str, Any]], Mapping[str, Any]]
+
+
+def _research_text(value: Any, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
-        raise ValueError("upstream research text is invalid")
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
     normalized = value.strip()
-    if (not normalized and not allow_empty) or any(ord(character) < 32 for character in normalized):
-        raise ValueError("upstream research text is invalid")
+    if not allow_empty and not normalized:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    if len(normalized) > 100_000 or any(
+        ord(character) < 32 and character not in "\t\n\r" for character in normalized
+    ):
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
     return normalized
 
 
-def _text_list(value: Any, field_name: str) -> tuple[str, ...]:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        raise ValueError(f"research {field_name} must be a list of nonempty text")
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in value:
-        try:
-            text = _valid_plain_text(item)
-        except ValueError:
-            raise ValueError(f"research {field_name} must be a list of nonempty text") from None
-        if text not in seen:
-            normalized.append(text)
-            seen.add(text)
-    return tuple(normalized)
+def _is_safe_symbol(value: Any) -> bool:
+    return isinstance(value, str) and _SAFE_SYMBOL.fullmatch(value) is not None
 
 
-def _parse_timestamp(value: Any) -> datetime:
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, str):
+def _is_safe_id(value: Any) -> bool:
+    return isinstance(value, str) and _SAFE_ID.fullmatch(value) is not None
+
+
+def _exact_iso_date(value: Any) -> date | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.isoformat() == value else None
+
+
+def _canonical_host(host: str) -> str:
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            raise ValueError("research evidence has an invalid source timestamp") from None
-    else:
-        raise ValueError("research evidence requires a source timestamp")
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("research evidence source timestamp must be timezone-aware")
-    return parsed.astimezone(UTC)
+            ascii_host = host.encode("idna").decode("ascii").lower()
+        except (UnicodeError, ValueError):
+            raise ValueError("research evidence URI is invalid") from None
+        if len(ascii_host) > 253:
+            raise ValueError("research evidence URI is invalid") from None
+        labels = ascii_host.split(".")
+        if not labels or any(not _DNS_LABEL.fullmatch(label) for label in labels):
+            raise ValueError("research evidence URI is invalid") from None
+        return ascii_host
+    return f"[{ip.compressed}]" if ip.version == 6 else ip.compressed
 
 
 def _canonical_evidence_uri(value: Any) -> str:
-    if not isinstance(value, str):
+    """Validate a source URI without ever echoing untrusted input."""
+
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value
+        or any(character.isspace() or ord(character) < 32 for character in value)
+        or _BAD_PERCENT_ESCAPE.search(value)
+    ):
         raise ValueError("research evidence URI is invalid")
-    parsed = urlsplit(value.strip())
-    if parsed.scheme.lower() != "https" or not parsed.hostname:
-        raise ValueError("research evidence URI must be an absolute HTTPS URI")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("research evidence URI cannot contain credentials")
     try:
+        parsed = urlsplit(value)
         port = parsed.port
-    except ValueError:
+    except (UnicodeError, ValueError):
         raise ValueError("research evidence URI is invalid") from None
-    host = parsed.hostname.lower()
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+    ):
+        raise ValueError("research evidence URI is invalid")
+    host = _canonical_host(parsed.hostname)
     netloc = host if port in (None, 443) else f"{host}:{port}"
-    return SplitResult("https", netloc, parsed.path or "/", parsed.query, "").geturl()
+    return SplitResult("https", netloc, parsed.path or "/", "", "").geturl()
 
 
-def _evidence(value: Any, as_of: datetime) -> tuple[Evidence, ...]:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)) or not value:
-        raise ValueError("research evidence requires at least one timestamped source")
-    result: list[Evidence] = []
-    seen: set[str] = set()
-    for item in value:
-        if not isinstance(item, Mapping) or set(item) != {"uri", "title", "published_at"}:
-            raise ValueError("research evidence entries require URI, title, and source timestamp")
-        uri = _canonical_evidence_uri(item["uri"])
-        try:
-            title = _valid_plain_text(item["title"])
-        except ValueError:
-            raise ValueError("research evidence title is invalid") from None
-        published_at = _parse_timestamp(item["published_at"])
-        if published_at > as_of:
-            raise ValueError("look-ahead evidence is not permitted")
-        if uri not in seen:
-            result.append(Evidence(uri=uri, title=title, published_at=published_at))
-            seen.add(uri)
-    return tuple(result)
+def _validate_debate(value: Any, expected_fields: frozenset[str]) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != expected_fields:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    result: dict[str, Any] = {}
+    for key in expected_fields:
+        item = value[key]
+        if key == "count":
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+            result[key] = item
+        else:
+            result[key] = _research_text(item, allow_empty=True)
+    return result
 
 
-def _normalized_confidence(value: Any, scale: Any) -> Decimal:
-    if isinstance(value, bool) or not isinstance(scale, str):
-        raise ValueError("research confidence and its scale are invalid")
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError("research confidence must be finite")
+def _validate_state(value: Any, symbol: str, requested_date: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != _AGENT_STATE_FIELDS:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    state: dict[str, Any] = {}
+    for key in _STATE_TEXT_FIELDS:
+        state[key] = _research_text(value[key], allow_empty=True)
+    if state["company_of_interest"] != symbol or state["trade_date"] != requested_date:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    state["investment_debate_state"] = _validate_debate(
+        value["investment_debate_state"], _INVEST_DEBATE_FIELDS
+    )
+    state["risk_debate_state"] = _validate_debate(
+        value["risk_debate_state"], _RISK_DEBATE_FIELDS
+    )
+    messages = value["messages"]
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes, bytearray)):
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    state["messages"] = list(messages)
+    return state
+
+
+def _stock_call(
+    message: Mapping[str, Any], symbol: str, requested: date
+) -> dict[str, tuple[date, date]]:
+    calls: dict[str, tuple[date, date]] = {}
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, Sequence) or isinstance(tool_calls, (str, bytes, bytearray)):
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    for call in tool_calls:
+        if not isinstance(call, Mapping) or call.get("name") != "get_stock_data":
+            continue
+        if set(call) != {"name", "args", "id", "type"} or call.get("type") != "tool_call":
+            continue
+        call_id = call.get("id")
+        args = call.get("args")
+        if not _is_safe_id(call_id) or not isinstance(args, Mapping):
+            continue
+        if set(args) != {"symbol", "start_date", "end_date"} or args.get("symbol") != symbol:
+            continue
+        start = _exact_iso_date(args.get("start_date"))
+        end = _exact_iso_date(args.get("end_date"))
+        if start is None or end is None or start > end or end > requested:
+            continue
+        assert isinstance(call_id, str)
+        if call_id in calls:
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        calls[call_id] = (start, end)
+    return calls
+
+
+def _parse_stock_tool_result(
+    content: Any,
+    symbol: str,
+    start: date,
+    end: date,
+    requested: date,
+) -> date:
+    if not isinstance(content, str) or len(content) > 5_000_000:
+        raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+    sections = content.split("\n\n")
+    if len(sections) != 2:
+        raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+    header_lines = sections[0].splitlines()
+    expected_heading = (
+        f"# Stock data for {symbol.upper()} from {start.isoformat()} to {end.isoformat()}"
+    )
+    if len(header_lines) != 3 or header_lines[0] != expected_heading:
+        raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+    total_text = header_lines[1].removeprefix("# Total records: ")
+    if (
+        header_lines[1] != f"# Total records: {total_text}"
+        or not total_text.isascii()
+        or not total_text.isdecimal()
+    ):
+        raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+    retrieved_text = header_lines[2].removeprefix("# Data retrieved on: ")
     try:
-        confidence = Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        raise ValueError("research confidence is invalid") from None
-    if not confidence.is_finite():
-        raise ValueError("research confidence must be finite")
-    if scale == "unit_interval":
-        normalized = confidence
-        upper_bound = Decimal("1")
-    elif scale == "percent":
-        normalized = confidence / Decimal("100")
-        upper_bound = Decimal("100")
-    else:
-        raise ValueError("research confidence uses an unsupported scale")
-    if confidence < 0 or confidence > upper_bound:
-        raise ValueError("research confidence is outside its supported scale")
-    return normalized
+        retrieved_at = datetime.strptime(retrieved_text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON) from None
+    if (
+        header_lines[2] != f"# Data retrieved on: {retrieved_text}"
+        or retrieved_at.strftime("%Y-%m-%d %H:%M:%S") != retrieved_text
+    ):
+        raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+    reader = csv.DictReader(io.StringIO(sections[1]))
+    required = {"Date", "Open", "High", "Low", "Close", "Volume"}
+    if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+        raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+    if len(reader.fieldnames) != len(set(reader.fieldnames)):
+        raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+    observed: list[date] = []
+    for row in reader:
+        if None in row or not all(isinstance(row.get(field), str) for field in required):
+            raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+        observed_date = _exact_iso_date(row["Date"])
+        if observed_date is None or observed_date < start:
+            raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+        if observed_date > requested:
+            raise ResearchUnavailable(LOOK_AHEAD_EVIDENCE_REASON)
+        if observed and observed_date <= observed[-1]:
+            raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+        for field in required - {"Date"}:
+            try:
+                number = Decimal(row[field])
+            except InvalidOperation:
+                raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON) from None
+            if not number.is_finite():
+                raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+        observed.append(observed_date)
+    if len(observed) != int(total_text) or not observed:
+        raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+    return max(observed)
 
 
-def _contains_trading_instruction(payload: Mapping[str, Any]) -> bool:
-    for key in payload:
-        if not isinstance(key, str):
-            return True
-        normalized = key.lower().replace("-", "_")
-        if any(fragment in normalized for fragment in _TRADE_FIELD_FRAGMENTS):
-            return True
-    return False
+def _extract_evidence(
+    messages: Sequence[Any], symbol: str, requested: date, as_of: datetime
+) -> tuple[Evidence, ...]:
+    calls: dict[str, tuple[date, date]] = {}
+    for message in messages:
+        if not isinstance(message, Mapping):
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        if message.get("type") == "ai":
+            calls.update(_stock_call(message, symbol, requested))
+
+    latest: date | None = None
+    for message in messages:
+        if not isinstance(message, Mapping) or message.get("type") != "tool":
+            continue
+        if message.get("name") != "get_stock_data":
+            continue
+        call_id = message.get("tool_call_id")
+        if not isinstance(call_id, str) or call_id not in calls:
+            continue
+        start, end = calls[call_id]
+        observed = _parse_stock_tool_result(
+            message.get("content"), symbol, start, end, requested
+        )
+        if latest is None or observed > latest:
+            latest = observed
+    if latest is None:
+        raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+    published_at = datetime.combine(latest, datetime.min.time(), tzinfo=UTC)
+    if published_at > as_of:
+        raise ResearchUnavailable(LOOK_AHEAD_EVIDENCE_REASON)
+    uri = _canonical_evidence_uri(
+        f"https://finance.yahoo.com/quote/{quote(symbol, safe='')}/history"
+    )
+    return (
+        Evidence(
+            uri=uri,
+            title=f"{symbol} historical market data (Yahoo Finance)",
+            published_at=published_at,
+        ),
+    )
+
+
+def _is_secret_key(key: str) -> bool:
+    normalized = key.lower().replace("-", "_")
+    return any(part in normalized for part in _SECRET_KEY_PARTS)
+
+
+def _safe_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        return value
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+            if _is_secret_key(key):
+                continue
+            result[key] = _safe_json_value(item)
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_safe_json_value(item) for item in value]
+    raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
 
 
 def _public_configuration(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
-        raise ValueError("research configuration provenance is invalid")
-    public: dict[str, Any] = {}
-    for key in sorted(_PUBLIC_CONFIGURATION_FIELDS):
-        if key not in value:
-            continue
-        item = value[key]
-        if isinstance(item, (str, bool, int)) or item is None:
-            public[key] = item
-        elif isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
-            if not all(isinstance(element, str) for element in item):
-                raise ValueError("research configuration provenance is invalid")
-            public[key] = list(item)
-        else:
-            raise ValueError("research configuration provenance is invalid")
-    public["upstream_commit"] = PINNED_TRADINGAGENTS_COMMIT
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    unknown = {
+        key
+        for key in value
+        if not isinstance(key, str)
+        or (key not in _PUBLIC_CONFIGURATION_FIELDS and not _is_secret_key(key))
+    }
+    if unknown:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    missing = _PUBLIC_CONFIGURATION_FIELDS - set(value)
+    if missing:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    public = {
+        key: _safe_json_value(value[key])
+        for key in sorted(_PUBLIC_CONFIGURATION_FIELDS)
+    }
+    if (
+        public["upstream_commit"] != PINNED_TRADINGAGENTS_COMMIT
+        or public["confidence_method"] != _CONFIDENCE_METHOD
+    ):
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
     return public
 
 
@@ -248,47 +466,57 @@ def _configuration_hash(
 
 
 class TauricResearchProvider:
-    """Convert sanitized Tauric output to research-only domain data."""
+    """Convert a sanitized real AgentState to research-only domain data."""
 
     def __init__(self, *, runner: TauricRunner, prompt_version: str) -> None:
-        try:
-            self._prompt_version = _valid_plain_text(prompt_version)
-        except ValueError:
-            raise ValueError("prompt version is invalid") from None
+        if not _is_safe_id(prompt_version):
+            raise ValueError("prompt version is invalid")
+        self._prompt_version = prompt_version
         self._runner = runner
 
     def analyze(self, instrument: Instrument, as_of: datetime) -> ResearchPacket:
         if as_of.tzinfo is None or as_of.utcoffset() is None:
             raise ValueError("as_of must be timezone-aware")
         normalized_as_of = as_of.astimezone(UTC)
+        if not _is_safe_symbol(instrument.symbol):
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        requested_date = normalized_as_of.date().isoformat()
         try:
-            raw_payload = self._runner.propagate(
-                instrument.symbol, normalized_as_of.date().isoformat()
-            )
+            raw = self._runner.propagate(instrument.symbol, requested_date)
+        except ResearchDependencyUnavailable:
+            raise ResearchDependencyUnavailable() from None
         except Exception:
-            raise ResearchUnavailable("Tauric research failed closed") from None
-        if not isinstance(raw_payload, Mapping) or not all(
-            isinstance(key, str) for key in raw_payload
-        ):
-            raise ValueError("upstream research must be a sanitized mapping")
-        if _contains_trading_instruction(raw_payload):
-            raise ValueError("research cannot contain trading instructions")
-        if not set(raw_payload).issubset(_PAYLOAD_FIELDS):
-            raise ValueError("upstream research mapping contains unsupported fields")
-
-        thesis = _valid_plain_text(raw_payload.get("thesis", ""), allow_empty=True)
-        bear_case = _valid_plain_text(raw_payload.get("bear_case", ""), allow_empty=True)
+            raise ResearchUnavailable(_UPSTREAM_FAILURE_REASON) from None
+        if not isinstance(raw, Mapping) or set(raw) != {"state", "model_id", "configuration"}:
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        model_id = raw["model_id"]
+        if not _is_safe_id(model_id):
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        assert isinstance(model_id, str)
+        state = _validate_state(raw["state"], instrument.symbol, requested_date)
+        debate = state["investment_debate_state"]
+        assert isinstance(debate, dict)
+        thesis = debate["bull_history"]
+        bear_case = debate["bear_history"]
+        assert isinstance(thesis, str)
+        assert isinstance(bear_case, str)
         if not thesis and not bear_case:
-            raise ValueError("research requires a nonempty thesis or bear case")
-        catalysts = _text_list(raw_payload.get("catalysts", ()), "catalysts")
-        risks = _text_list(raw_payload.get("risks", ()), "risks")
-        confidence = _normalized_confidence(
-            raw_payload.get("confidence"), raw_payload.get("confidence_scale")
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        messages = state["messages"]
+        assert isinstance(messages, list)
+        evidence = _extract_evidence(
+            messages,
+            instrument.symbol,
+            normalized_as_of.date(),
+            normalized_as_of,
         )
-        model_id = _valid_plain_text(raw_payload.get("model_id"))
-        evidence = _evidence(raw_payload.get("evidence"), normalized_as_of)
+        confidence = Decimal("0.50")
+        if thesis:
+            confidence += Decimal("0.25")
+        if bear_case:
+            confidence += Decimal("0.25")
         configuration_hash = _configuration_hash(
-            raw_payload.get("configuration"),
+            raw["configuration"],
             model_id=model_id,
             prompt_version=self._prompt_version,
         )
@@ -297,8 +525,8 @@ class TauricResearchProvider:
             as_of=normalized_as_of,
             thesis=thesis,
             bear_case=bear_case,
-            catalysts=catalysts,
-            risks=risks,
+            catalysts=(),
+            risks=(),
             evidence=evidence,
             confidence=confidence,
             model_id=model_id,
@@ -307,8 +535,187 @@ class TauricResearchProvider:
         )
 
 
+def _message_mapping(message: Any) -> dict[str, Any]:
+    if isinstance(message, Mapping):
+        message_type = message.get("type")
+        content = message.get("content")
+        tool_calls = message.get("tool_calls", [])
+        name = message.get("name")
+        tool_call_id = message.get("tool_call_id")
+    else:
+        message_type = getattr(message, "type", None)
+        content = getattr(message, "content", None)
+        tool_calls = getattr(message, "tool_calls", [])
+        name = getattr(message, "name", None)
+        tool_call_id = getattr(message, "tool_call_id", None)
+    if not isinstance(message_type, str) or not isinstance(content, str):
+        raise RuntimeError("invalid upstream message")
+    if message_type == "ai":
+        if not isinstance(tool_calls, Sequence):
+            raise RuntimeError("invalid upstream message")
+        sanitized_calls: list[dict[str, Any]] = []
+        for call in tool_calls:
+            if not isinstance(call, Mapping):
+                raise RuntimeError("invalid upstream message")
+            sanitized_calls.append(
+                {
+                    "name": call.get("name"),
+                    "args": call.get("args"),
+                    "id": call.get("id"),
+                    "type": call.get("type", "tool_call"),
+                }
+            )
+        return {"type": "ai", "content": content, "tool_calls": sanitized_calls}
+    if message_type == "tool":
+        return {
+            "type": "tool",
+            "content": content,
+            "name": name,
+            "tool_call_id": tool_call_id,
+        }
+    return {"type": message_type, "content": content}
+
+
+def _serialize_agent_state(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise RuntimeError("invalid upstream state")
+    result = {key: value.get(key) for key in _AGENT_STATE_FIELDS if key != "messages"}
+    messages = value.get("messages")
+    if not isinstance(messages, Sequence):
+        raise RuntimeError("invalid upstream state")
+    result["messages"] = [_message_mapping(message) for message in messages]
+    return result
+
+
+def _invoke_pinned_graph(request: dict[str, Any]) -> Mapping[str, Any]:
+    """Child-process worker that imports and calls only the pinned public API."""
+
+    graph_module = importlib.import_module("tradingagents.graph.trading_graph")
+    graph_class = getattr(graph_module, "TradingAgentsGraph", None)
+    if not callable(graph_class):
+        raise ImportError("pinned TradingAgents API unavailable")
+    graph = graph_class(
+        selected_analysts=tuple(request["selected_analysts"]),
+        config=request["config"],
+    )
+    upstream = graph.propagate(request["symbol"], request["date"])
+    if not isinstance(upstream, tuple) or len(upstream) != 2:
+        raise RuntimeError("invalid pinned TradingAgents result")
+    return _serialize_agent_state(upstream[0])
+
+
+def _worker_entry(
+    connection: Connection,
+    worker: Worker,
+    request: dict[str, Any],
+) -> None:
+    """Return fixed status codes so child errors and secrets never cross IPC."""
+
+    try:
+        result = worker(request)
+        if not isinstance(result, Mapping):
+            connection.send(("invalid", None))
+        else:
+            connection.send(("ok", dict(result)))
+    except (ImportError, ModuleNotFoundError):
+        connection.send(("dependency_unavailable", None))
+    except BaseException:
+        with suppress(BaseException):
+            connection.send(("upstream_unavailable", None))
+    finally:
+        connection.close()
+
+
+def _terminate_process(process: BaseProcess) -> None:
+    if not process.is_alive():
+        process.join(timeout=1)
+        return
+    process.terminate()
+    process.join(timeout=2)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=2)
+
+
+def _audited_config(
+    run_root: Path,
+    *,
+    llm_provider: str,
+    model_id: str,
+    checkpoint_enabled: bool,
+) -> dict[str, Any]:
+    return {
+        "project_dir": str(run_root),
+        "results_dir": str(run_root / "results"),
+        "data_cache_dir": str(run_root / "cache"),
+        "memory_log_path": str(run_root / "memory" / "trading_memory.md"),
+        "memory_log_max_entries": 0,
+        "llm_provider": llm_provider,
+        "deep_think_llm": model_id,
+        "quick_think_llm": model_id,
+        "backend_url": _SUPPORTED_ENDPOINTS[llm_provider],
+        "google_thinking_level": None,
+        "openai_reasoning_effort": None,
+        "anthropic_effort": None,
+        "temperature": 0.0,
+        "llm_max_retries": 0,
+        "checkpoint_enabled": checkpoint_enabled,
+        "output_language": "English",
+        "max_debate_rounds": 1,
+        "max_risk_discuss_rounds": 1,
+        "max_recur_limit": 100,
+        "news_article_limit": 20,
+        "global_news_article_limit": 10,
+        "global_news_lookback_days": 7,
+        "global_news_queries": [
+            "Federal Reserve interest rates inflation",
+            "S&P 500 earnings GDP economic outlook",
+            "geopolitical risk trade war sanctions",
+            "ECB Bank of England BOJ central bank policy",
+            "oil commodities supply chain energy",
+        ],
+        "data_vendors": {
+            "core_stock_apis": "yfinance",
+            "technical_indicators": "yfinance",
+            "fundamental_data": "yfinance",
+            "news_data": "yfinance",
+            "macro_data": "fred",
+            "prediction_markets": "polymarket",
+        },
+        "tool_vendors": {},
+        "benchmark_ticker": None,
+        "benchmark_map": {
+            ".NS": "^NSEI",
+            ".BO": "^BSESN",
+            ".T": "^N225",
+            ".HK": "^HSI",
+            ".L": "^FTSE",
+            ".TO": "^GSPTSE",
+            ".AX": "^AXJO",
+            ".SS": "000001.SS",
+            ".SZ": "399001.SZ",
+            "": "SPY",
+        },
+    }
+
+
+def _provenance(config: Mapping[str, Any], selected_analysts: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        "profile": _CONFIG_PROFILE,
+        "upstream_commit": PINNED_TRADINGAGENTS_COMMIT,
+        **{
+            key: config[key]
+            for key in _PUBLIC_CONFIGURATION_FIELDS
+            if key in config
+        },
+        "selected_analysts": list(selected_analysts),
+        "storage_scope": "isolated-per-run",
+        "confidence_method": _CONFIDENCE_METHOD,
+    }
+
+
 class TauricUpstreamRunner:
-    """Lazily invoke the exact reviewed TradingAgents API and sanitize its output."""
+    """Run the pinned graph in a killable process and return a real-state envelope."""
 
     def __init__(
         self,
@@ -318,14 +725,9 @@ class TauricUpstreamRunner:
         checkpoint_enabled: bool,
         selected_analysts: tuple[str, ...] = ("market", "news", "fundamentals"),
         timeout_seconds: float = 300.0,
+        worker: Worker = _invoke_pinned_graph,
     ) -> None:
         normalized_provider = llm_provider.strip().lower() if isinstance(llm_provider, str) else ""
-        normalized_model = model_id.strip() if isinstance(model_id, str) else ""
-        valid_model = (
-            bool(normalized_model)
-            and len(normalized_model) <= 200
-            and all(character.isprintable() for character in normalized_model)
-        )
         valid_analysts = (
             isinstance(selected_analysts, tuple)
             and bool(selected_analysts)
@@ -339,101 +741,103 @@ class TauricUpstreamRunner:
             and timeout_seconds > 0
         )
         if (
-            normalized_provider not in _SUPPORTED_LLM_PROVIDERS
-            or not valid_model
+            normalized_provider not in _SUPPORTED_ENDPOINTS
+            or not _is_safe_id(model_id)
             or type(checkpoint_enabled) is not bool
             or not valid_analysts
             or not valid_timeout
+            or not callable(worker)
         ):
             raise ValueError("Tauric runner configuration is invalid")
         self._llm_provider = normalized_provider
-        self._model_id = normalized_model
+        self._model_id = model_id
         self._checkpoint_enabled = checkpoint_enabled
         self._selected_analysts = selected_analysts
         self._timeout_seconds = float(timeout_seconds)
+        self._worker = worker
 
     def propagate(self, symbol: str, date: str) -> Mapping[str, Any]:
-        if not self._valid_symbol_and_date(symbol, date):
+        requested = _exact_iso_date(date)
+        if not _is_safe_symbol(symbol) or requested is None:
             raise ValueError("Tauric research request is invalid")
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tauric-research")
-        future = executor.submit(self._propagate, symbol, date)
+        with tempfile.TemporaryDirectory(prefix="market-sentinel-tauric-") as temporary:
+            config = _audited_config(
+                Path(temporary),
+                llm_provider=self._llm_provider,
+                model_id=self._model_id,
+                checkpoint_enabled=self._checkpoint_enabled,
+            )
+            Path(config["results_dir"]).mkdir(parents=True, exist_ok=True)
+            Path(config["data_cache_dir"]).mkdir(parents=True, exist_ok=True)
+            Path(config["memory_log_path"]).parent.mkdir(parents=True, exist_ok=True)
+            state = self._run_process(
+                {
+                    "symbol": symbol,
+                    "date": date,
+                    "selected_analysts": list(self._selected_analysts),
+                    "config": config,
+                }
+            )
+            return {
+                "state": state,
+                "model_id": self._model_id,
+                "configuration": _provenance(config, self._selected_analysts),
+            }
+
+    def _run_process(self, request: dict[str, Any]) -> Mapping[str, Any]:
+        context = multiprocessing.get_context("spawn")
+        receive, send = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_worker_entry,
+            args=(send, self._worker, request),
+            name="tauric-research",
+        )
+        started = False
         try:
-            return future.result(timeout=self._timeout_seconds)
-        except FutureTimeoutError:
-            future.cancel()
-            raise ResearchUnavailable("Tauric research timed out and failed closed") from None
-        except ResearchUnavailable:
-            raise
-        except Exception:
-            raise ResearchUnavailable("Tauric research failed closed") from None
+            try:
+                process.start()
+                started = True
+                send.close()
+            except Exception:
+                raise ResearchUnavailable(_UPSTREAM_FAILURE_REASON) from None
+            if not receive.poll(self._timeout_seconds):
+                if process.is_alive():
+                    _terminate_process(process)
+                    raise ResearchUnavailable(_TIMEOUT_REASON)
+                raise ResearchUnavailable(_UPSTREAM_FAILURE_REASON)
+            try:
+                response = receive.recv()
+            except (EOFError, OSError):
+                raise ResearchUnavailable(_UPSTREAM_FAILURE_REASON) from None
+            process.join(timeout=2)
+            if process.is_alive():
+                _terminate_process(process)
+                raise ResearchUnavailable(_UPSTREAM_FAILURE_REASON)
+            if (
+                not isinstance(response, tuple)
+                or len(response) != 2
+                or not isinstance(response[0], str)
+            ):
+                raise ResearchUnavailable(_UPSTREAM_FAILURE_REASON)
+            status, payload = response
+            if status == "dependency_unavailable":
+                raise ResearchDependencyUnavailable()
+            if status != "ok" or not isinstance(payload, Mapping):
+                raise ResearchUnavailable(_UPSTREAM_FAILURE_REASON)
+            return dict(payload)
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-
-    @staticmethod
-    def _valid_symbol_and_date(symbol: str, requested_date: str) -> bool:
-        if (
-            not isinstance(symbol, str)
-            or not symbol.strip()
-            or len(symbol) > 64
-            or not all(character.isprintable() for character in symbol)
-        ):
-            return False
-        try:
-            parsed_date = date.fromisoformat(requested_date)
-        except (TypeError, ValueError):
-            return False
-        return parsed_date.isoformat() == requested_date
-
-    def _propagate(self, symbol: str, requested_date: str) -> Mapping[str, Any]:
-        try:
-            graph_module = importlib.import_module("tradingagents.graph.trading_graph")
-            config_module = importlib.import_module("tradingagents.default_config")
-        except (ImportError, ModuleNotFoundError):
-            raise ResearchUnavailable(
-                "TradingAgents research is unavailable; install it with: "
-                f"{RESEARCH_INSTALL_COMMAND}"
-            ) from None
-
-        default_config = getattr(config_module, "DEFAULT_CONFIG", None)
-        graph_class = getattr(graph_module, "TradingAgentsGraph", None)
-        if not isinstance(default_config, Mapping) or not callable(graph_class):
-            raise ResearchUnavailable("Pinned TradingAgents API is unavailable")
-        config = copy.deepcopy(dict(default_config))
-        config["llm_provider"] = self._llm_provider
-        config["deep_think_llm"] = self._model_id
-        config["quick_think_llm"] = self._model_id
-        config["checkpoint_enabled"] = self._checkpoint_enabled
-
-        graph = graph_class(selected_analysts=self._selected_analysts, config=config)
-        upstream_result = graph.propagate(symbol, requested_date)
-        if (
-            not isinstance(upstream_result, tuple)
-            or len(upstream_result) != 2
-            or not isinstance(upstream_result[0], Mapping)
-        ):
-            raise ResearchUnavailable("Pinned TradingAgents returned an invalid result")
-        state = upstream_result[0]
-        research = state.get("research_packet", state)
-        if not isinstance(research, Mapping):
-            raise ResearchUnavailable("Pinned TradingAgents returned invalid research")
-        sanitized = {
-            key: copy.deepcopy(research[key]) for key in _PAYLOAD_FIELDS if key in research
-        }
-        sanitized["model_id"] = self._model_id
-        sanitized["configuration"] = {
-            "llm_provider": self._llm_provider,
-            "deep_think_llm": self._model_id,
-            "quick_think_llm": self._model_id,
-            "checkpoint_enabled": self._checkpoint_enabled,
-            "selected_analysts": list(self._selected_analysts),
-            "upstream_commit": PINNED_TRADINGAGENTS_COMMIT,
-        }
-        return sanitized
+            receive.close()
+            send.close()
+            if started and process.is_alive():
+                _terminate_process(process)
 
 
 __all__ = [
+    "INVALID_RESEARCH_STATE_REASON",
+    "NO_TRUSTWORTHY_EVIDENCE_REASON",
     "PINNED_TRADINGAGENTS_COMMIT",
     "RESEARCH_INSTALL_COMMAND",
+    "ResearchDependencyUnavailable",
     "ResearchUnavailable",
     "TauricResearchProvider",
     "TauricRunner",

@@ -1,38 +1,68 @@
 {
-  "thesis": "Durable services growth and improving margins support the long-term case.",
-  "bear_case": "Premium valuation leaves little room for weaker demand.",
-  "catalysts": [
-    "Next quarterly earnings release",
-    "New product cycle"
-  ],
-  "risks": [
-    "Multiple compression",
-    "Regulatory pressure"
-  ],
-  "confidence": 72,
-  "confidence_scale": "percent",
-  "model_id": "fixture-model",
-  "configuration": {
-    "llm_provider": "fixture",
-    "deep_think_llm": "fixture-model",
-    "quick_think_llm": "fixture-model",
-    "checkpoint_enabled": false,
-    "selected_analysts": [
-      "market",
-      "news",
-      "fundamentals"
-    ]
-  },
-  "evidence": [
+  "messages": [
     {
-      "uri": "https://example.test/aapl/earnings",
-      "title": "AAPL quarterly results",
-      "published_at": "2026-08-08T18:30:00Z"
+      "type": "human",
+      "content": "Research AAPL at the requested cutoff."
     },
     {
-      "uri": "https://example.test/aapl/products#launch",
-      "title": "AAPL product announcement",
-      "published_at": "2026-08-08T19:15:00+00:00"
+      "type": "ai",
+      "content": "",
+      "tool_calls": [
+        {
+          "name": "get_stock_data",
+          "args": {
+            "symbol": "AAPL",
+            "start_date": "2026-08-01",
+            "end_date": "2026-08-08"
+          },
+          "id": "call-market-1",
+          "type": "tool_call"
+        }
+      ]
+    },
+    {
+      "type": "tool",
+      "name": "get_stock_data",
+      "tool_call_id": "call-market-1",
+      "content": "# Stock data for AAPL from 2026-08-01 to 2026-08-08\n# Total records: 2\n# Data retrieved on: 2026-08-08 19:20:00\n\nDate,Open,High,Low,Close,Volume\n2026-08-07,220.00,224.00,219.00,223.00,1000\n2026-08-08,223.00,226.00,222.00,225.00,1100\n"
+    },
+    {
+      "type": "ai",
+      "content": "The market report is complete.",
+      "tool_calls": []
     }
-  ]
+  ],
+  "company_of_interest": "AAPL",
+  "asset_type": "stock",
+  "instrument_context": "AAPL equity listed in the United States.",
+  "trade_date": "2026-08-08",
+  "sender": "Risk Judge",
+  "market_report": "Price data was retrieved through the configured market-data tool.",
+  "sentiment_report": "Timestamped sentiment evidence was unavailable.",
+  "news_report": "A prose mention of https://untrusted.example/ on 2026-08-08 is not evidence.",
+  "fundamentals_report": "Fundamentals were reviewed without a timestamped structured source.",
+  "investment_debate_state": {
+    "bull_history": "Services growth and margin resilience support the constructive case.",
+    "bear_history": "Valuation and demand sensitivity support the cautious case.",
+    "history": "Bull and bear researchers debated the available facts.",
+    "current_response": "The evidence supports a balanced research view.",
+    "judge_decision": "The research debate is complete.",
+    "count": 2
+  },
+  "investment_plan": "Research-only plan; no execution authority.",
+  "trader_investment_plan": "Upstream trade-oriented text is not adapted into research.",
+  "risk_debate_state": {
+    "aggressive_history": "Aggressive risk view.",
+    "conservative_history": "Conservative risk view.",
+    "neutral_history": "Neutral risk view.",
+    "history": "Risk discussion history.",
+    "latest_speaker": "Neutral Analyst",
+    "current_aggressive_response": "Aggressive response.",
+    "current_conservative_response": "Conservative response.",
+    "current_neutral_response": "Neutral response.",
+    "judge_decision": "Risk review complete.",
+    "count": 3
+  },
+  "final_trade_decision": "BUY 100 SHARES",
+  "past_context": "No prior context."
 }
