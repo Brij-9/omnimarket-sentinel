@@ -61,3 +61,12 @@ def test_classifier_rejects_spread_at_and_above_the_configured_cap() -> None:
         classify_regime(bars, max_spread_bps=30, spread_bps=Decimal("30.01"))
         is MarketRegime.UNTRADEABLE
     )
+
+
+def test_classifier_rejects_recently_illiquid_market_despite_liquid_old_history() -> None:
+    """A full-history volume average can hide a current liquidity collapse."""
+    bars = list(trending_bars(count=80))
+    for index in range(60, 80):
+        bars[index] = bars[index].model_copy(update={"volume": Decimal("0")})
+
+    assert classify_regime(tuple(bars), max_spread_bps=30) is MarketRegime.UNTRADEABLE

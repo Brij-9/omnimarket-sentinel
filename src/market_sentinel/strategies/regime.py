@@ -46,7 +46,12 @@ def classify_regime(
             return MarketRegime.UNTRADEABLE
         if spread_cap == _ZERO or current_spread >= spread_cap:
             return MarketRegime.UNTRADEABLE
-        average_volume = sum((bar.volume for bar in checked), _ZERO) / Decimal(len(checked))
+        trailing_volume_bars = checked[-_FAST_WINDOW:]
+        if trailing_volume_bars[-1].volume <= _ZERO:
+            return MarketRegime.UNTRADEABLE
+        average_volume = sum(
+            (bar.volume for bar in trailing_volume_bars), _ZERO
+        ) / Decimal(_FAST_WINDOW)
         if average_volume < minimum_volume:
             return MarketRegime.UNTRADEABLE
 

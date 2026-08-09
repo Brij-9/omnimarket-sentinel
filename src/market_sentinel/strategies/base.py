@@ -18,6 +18,7 @@ class StrategyContext:
     spread_bps: Decimal = Decimal("0")
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "bars", tuple(self.bars))
         if not self.instrument_id.strip():
             raise ValueError("instrument_id must not be empty")
         if not isinstance(self.horizon, Horizon):

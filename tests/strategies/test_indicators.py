@@ -68,6 +68,13 @@ def test_rsi_uses_wilder_changes_and_defined_zero_loss_edges(
     assert rsi(values, window=values.__len__() - 1) == expected
 
 
+def test_rsi_applies_wilder_smoothing_after_its_seed_window() -> None:
+    """Skipping post-seed smoothing would return 75 instead of the hand-calculated 1500/17."""
+    values = [Decimal("1"), Decimal("2"), Decimal("4"), Decimal("3"), Decimal("6")]
+
+    assert rsi(values, window=3) == Decimal("88.23529411764705882352941177")
+
+
 def test_vwap_uses_typical_price_and_rejects_nonpositive_cumulative_volume() -> None:
     """Using close alone or dividing by zero gives the wrong liquidity-weighted price."""
     first, second = bar_series(count=2, start_price="10", increment="0")
@@ -109,26 +116,25 @@ def test_indicators_reject_invalid_windows_and_nonfinite_or_float_values() -> No
 
 def test_indicator_results_for_a_prefix_do_not_change_after_future_data_exists() -> None:
     """Reading beyond the supplied prefix would make historical replay look ahead."""
-    prefix_values = [Decimal("1"), Decimal("2"), Decimal("4"), Decimal("3")]
-    prefix_bars = bar_series(count=4, start_price="10", increment="1")
+    source_values = [Decimal("1"), Decimal("2"), Decimal("4"), Decimal("3")]
+    source_bars = list(bar_series(count=4, start_price="10", increment="1"))
+    cutoff = 4
     expected = (
-        sma(prefix_values, window=3),
-        ema(prefix_values, window=2),
-        atr(prefix_bars, window=2),
-        rsi(prefix_values, window=3),
-        vwap(prefix_bars, window=3),
+        sma(source_values[:cutoff], window=3),
+        ema(source_values[:cutoff], window=2),
+        atr(source_bars[:cutoff], window=2),
+        rsi(source_values[:cutoff], window=3),
+        vwap(source_bars[:cutoff], window=3),
     )
-    future_values = prefix_values + [Decimal("100")]
-    future_bars = prefix_bars + bar_series(count=1, start_price="100", increment="0")
+    source_values.extend([Decimal("1000"), Decimal("0.01")])
+    source_bars.extend(bar_series(count=2, start_price="1000", increment="-999"))
 
-    assert future_values[-1] == Decimal("100")
-    assert future_bars[-1].close == Decimal("100.25")
     assert (
-        sma(prefix_values, window=3),
-        ema(prefix_values, window=2),
-        atr(prefix_bars, window=2),
-        rsi(prefix_values, window=3),
-        vwap(prefix_bars, window=3),
+        sma(source_values[:cutoff], window=3),
+        ema(source_values[:cutoff], window=2),
+        atr(source_bars[:cutoff], window=2),
+        rsi(source_values[:cutoff], window=3),
+        vwap(source_bars[:cutoff], window=3),
     ) == expected
 
 
@@ -149,3 +155,17 @@ def test_strategy_context_is_immutable_and_strategy_is_a_structural_protocol() -
     assert isinstance(NoopStrategy(), Strategy)
     with pytest.raises(FrozenInstanceError):
         context.instrument_id = "MSFT@alpaca"  # type: ignore[misc]
+
+
+def test_strategy_context_copies_a_mutable_bar_collection() -> None:
+    """Retaining a caller's list would let later mutations rewrite point-in-time strategy input."""
+    supplied_bars = list(bar_series(count=1))
+    context = StrategyContext(
+        instrument_id="AAPL@alpaca",
+        bars=supplied_bars,  # type: ignore[arg-type]
+        horizon=Horizon.SWING,
+    )
+    supplied_bars.append(bar_series(count=1, start_price="999", increment="0")[0])
+
+    assert isinstance(context.bars, tuple)
+    assert context.bars == (bar_series(count=1)[0],)
