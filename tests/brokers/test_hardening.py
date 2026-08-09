@@ -250,13 +250,26 @@ def test_alpaca_client_reference_lookup_and_cancel_are_not_server_lookup() -> No
 
 
 def test_ccxt_positions_use_spot_balance_not_derivatives_positions() -> None:
+    class Valuation:
+        def value_spot(self, _: str, currency: str, quote: str, __: object) -> dict[str, object]:
+            return {
+                "instrument_id": f"{currency}/{quote}@ccxt-spot",
+                "average_price": "100",
+                "market_price": "101",
+                "at": NOW,
+            }
+
     exchange = FakeCcxtExchange(_market())
-    exchange.balance = {"BTC": {"free": "1", "total": "1", "average": "100", "last": "101"}}
-    broker = CcxtSpotBroker(ccxt_settings(), exchange=exchange)
+    exchange.balance = {"free": {}, "used": {}, "total": {"BTC": "1"}, "info": {}}
+    broker = CcxtSpotBroker(
+        ccxt_settings(),
+        exchange=exchange,
+        valuation_provider=Valuation(),
+    )
 
     positions = broker.positions()
 
-    assert positions[0].instrument_id == "BTC@ccxt-spot"
+    assert positions[0].instrument_id == "BTC/USDT@ccxt-spot"
     assert exchange.fetch_positions_called is False
 
 

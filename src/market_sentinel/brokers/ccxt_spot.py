@@ -1,9 +1,11 @@
-"""Fail-closed, native-spot-only CCXT adapter using injected exchanges."""
+"""Fail-closed native-spot CCXT adapter using only injected boundaries."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, Protocol, TypeVar
 
 from market_sentinel.brokers._records import (
@@ -33,16 +35,14 @@ _T = TypeVar("_T")
 class CcxtConnectionConfig:
     exchange_id: str
     enable_rate_limit: bool
-    api_key: str
-    secret: str
+    api_key: str = ""
+    secret: str = ""
 
     def __repr__(self) -> str:
         present = bool(self.api_key and self.secret)
         return (
             "CcxtConnectionConfig("
-            f"exchange_id={self.exchange_id!r}, "
-            f"enable_rate_limit={self.enable_rate_limit!r}, "
-            f"credentials_present={present!r})"
+            f"exchange_id={self.exchange_id!r}, credentials_present={present!r})"
         )
 
 
@@ -70,6 +70,12 @@ class CcxtExchange(Protocol):
     def fetch_balance(self) -> Mapping[str, object]: ...
 
 
+class SpotValuationProvider(Protocol):
+    def value_spot(
+        self, exchange_id: str, currency: str, quote_currency: str, quantity: Decimal
+    ) -> object: ...
+
+
 CcxtExchangeFactory = Callable[[CcxtConnectionConfig], CcxtExchange]
 
 
@@ -82,23 +88,22 @@ class CcxtSpotBroker:
         *,
         exchange: CcxtExchange | None = None,
         exchange_factory: CcxtExchangeFactory | None = None,
+        valuation_provider: SpotValuationProvider | None = None,
+        quote_currency: str = "USDT",
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._settings, self._exchange, self._exchange_factory = (
             settings,
             exchange,
             exchange_factory,
         )
+        self._valuation, self._quote, self._clock = valuation_provider, quote_currency, clock
         self._markets: Mapping[str, object] = {}
+        self._prepared = False
 
     @classmethod
-    def from_settings(
-        cls,
-        settings: Settings,
-        *,
-        exchange: CcxtExchange | None = None,
-        exchange_factory: CcxtExchangeFactory | None = None,
-    ) -> CcxtSpotBroker:
-        return cls(settings, exchange=exchange, exchange_factory=exchange_factory)
+    def from_settings(cls, settings: Settings, **kwargs: object) -> CcxtSpotBroker:
+        return cls(settings, **kwargs)  # type: ignore[arg-type]
 
     def capabilities(self) -> BrokerCapabilities:
         return BrokerCapabilities(
@@ -132,38 +137,32 @@ class CcxtSpotBroker:
             gates.append(gate("CCXT_MARKETS_ACCESSIBLE", False, "MARKETS_UNAVAILABLE"))
             return PreflightReport(self.broker_name, tuple(gates))
         try:
-            exchange = self._get_exchange()
-            configured = (
-                exchange.id == s.ccxt_exchange_id
-                and exchange.enableRateLimit is True
-                and exchange.options.get("defaultType") == "spot"
-            )
-            gates.append(gate("CCXT_EXCHANGE_CONFIGURED", configured))
-            if not configured:
-                return PreflightReport(self.broker_name, tuple(gates))
-            if s.ccxt_sandbox:
-                self._call(lambda: exchange.set_sandbox_mode(True))
-            self._markets = self._call(exchange.load_markets)
+            exchange = self._prepare_exchange()
             gates.extend(
                 [
+                    gate("CCXT_EXCHANGE_CONFIGURED", True),
                     gate("CCXT_SPOT_MARKETS_AVAILABLE", _valid_market_set(self._markets)),
                     gate("CCXT_CREATE_ORDER_SUPPORTED", exchange.has.get("createOrder") is True),
                 ]
             )
         except RuntimeError:
-            gates.append(gate("CCXT_MARKETS_ACCESSIBLE", False, "MARKETS_UNAVAILABLE"))
+            gates.extend(
+                [
+                    gate("CCXT_EXCHANGE_CONFIGURED", False, "EXCHANGE_INVALID"),
+                    gate("CCXT_MARKETS_ACCESSIBLE", False, "MARKETS_UNAVAILABLE"),
+                ]
+            )
         return PreflightReport(self.broker_name, tuple(gates))
 
     def submit(self, intent: OrderIntent, snapshot: MarketSnapshot) -> BrokerOrder:
-        del snapshot
         self._require_ready()
+        exchange = self._prepare_exchange()
         if intent.product not in {"spot", "cash"}:
             raise ValueError("CCXT adapter is spot-only; leverage and derivatives are rejected")
         if intent.notional is not None or intent.quantity is None:
             raise ValueError("CCXT adapter requires an explicit base quantity")
         if intent.order_type not in {OrderType.MARKET, OrderType.LIMIT}:
             raise ValueError("CCXT market-order emulation and unsupported order types are rejected")
-        exchange = self._get_exchange()
         symbol = symbol_from_instrument(intent.instrument_id)
         market = self._markets.get(symbol)
         if market is None or not _valid_market(market):
@@ -174,25 +173,31 @@ class CcxtSpotBroker:
         ):
             raise ValueError("CCXT requires exact native market-order capability")
         amount = decimal(intent.quantity, positive=True)
-        normalized_amount = decimal(
-            self._call(lambda: exchange.amount_to_precision(symbol, str(amount))), positive=True
-        )
-        if normalized_amount != amount:
+        if (
+            decimal(
+                self._call(lambda: exchange.amount_to_precision(symbol, str(amount))), positive=True
+            )
+            != amount
+        ):
             raise ValueError("amount precision normalization changes the order")
         price = intent.limit_price
-        if price is not None:
-            normalized_price = decimal(
+        if (
+            price is not None
+            and decimal(
                 self._call(lambda: exchange.price_to_precision(symbol, str(price))), positive=True
             )
-            if normalized_price != price:
-                raise ValueError("price precision normalization changes the order")
+            != price
+        ):
+            raise ValueError("price precision normalization changes the order")
         limits = mapping(value(market, "limits"))
         amount_limits = mapping(value(limits, "amount"))
         cost_limits = mapping(value(limits, "cost"))
         if amount < decimal(value(amount_limits, "min"), positive=True):
             raise ValueError("quantity is below the configured spot market minimum")
         reference = (
-            price if price is not None else decimal(value(market, "reference_price"), positive=True)
+            price
+            if price is not None
+            else _snapshot_reference(snapshot, intent.instrument_id, self._now())
         )
         if amount * reference < decimal(value(cost_limits, "min"), positive=True):
             raise ValueError("order cost is below the configured spot market minimum")
@@ -209,10 +214,12 @@ class CcxtSpotBroker:
         )
 
     def get_order(self, order_id: str) -> BrokerOrder:
-        return self._order(lambda: self._get_exchange().fetch_order(order_id))
+        return self._order(lambda: self._prepare_exchange().fetch_order(order_id))
 
     def get_order_by_client_id(self, client_intent_id: str) -> BrokerOrder:
-        return self._order(lambda: self._get_exchange().fetch_order_by_client_id(client_intent_id))
+        return self._order(
+            lambda: self._prepare_exchange().fetch_order_by_client_id(client_intent_id)
+        )
 
     def list_orders(self) -> tuple[BrokerOrder, ...]:
         return ()
@@ -231,29 +238,64 @@ class CcxtSpotBroker:
         raise NotImplementedError("CCXT spot cancellation is not advertised")
 
     def positions(self) -> tuple[Position, ...]:
-        balance = self._call(self._get_exchange().fetch_balance)
-        positions: list[Position] = []
-        for symbol, raw in balance.items():
-            if not isinstance(raw, Mapping):
-                continue
-            try:
-                total = decimal(raw.get("total"), nonnegative=True)
-                if total == 0:
+        try:
+            balance = self._call(self._prepare_exchange().fetch_balance)
+            total = _standard_total(balance)
+            positions: list[Position] = []
+            for currency, raw_quantity in total.items():
+                quantity = decimal(raw_quantity, nonnegative=True)
+                if quantity == 0 or currency == self._quote:
                     continue
-                average = decimal(raw.get("average"), nonnegative=True)
-                last = decimal(raw.get("last"), nonnegative=True)
-            except ValueError:
-                raise RuntimeError("ccxt client operation failed") from None
-            positions.append(
-                Position(
-                    instrument_id=f"{symbol}@{self.broker_name}",
-                    quantity=total,
-                    average_price=average,
-                    market_price=last,
-                    unrealized_pnl=(last - average) * total,
+                positions.append(self._valued_position(currency, quantity))
+            return tuple(positions)
+        except Exception:
+            pass
+        raise RuntimeError("ccxt client operation failed")
+
+    def _valued_position(self, currency: str, quantity: Decimal) -> Position:
+        if self._valuation is None:
+            raise RuntimeError("ccxt client operation failed")
+        valuation = self._valuation
+        assert valuation is not None
+        record = mapping(
+            self._call(
+                lambda: valuation.value_spot(
+                    self._settings.ccxt_exchange_id, currency, self._quote, quantity
                 )
             )
-        return tuple(positions)
+        )
+        if record.get("instrument_id") != f"{currency}/{self._quote}@{self.broker_name}":
+            raise RuntimeError("ccxt client operation failed")
+        at = record.get("at")
+        if type(at) is not datetime or at.tzinfo is None or at.utcoffset() is None:
+            raise RuntimeError("ccxt client operation failed")
+        average, market = (
+            decimal(record.get("average_price"), positive=True),
+            decimal(record.get("market_price"), positive=True),
+        )
+        return Position(
+            instrument_id=str(record["instrument_id"]),
+            quantity=quantity,
+            average_price=average,
+            market_price=market,
+            unrealized_pnl=(market - average) * quantity,
+        )
+
+    def _prepare_exchange(self) -> CcxtExchange:
+        exchange = self._get_exchange()
+        if self._prepared:
+            return exchange
+        if (
+            exchange.id != self._settings.ccxt_exchange_id
+            or exchange.enableRateLimit is not True
+            or exchange.options.get("defaultType") != "spot"
+        ):
+            raise RuntimeError("ccxt client operation failed")
+        if self._settings.ccxt_sandbox:
+            self._call(lambda: exchange.set_sandbox_mode(True))
+        self._markets = self._call(exchange.load_markets)
+        self._prepared = True
+        return exchange
 
     def _order(self, operation: Callable[[], object], client_id: str = "") -> BrokerOrder:
         return self._call(
@@ -273,32 +315,59 @@ class CcxtSpotBroker:
         if self._exchange is None:
             if self._exchange_factory is None:
                 raise RuntimeError("ccxt client operation failed")
-            factory = self._exchange_factory
-            assert factory is not None
             config = CcxtConnectionConfig(
                 self._settings.ccxt_exchange_id,
                 True,
                 self._settings.ccxt_api_key,
                 self._settings.ccxt_secret,
             )
+            factory = self._exchange_factory
+            assert factory is not None
             self._exchange = self._call(lambda: factory(config))
         return self._exchange
+
+    def _now(self) -> datetime:
+        if self._clock is None:
+            raise ValueError("snapshot reference is unavailable")
+        now = self._call(self._clock)
+        if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("snapshot reference is unavailable")
+        return now.astimezone(UTC)
 
     def _require_ready(self) -> None:
         if not self.preflight().ready:
             raise PermissionError("broker preflight is not ready")
 
 
+def _standard_total(balance: object) -> Mapping[str, object]:
+    data = mapping(balance)
+    if set(data) - {"free", "used", "total", "info"}:
+        raise RuntimeError("ccxt client operation failed")
+    if not all(isinstance(data.get(key), Mapping) for key in ("free", "used", "total", "info")):
+        raise RuntimeError("ccxt client operation failed")
+    return mapping(data["total"])
+
+
+def _snapshot_reference(snapshot: MarketSnapshot, instrument_id: str, now: datetime) -> Decimal:
+    if (
+        snapshot.instrument_id != instrument_id
+        or snapshot.observed_at > now
+        or snapshot.source_at > now
+        or snapshot.is_stale(now)
+        or not snapshot.bars
+    ):
+        raise ValueError("snapshot reference is unavailable")
+    return decimal(snapshot.bars[-1].close, positive=True)
+
+
 def _valid_market_set(markets: Mapping[str, object]) -> bool:
-    return any(_valid_market(market) for market in markets.values())
+    return any(_valid_market(m) for m in markets.values())
 
 
 def _valid_market(market: object) -> bool:
     try:
-        precision = mapping(value(market, "precision"))
-        limits = mapping(value(market, "limits"))
-        amount = mapping(value(limits, "amount"))
-        cost = mapping(value(limits, "cost"))
+        precision, limits = mapping(value(market, "precision")), mapping(value(market, "limits"))
+        amount, cost = mapping(value(limits, "amount")), mapping(value(limits, "cost"))
         return (
             value(market, "spot") is True
             and value(market, "active") is True

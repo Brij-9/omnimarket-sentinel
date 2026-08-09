@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Protocol, TypeVar
@@ -44,10 +44,13 @@ class GrowwClient(Protocol):
     def positions(self) -> Sequence[object]: ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class GrowwSession:
-    client: GrowwClient
+    client: GrowwClient = field(repr=False)
     expires_at: datetime
+
+    def __repr__(self) -> str:
+        return "GrowwSession(credentials_present=True)"
 
 
 class GrowwAuthProvider(Protocol):
@@ -66,8 +69,10 @@ class GrowwBroker:
         access_token_expires_at: datetime | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        self._settings, self._client, self._auth_provider = settings, client, auth_provider
-        self._access_token_expires_at, self._clock = access_token_expires_at, clock
+        self._settings, self._auth_provider, self._clock = settings, auth_provider, clock
+        self._direct_client = client
+        self._direct_expiry = access_token_expires_at
+        self._session: GrowwSession | None = None
 
     @classmethod
     def from_settings(
@@ -130,13 +135,13 @@ class GrowwBroker:
             return PreflightReport(self.broker_name, tuple(local))
         try:
             now = self._now()
-            client, expiry = self._authenticated_client(now)
-            fresh = _is_fresh(expiry, now)
+            session = self._authenticated_session(now)
+            fresh = _is_fresh(session.expires_at, now)
             local.append(gate("GROWW_AUTH_SESSION_FRESH", fresh))
             if not fresh:
                 return PreflightReport(self.broker_name, tuple(local))
-            profile = self._call(client.profile)
-            capabilities = self._call(client.capabilities)
+            profile = self._call(session.client.profile)
+            capabilities = self._call(session.client.capabilities)
             local.extend(
                 [
                     gate("GROWW_PROFILE_ACTIVE", value(profile, "active") is True),
@@ -238,15 +243,18 @@ class GrowwBroker:
         if self._clock is None:
             raise RuntimeError("groww client operation failed")
         now = self._call(self._clock)
-        if now.tzinfo is None or now.utcoffset() is None:
+        if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:
             raise RuntimeError("groww client operation failed")
         return now.astimezone(UTC)
 
-    def _authenticated_client(self, now: datetime) -> tuple[GrowwClient, datetime]:
-        if self._client is not None:
-            if self._access_token_expires_at is None:
+    def _authenticated_session(self, now: datetime) -> GrowwSession:
+        if self._session is not None:
+            return self._session
+        if self._direct_client is not None:
+            if self._direct_expiry is None:
                 raise RuntimeError("groww client operation failed")
-            return self._client, self._access_token_expires_at
+            self._session = GrowwSession(self._direct_client, self._direct_expiry)
+            return self._session
         if self._auth_provider is None:
             raise RuntimeError("groww client operation failed")
         provider = self._auth_provider
@@ -254,17 +262,19 @@ class GrowwBroker:
         session = self._call(lambda: provider.authenticated_session(self._settings, now))
         if not isinstance(session, GrowwSession):
             raise RuntimeError("groww client operation failed")
-        self._client = session.client
-        return session.client, session.expires_at
+        self._session = session
+        return session
 
     def _require_ready(self) -> None:
         if not self.preflight().ready:
             raise PermissionError("broker preflight is not ready")
 
     def _require_client(self) -> GrowwClient:
-        if self._client is None:
-            raise PermissionError("injected Groww client is required")
-        return self._client
+        if self._session is not None:
+            return self._session.client
+        if self._direct_client is not None:
+            return self._direct_client
+        raise PermissionError("injected Groww client is required")
 
 
 def _is_public_ipv4(value_: str) -> bool:
