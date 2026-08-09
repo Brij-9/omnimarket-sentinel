@@ -14,8 +14,12 @@ class FakeCcxtExchange:
     def __init__(self, market: Mapping[str, Any]) -> None:
         self.market = market
         self.calls: list[str] = []
-        self.has = {"createOrder": True}
+        self.id = "testexchange"
+        self.enableRateLimit = True
+        self.options = {"defaultType": "spot"}
+        self.has = {"createOrder": True, "createMarketOrder": True}
         self.submissions: list[dict[str, Any]] = []
+        self.fetch_positions_called = False
 
     def set_sandbox_mode(self, enabled: bool) -> None:
         assert enabled is True
@@ -24,6 +28,14 @@ class FakeCcxtExchange:
     def load_markets(self) -> Mapping[str, Mapping[str, Any]]:
         self.calls.append("markets")
         return {str(self.market["symbol"]): self.market}
+
+    def amount_to_precision(self, symbol: str, amount: str) -> str:
+        del symbol
+        return amount
+
+    def price_to_precision(self, symbol: str, price: str) -> str:
+        del symbol
+        return price
 
     def create_order(
         self,
@@ -66,8 +78,13 @@ class FakeCcxtExchange:
             "timestamp": 1786269600000,
         }
 
-    def fetch_positions(self) -> list[Mapping[str, Any]]:
-        return []
+    def fetch_order_by_client_id(self, client_order_id: str) -> Mapping[str, Any]:
+        order = dict(self.fetch_order("server-from-client-reference"))
+        order["clientOrderId"] = client_order_id
+        return order
+
+    def fetch_balance(self) -> Mapping[str, Any]:
+        return getattr(self, "balance", {})
 
 
 def _market() -> Mapping[str, Any]:

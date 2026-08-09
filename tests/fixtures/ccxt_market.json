@@ -1,1 +1,1 @@
-{"symbol":"BTC/USDT","spot":true,"active":true,"precision":{"amount":0.00001,"price":0.01},"limits":{"amount":{"min":0.00001},"cost":{"min":10}}}
+{"symbol":"BTC/USDT","spot":true,"active":true,"reference_price":"100","precision":{"amount":0.00001,"price":0.01},"limits":{"amount":{"min":0.00001},"cost":{"min":10}}}

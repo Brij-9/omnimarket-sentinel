@@ -28,7 +28,7 @@ class FakeAlpacaClient:
             "client_order_id": payload["client_order_id"],
             "symbol": payload["symbol"],
             "status": "accepted",
-            "qty": payload.get("qty", "0"),
+            "qty": payload.get("qty", "0.1"),
             "filled_qty": "0",
             "submitted_at": "2026-08-09T10:00:00Z",
             "updated_at": "2026-08-09T10:00:00Z",
@@ -45,6 +45,16 @@ class FakeAlpacaClient:
             "submitted_at": "2026-08-09T10:00:00Z",
             "updated_at": "2026-08-09T10:00:00Z",
         }
+
+    def get_order_by_client_id(self, client_order_id: str) -> Mapping[str, Any]:
+        order = dict(self.get_order("server-from-client-reference"))
+        order["client_order_id"] = client_order_id
+        return order
+
+    def cancel_order(self, order_id: str) -> Mapping[str, Any]:
+        order = dict(self.get_order(order_id))
+        order["status"] = "cancelled"
+        return order
 
     def get_positions(self) -> list[Mapping[str, Any]]:
         return []

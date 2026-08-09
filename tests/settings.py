@@ -18,7 +18,7 @@ def groww_settings(**overrides: Any) -> Settings:
         "GROWW_REAL_API_ENABLED": True,
         "GROWW_API_SUBSCRIPTION_ACTIVE": True,
         "GROWW_PROTECTED_ORDER_CLIENT": True,
-        "GROWW_STATIC_OUTBOUND_IP": "198.51.100.9",
+        "GROWW_STATIC_OUTBOUND_IP": "8.8.8.8",
         "GROWW_STATIC_IP_ALLOWLISTED": True,
         "GROWW_ALGO_ID": "approved-test-algo",
         "GROWW_ACCESS_TOKEN": "test-token",
