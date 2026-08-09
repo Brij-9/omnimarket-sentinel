@@ -10,6 +10,8 @@ from typing import Protocol, runtime_checkable
 from market_sentinel.domain.enums import Horizon, SignalDirection
 from market_sentinel.domain.models import Bar, Signal
 
+_MAX_PLAIN_DECIMAL_PADDING = 32
+
 
 @dataclass(frozen=True, slots=True)
 class StrategyContext:
@@ -104,7 +106,7 @@ def _canonical_value(value: object) -> tuple[str, str]:
     if type(value) is int:
         return "integer", str(value)
     if isinstance(value, Decimal) and value.is_finite():
-        return "decimal", "0" if value.is_zero() else format(value.normalize(), "f")
+        return "decimal", _exact_decimal_text(value)
     if isinstance(value, StrEnum):
         return "enum", value.value
     if isinstance(value, str):
@@ -116,6 +118,35 @@ def _canonical_value(value: object) -> tuple[str, str]:
     if value is None:
         return "null", "null"
     raise ValueError("strategy configuration contains a noncanonical value")
+
+
+def _exact_decimal_text(value: Decimal) -> str:
+    """Encode a finite Decimal exactly without context rounding or exponent-sized padding."""
+    if value.is_zero():
+        return "0"
+    decimal_tuple = value.as_tuple()
+    exponent = decimal_tuple.exponent
+    if not isinstance(exponent, int):
+        raise ValueError("strategy configuration contains a noncanonical Decimal")
+    digits = list(decimal_tuple.digits)
+    while digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    coefficient = "".join(str(digit) for digit in digits)
+    prefix = "-" if decimal_tuple.sign else ""
+    if exponent == 0:
+        return prefix + coefficient
+    if exponent > 0:
+        if exponent <= _MAX_PLAIN_DECIMAL_PADDING:
+            return prefix + coefficient + "0" * exponent
+        return f"{prefix}{coefficient}e{exponent}"
+    decimal_position = len(coefficient) + exponent
+    if decimal_position > 0:
+        return prefix + coefficient[:decimal_position] + "." + coefficient[decimal_position:]
+    leading_zeros = -decimal_position
+    if leading_zeros <= _MAX_PLAIN_DECIMAL_PADDING:
+        return prefix + "0." + "0" * leading_zeros + coefficient
+    return f"{prefix}{coefficient}e{exponent}"
 
 
 @runtime_checkable

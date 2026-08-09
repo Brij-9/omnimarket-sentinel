@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -457,6 +458,55 @@ def test_fill_model_rejects_event_before_submission() -> None:
             submitted_at=submitted,
             event_at=submitted - timedelta(microseconds=1),
         )
+
+
+@pytest.mark.parametrize(
+    ("submitted", "thirty_minutes", "sixty_minutes"),
+    [
+        (
+            datetime(2026, 3, 8, 1, 30, tzinfo=ZoneInfo("America/New_York")),
+            datetime(2026, 3, 8, 3, 0, tzinfo=ZoneInfo("America/New_York")),
+            datetime(2026, 3, 8, 3, 30, tzinfo=ZoneInfo("America/New_York")),
+        ),
+        (
+            datetime(2026, 11, 1, 1, 30, fold=0, tzinfo=ZoneInfo("America/New_York")),
+            datetime(2026, 11, 1, 1, 0, fold=1, tzinfo=ZoneInfo("America/New_York")),
+            datetime(2026, 11, 1, 1, 30, fold=1, tzinfo=ZoneInfo("America/New_York")),
+        ),
+    ],
+)
+def test_fill_model_latency_uses_absolute_elapsed_time_across_dst_folds(
+    submitted: datetime,
+    thirty_minutes: datetime,
+    sixty_minutes: datetime,
+) -> None:
+    """Same-zone wall-clock arithmetic is wrong across spring and fall DST transitions."""
+    model = FillModel(costs=CostModel(latency=timedelta(minutes=60)))
+
+    assert model.can_fill(submitted_at=submitted, event_at=thirty_minutes) is False
+    assert model.can_fill(submitted_at=submitted, event_at=sixty_minutes) is True
+    with pytest.raises(ValueError, match="latency"):
+        model.fill(
+            fill_id="too-early",
+            order_id="order",
+            instrument=instrument(),
+            side=Side.BUY,
+            quantity=Decimal("0.05"),
+            reference_price=Decimal("10"),
+            submitted_at=submitted,
+            filled_at=thirty_minutes,
+        )
+    exact = model.fill(
+        fill_id="exact",
+        order_id="order",
+        instrument=instrument(),
+        side=Side.BUY,
+        quantity=Decimal("0.05"),
+        reference_price=Decimal("10"),
+        submitted_at=submitted,
+        filled_at=sixty_minutes,
+    )
+    assert exact.filled_at == sixty_minutes.astimezone(UTC)
 
 
 def test_sell_fill_applies_adverse_spread_slippage_and_floor_rounding() -> None:

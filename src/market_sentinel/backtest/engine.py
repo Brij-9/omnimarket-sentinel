@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
@@ -187,11 +187,13 @@ class FillModel:
 
     def can_fill(self, *, submitted_at: datetime, event_at: datetime) -> bool:
         """Return latency eligibility after validating aware chronological timestamps."""
-        _require_aware_datetime(submitted_at, "submitted_at")
-        _require_aware_datetime(event_at, "event_at")
-        if event_at < submitted_at:
+        submitted_instant = _require_aware_datetime(
+            submitted_at, "submitted_at"
+        ).astimezone(UTC)
+        event_instant = _require_aware_datetime(event_at, "event_at").astimezone(UTC)
+        if event_instant < submitted_instant:
             raise ValueError("event_at must not precede submitted_at")
-        return event_at >= submitted_at + self.costs.latency
+        return event_instant >= submitted_instant + self.costs.latency
 
 
 @dataclass(frozen=True, slots=True)

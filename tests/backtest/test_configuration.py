@@ -1,7 +1,7 @@
 """Canonical strategy evidence must be derived from the strategy instance."""
 
 from datetime import time, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 
@@ -88,3 +88,55 @@ def test_caller_cannot_supply_or_misstate_strategy_parameters() -> None:
             initial_cash=Decimal("10"),
             parameters={"max_spread_bps": Decimal("999")},  # type: ignore[call-arg]
         )
+
+
+def _canonical_decimal(value: Decimal) -> str:
+    configuration = canonical_strategy_configuration(
+        metadata=SwingBreakoutStrategy.metadata,
+        parameters={"value": value},
+    )
+    return configuration.parameters[0].value
+
+
+def test_decimal_configuration_preserves_distinct_values_beyond_context_precision() -> None:
+    """Decimal.normalize rounded these distinct 29-digit values into identical evidence."""
+    first = Decimal("12345678901234567890123456781")
+    second = Decimal("12345678901234567890123456782")
+
+    with localcontext() as context:
+        context.prec = 4
+        first_text = _canonical_decimal(first)
+        second_text = _canonical_decimal(second)
+
+    assert first_text == "12345678901234567890123456781"
+    assert second_text == "12345678901234567890123456782"
+    assert first_text != second_text
+
+
+def test_decimal_configuration_canonicalizes_equal_scales_identically() -> None:
+    """Numerically equal finite Decimals must have one canonical representation."""
+    assert {_canonical_decimal(Decimal(text)) for text in ("1", "1.0", "1.000")} == {"1"}
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (Decimal("-12.5000"), "-12.5"),
+        (Decimal("0"), "0"),
+        (Decimal("-0.000"), "0"),
+        (Decimal("1E+100000"), "1e100000"),
+        (Decimal("1E-100000"), "1e-100000"),
+    ],
+)
+def test_decimal_configuration_handles_sign_zero_and_large_exponents_compactly(
+    value: Decimal, expected: str
+) -> None:
+    """Canonical evidence must be exact without exponent-sized string allocation."""
+    assert _canonical_decimal(value) == expected
+
+
+@pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")])
+def test_decimal_configuration_still_rejects_nonfinite_values(value: Decimal) -> None:
+    """Only finite Decimal values are valid canonical strategy evidence."""
+    with pytest.raises(ValueError, match="noncanonical"):
+        _canonical_decimal(value)
