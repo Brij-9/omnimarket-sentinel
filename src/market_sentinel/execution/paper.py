@@ -145,6 +145,7 @@ class _PaperState:
     orders: dict[str, _PaperOrderRecord]
     client_orders: dict[str, str]
     active_order_ids: dict[str, tuple[str, ...]]
+    reserved_order_ids: dict[str, tuple[str, ...]]
     snapshots: dict[str, MarketSnapshot]
     cursors: dict[str, _MarketCursor]
     fills: list[Fill]
@@ -176,6 +177,7 @@ class _StateJournal:
     order_values: dict[str, _PaperOrderRecord | _Missing]
     client_values: dict[str, str | _Missing]
     active_order_values: dict[str, tuple[str, ...] | _Missing]
+    reserved_order_values: dict[str, tuple[str, ...] | _Missing]
     snapshot_values: dict[str, MarketSnapshot | _Missing]
     cursor_values: dict[str, _MarketCursor | _Missing]
     instrument_values: dict[str, Instrument | _Missing]
@@ -221,6 +223,10 @@ class _StateJournal:
                 state.active_order_ids,
                 instrument_keys,
             ),
+            reserved_order_values=_capture_mapping_values(
+                state.reserved_order_ids,
+                instrument_keys,
+            ),
             snapshot_values=_capture_mapping_values(state.snapshots, instrument_keys),
             cursor_values=_capture_mapping_values(state.cursors, instrument_keys),
             instrument_values=_capture_mapping_values(state.instruments, instrument_keys),
@@ -251,6 +257,10 @@ class _StateJournal:
         _restore_mapping_values(
             self.state.active_order_ids,
             self.active_order_values,
+        )
+        _restore_mapping_values(
+            self.state.reserved_order_ids,
+            self.reserved_order_values,
         )
         _restore_mapping_values(self.state.snapshots, self.snapshot_values)
         _restore_mapping_values(self.state.cursors, self.cursor_values)
@@ -399,6 +409,7 @@ class PaperBroker:
             orders={},
             client_orders={},
             active_order_ids={},
+            reserved_order_ids={},
             snapshots={},
             cursors={},
             fills=[],
@@ -1415,7 +1426,7 @@ def _execute_submit_kernel(
         submission_reference_price=snapshot.bars[-1].close,
         remaining_notional=intent.notional,
     )
-    _sync_active_order(staged, staged.orders[order_id])
+    _sync_order_indexes(staged, staged.orders[order_id])
     staged.client_orders[intent.intent_id] = order_id
     staged.snapshots[intent.instrument_id] = _bounded_snapshot(snapshot)
     staged.cursors[intent.instrument_id] = cursor
@@ -1479,7 +1490,7 @@ def _execute_resolution_kernel(
         )
     specs.append(_transition_spec(transition))
     staged.orders[order_id] = replace(record, order=updated)
-    _sync_active_order(staged, staged.orders[order_id])
+    _sync_order_indexes(staged, staged.orders[order_id])
     staged.latest_at = resolved_at
     return staged, specs, updated, resolved_at
 
@@ -1555,9 +1566,11 @@ def _execute_market_kernel(
         if previous_instrument is not None and previous_instrument != instrument:
             raise ValueError("instrument metadata changed within the paper session")
         staged.instruments[snapshot.instrument_id] = instrument
-        for order_id in staged.active_order_ids.get(snapshot.instrument_id, ()):
+        active_cohort = staged.active_order_ids.get(snapshot.instrument_id, ())
+        active_survivors: list[str] = []
+        terminal_ids: set[str] = set()
+        for order_id in active_cohort:
             record = staged.orders[order_id]
-            prior_status = record.order.status
             record, fill, liquidity, order_specs = PaperBroker._process_order(
                 state=staged,
                 record=record,
@@ -1569,11 +1582,29 @@ def _execute_market_kernel(
                 session_id=session_id,
             )
             staged.orders[order_id] = record
-            if record.order.status is not prior_status:
-                _sync_active_order(staged, record)
+            if _is_market_executable(record.order.status):
+                active_survivors.append(order_id)
+            else:
+                terminal_ids.add(order_id)
             specs.extend(order_specs)
             if fill is not None:
                 produced.append(fill)
+        _replace_order_index(
+            staged.active_order_ids,
+            snapshot.instrument_id,
+            tuple(active_survivors),
+        )
+        if terminal_ids:
+            reserved_survivors = tuple(
+                order_id
+                for order_id in staged.reserved_order_ids.get(snapshot.instrument_id, ())
+                if order_id not in terminal_ids
+            )
+            _replace_order_index(
+                staged.reserved_order_ids,
+                snapshot.instrument_id,
+                reserved_survivors,
+            )
         staged.snapshots[snapshot.instrument_id] = _bounded_snapshot(snapshot)
         staged.cursors[snapshot.instrument_id] = cursor
         observed_at = snapshot.observed_at.astimezone(UTC)
@@ -1797,7 +1828,7 @@ def _execute_reconciliation_kernel(
         last_fill_at=new_fills[-1].filled_at,
         last_fill_id=new_fills[-1].fill_id,
     )
-    _sync_active_order(staged, staged.orders[current.order_id])
+    _sync_order_indexes(staged, staged.orders[current.order_id])
     for fill in new_fills:
         staged.fill_ids_digest = _next_fill_ids_digest(
             staged.fill_ids_digest,
@@ -2243,25 +2274,59 @@ def _state_positions(state: _PaperState) -> tuple[Position, ...]:
     return state.ledger.snapshot(state.latest_at).positions
 
 
-def _sync_active_order(state: _PaperState, record: _PaperOrderRecord) -> None:
-    """Maintain one immutable sorted executable-order tuple for its instrument."""
-    instrument_id = record.order.instrument_id
-    order_id = record.order.order_id
-    current = state.active_order_ids.get(instrument_id, ())
-    executable = (
-        record.order.status not in _CLOSED
-        and record.order.status is not OrderStatus.UNKNOWN
-    )
-    if executable:
+def _is_market_executable(status: OrderStatus) -> bool:
+    return status not in _CLOSED and status is not OrderStatus.UNKNOWN
+
+
+def _replace_order_index(
+    index: dict[str, tuple[str, ...]],
+    instrument_id: str,
+    order_ids: tuple[str, ...],
+) -> None:
+    if index.get(instrument_id, ()) == order_ids:
+        return
+    if order_ids:
+        index[instrument_id] = order_ids
+    else:
+        index.pop(instrument_id, None)
+
+
+def _set_order_index_membership(
+    index: dict[str, tuple[str, ...]],
+    instrument_id: str,
+    order_id: str,
+    *,
+    included: bool,
+) -> None:
+    current = index.get(instrument_id, ())
+    if included:
         if order_id not in current:
-            state.active_order_ids[instrument_id] = tuple(sorted((*current, order_id)))
+            index[instrument_id] = tuple(sorted((*current, order_id)))
         return
     if order_id in current:
-        remaining = tuple(candidate for candidate in current if candidate != order_id)
-        if remaining:
-            state.active_order_ids[instrument_id] = remaining
-        else:
-            state.active_order_ids.pop(instrument_id, None)
+        _replace_order_index(
+            index,
+            instrument_id,
+            tuple(candidate for candidate in current if candidate != order_id),
+        )
+
+
+def _sync_order_indexes(state: _PaperState, record: _PaperOrderRecord) -> None:
+    """Maintain executable and liveness-reserved tuples for one order."""
+    instrument_id = record.order.instrument_id
+    order_id = record.order.order_id
+    _set_order_index_membership(
+        state.active_order_ids,
+        instrument_id,
+        order_id,
+        included=_is_market_executable(record.order.status),
+    )
+    _set_order_index_membership(
+        state.reserved_order_ids,
+        instrument_id,
+        order_id,
+        included=record.order.status not in _CLOSED,
+    )
 
 
 def _relevant_instrument_ids(state: _PaperState) -> set[str]:
@@ -2271,11 +2336,13 @@ def _relevant_instrument_ids(state: _PaperState) -> set[str]:
 
 def _validate_admission_liveness(state: _PaperState, instrument_id: str) -> None:
     """Ensure the worst next cohort grammar fits before admitting active exposure."""
-    active_count = sum(len(order_ids) for order_ids in state.active_order_ids.values())
-    active_instruments = set(state.active_order_ids) | {instrument_id}
+    reserved_count = sum(
+        len(order_ids) for order_ids in state.reserved_order_ids.values()
+    )
+    reserved_instruments = set(state.reserved_order_ids) | {instrument_id}
     position_instruments = {position.instrument_id for position in _state_positions(state)}
-    market_rows = len(active_instruments | position_instruments)
-    worst_order_rows = 3 * (active_count + 1)
+    market_rows = len(reserved_instruments | position_instruments)
+    worst_order_rows = 3 * (reserved_count + 1)
     if market_rows + worst_order_rows > _MAX_GROUP_ACTIVITIES:
         raise ValueError("submission would exceed the next market activity capacity")
 
@@ -2902,6 +2969,7 @@ def _validate_state_limits(state: _PaperState, *, activity_count: int) -> None:
         | set(state.instruments)
         | set(state.market_prices)
         | set(state.active_order_ids)
+        | set(state.reserved_order_ids)
         | {position.instrument_id for position in _state_positions(state)}
     )
     if (
@@ -2918,6 +2986,22 @@ def _validate_state_limits(state: _PaperState, *, activity_count: int) -> None:
                 or state.orders[order_id].order.status in _CLOSED
                 or state.orders[order_id].order.status is OrderStatus.UNKNOWN
                 for order_id in order_ids
+            )
+            for instrument_id, order_ids in state.active_order_ids.items()
+        )
+        or any(
+            order_ids != tuple(sorted(set(order_ids)))
+            or any(
+                order_id not in state.orders
+                or state.orders[order_id].order.instrument_id != instrument_id
+                or state.orders[order_id].order.status in _CLOSED
+                for order_id in order_ids
+            )
+            for instrument_id, order_ids in state.reserved_order_ids.items()
+        )
+        or any(
+            not set(order_ids).issubset(
+                state.reserved_order_ids.get(instrument_id, ())
             )
             for instrument_id, order_ids in state.active_order_ids.items()
         )
@@ -3037,6 +3121,7 @@ def _blank_state(configuration: _ReplayConfiguration) -> _PaperState:
         orders={},
         client_orders={},
         active_order_ids={},
+        reserved_order_ids={},
         snapshots={},
         cursors={},
         fills=[],

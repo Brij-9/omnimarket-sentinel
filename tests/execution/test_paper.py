@@ -3893,3 +3893,329 @@ def test_multi_instrument_market_index_preserves_canonical_cohort_order(
         for order in sorted(active_orders, key=lambda item: item.instrument_id)
     ]
     assert calls == expected
+
+
+def test_unknown_reservation_prevents_171st_executable_order_and_market_brick() -> None:
+    """UNKNOWN truth cannot free capacity that its later ACK would consume again."""
+    broker = PaperBroker(starting_cash=Decimal("100000"))
+    initial = _snapshot(_bar(0, open_price="100"))
+    orders = [
+        broker.submit(
+            _intent(
+                intent_id=f"reserved-{index}",
+                quantity=Decimal("0.1"),
+                order_type=OrderType.STOP,
+                trigger_price=Decimal("110"),
+                take_profit=Decimal("150"),
+            ),
+            initial,
+        )
+        for index in range(170)
+    ]
+    unknown = broker.mark_unknown(orders[0].order_id, at=AT)
+    before = (
+        broker.list_orders(),
+        broker.fills,
+        broker.cash,
+        broker.audit_events,
+        broker.session_head,
+    )
+
+    try:
+        broker.submit(
+            _intent(
+                intent_id="reserved-replacement",
+                quantity=Decimal("0.1"),
+                order_type=OrderType.STOP,
+                trigger_price=Decimal("110"),
+                take_profit=Decimal("150"),
+            ),
+            initial,
+        )
+    except ValueError as error:
+        assert "activity" in str(error)
+        assert (
+            broker.list_orders(),
+            broker.fills,
+            broker.cash,
+            broker.audit_events,
+            broker.session_head,
+        ) == before
+    else:
+        broker.reconcile_unknown(unknown.order_id, OrderStatus.ACKNOWLEDGED, at=AT)
+        with pytest.raises(ValueError, match="bounded durable limit"):
+            broker.on_snapshot(
+                _snapshot(
+                    *initial.bars,
+                    _bar(1, open_price="110", high="115", low="109", volume="1000"),
+                ),
+                _instrument(),
+            )
+        pytest.fail("UNKNOWN replacement admitted and produced a 171-order market brick")
+
+    broker.reconcile_unknown(unknown.order_id, OrderStatus.ACKNOWLEDGED, at=AT)
+    fills = broker.on_snapshot(
+        _snapshot(
+            *initial.bars,
+            _bar(1, open_price="110", high="115", low="109", volume="1000"),
+        ),
+        _instrument(),
+    )
+    assert len(fills) == 170
+
+
+def test_unknown_reservation_local_rollback_release_and_rehydrate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local UNKNOWN resolution is atomic and only terminal truth releases capacity."""
+    monkeypatch.setattr(paper_module, "_MAX_GROUP_ACTIVITIES", 7)
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'local-reserve.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("10000"),
+        audit_log=audit,
+        durable=True,
+        session_id="local-reserve",
+    )
+    initial = _snapshot(_bar(0, open_price="100"))
+    first = broker.submit(
+        _intent(
+            intent_id="local-first",
+            order_type=OrderType.STOP,
+            trigger_price=Decimal("110"),
+            take_profit=Decimal("150"),
+        ),
+        initial,
+    )
+    broker.submit(
+        _intent(
+            intent_id="local-second",
+            order_type=OrderType.STOP,
+            trigger_price=Decimal("110"),
+            take_profit=Decimal("150"),
+        ),
+        initial,
+    )
+    broker.mark_unknown(first.order_id, at=AT)
+    restored = PaperBroker.rehydrate_durable(audit, expected_head=broker.session_head)
+    before = (
+        restored.list_orders(),
+        restored.audit_events,
+        restored.session_head,
+        tuple(store.stream("local-reserve")),
+    )
+    original_append = store.append_many
+
+    def fail_append(events: object) -> None:
+        del events
+        raise RuntimeError("durable store unavailable")
+
+    monkeypatch.setattr(store, "append_many", fail_append)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        restored.reconcile_unknown(first.order_id, OrderStatus.ACKNOWLEDGED, at=AT)
+    assert (
+        restored.list_orders(),
+        restored.audit_events,
+        restored.session_head,
+        tuple(store.stream("local-reserve")),
+    ) == before
+
+    monkeypatch.setattr(store, "append_many", original_append)
+    restored.cancel(first.order_id, at=AT)
+    replacement = restored.submit(
+        _intent(
+            intent_id="local-replacement",
+            order_type=OrderType.STOP,
+            trigger_price=Decimal("110"),
+            take_profit=Decimal("150"),
+        ),
+        initial,
+    )
+    fills = restored.on_snapshot(
+        _snapshot(
+            *initial.bars,
+            _bar(1, open_price="110", high="115", low="109", volume="100"),
+        ),
+        _instrument(),
+    )
+    recovered = PaperBroker.rehydrate_durable(audit, expected_head=restored.session_head)
+
+    assert len(fills) == 2
+    assert recovered.get_order(first.order_id).status is OrderStatus.CANCELLED
+    assert recovered.get_order(replacement.order_id).status is OrderStatus.FILLED
+    assert recovered.session_head == restored.session_head
+
+
+def test_unknown_reservation_authoritative_rollback_and_rehydrate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Authoritative partial truth reactivates within its retained reservation atomically."""
+    monkeypatch.setattr(paper_module, "_MAX_GROUP_ACTIVITIES", 7)
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'truth-reserve.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("10000"),
+        audit_log=audit,
+        durable=True,
+        session_id="truth-reserve",
+    )
+    bar0 = _bar(0, open_price="100")
+    initial = _snapshot(bar0)
+    order = broker.submit(
+        _intent(intent_id="truth-first", quantity=Decimal("2")),
+        initial,
+    )
+    broker.submit(
+        _intent(
+            intent_id="truth-second",
+            order_type=OrderType.STOP,
+            trigger_price=Decimal("150"),
+            take_profit=Decimal("180"),
+        ),
+        initial,
+    )
+    quiet_bar = bar0.model_copy(
+        update={"at": AT + timedelta(microseconds=1), "volume": Decimal("0")}
+    )
+    quiet = _snapshot(
+        bar0,
+        quiet_bar,
+        observed_at=quiet_bar.at,
+        source_at=quiet_bar.at,
+    )
+    broker.on_snapshot(quiet, _instrument(quantity_step=Decimal("1")))
+    unknown = broker.mark_unknown(order.order_id, at=AT + timedelta(seconds=1))
+    restored = PaperBroker.rehydrate_durable(audit, expected_head=broker.session_head)
+    truth = unknown.model_copy(
+        update={
+            "status": OrderStatus.PARTIALLY_FILLED,
+            "filled_quantity": Decimal("1"),
+            "average_fill_price": Decimal("100"),
+            "updated_at": AT + timedelta(seconds=2),
+        }
+    )
+    fill = Fill(
+        fill_id="truth-reservation-fill",
+        order_id=order.order_id,
+        instrument_id=order.instrument_id,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        price=Decimal("100"),
+        fee=Decimal("0"),
+        filled_at=AT + timedelta(seconds=1, microseconds=1),
+    )
+    before = (
+        restored.list_orders(),
+        restored.fills,
+        restored.cash,
+        restored.audit_events,
+        restored.session_head,
+        tuple(store.stream("truth-reserve")),
+    )
+    original_append = store.append_many
+
+    def fail_append(events: object) -> None:
+        del events
+        raise RuntimeError("durable store unavailable")
+
+    monkeypatch.setattr(store, "append_many", fail_append)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        restored.reconcile_unknown_fills(
+            truth,
+            (fill,),
+            instrument=_instrument(quantity_step=Decimal("1")),
+        )
+    assert (
+        restored.list_orders(),
+        restored.fills,
+        restored.cash,
+        restored.audit_events,
+        restored.session_head,
+        tuple(store.stream("truth-reserve")),
+    ) == before
+
+    monkeypatch.setattr(store, "append_many", original_append)
+    restored.reconcile_unknown_fills(
+        truth,
+        (fill,),
+        instrument=_instrument(quantity_step=Decimal("1")),
+    )
+    recovered = PaperBroker.rehydrate_durable(audit, expected_head=restored.session_head)
+    assert recovered.get_order(order.order_id).status is OrderStatus.PARTIALLY_FILLED
+    assert recovered.fills[-1] == fill
+
+
+def test_market_bulk_expiry_replaces_active_index_once_with_linear_work() -> None:
+    """A 170-order terminal cohort cannot rebuild shrinking tuples quadratically."""
+
+    class CountingActiveIndex(dict[str, tuple[str, ...]]):
+        writes: int
+        referenced_ids: int
+
+        def __init__(self, source: Mapping[str, tuple[str, ...]]) -> None:
+            super().__init__(source)
+            self.writes = 0
+            self.referenced_ids = 0
+
+        def __setitem__(self, key: str, value: tuple[str, ...]) -> None:
+            self.writes += 1
+            self.referenced_ids += len(value)
+            super().__setitem__(key, value)
+
+    broker = PaperBroker(starting_cash=Decimal("100000"))
+    initial = _snapshot(_bar(0, open_price="100"))
+    orders = [
+        broker.submit(
+            _intent(
+                intent_id=f"bulk-expiry-{index}",
+                quantity=Decimal("0.1"),
+                expires_at=AT + timedelta(minutes=1),
+            ),
+            initial,
+        )
+        for index in range(170)
+    ]
+    counting = CountingActiveIndex(broker._state.active_order_ids)
+    broker._state.active_order_ids = counting
+
+    broker.on_snapshot(
+        _snapshot(*initial.bars, _bar(1, open_price="100", volume="0")),
+        _instrument(),
+    )
+
+    assert all(broker.get_order(order.order_id).status is OrderStatus.EXPIRED for order in orders)
+    assert counting.writes <= 1
+    assert counting.referenced_ids <= 170
+    assert broker._state.active_order_ids == {}
+
+
+def test_market_bulk_terminal_index_assignment_rolls_back_atomically() -> None:
+    """One failed bulk terminal commit restores the complete canonical cohort."""
+    audit = _FailingAudit("paper.state.committed", occurrence=11)
+    broker = PaperBroker(starting_cash=Decimal("10000"), audit_log=audit)
+    initial = _snapshot(_bar(0, open_price="100"))
+    orders = [
+        broker.submit(
+            _intent(
+                intent_id=f"rollback-expiry-{index}",
+                expires_at=AT + timedelta(minutes=1),
+            ),
+            initial,
+        )
+        for index in range(10)
+    ]
+    before = (broker.list_orders(), broker.audit_events, broker.session_head)
+    next_snapshot = _snapshot(*initial.bars, _bar(1, open_price="100", volume="0"))
+
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        broker.on_snapshot(next_snapshot, _instrument())
+    assert (broker.list_orders(), broker.audit_events, broker.session_head) == before
+
+    broker.on_snapshot(next_snapshot, _instrument())
+    assert all(broker.get_order(order.order_id).status is OrderStatus.EXPIRED for order in orders)
