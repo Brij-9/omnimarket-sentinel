@@ -256,7 +256,8 @@ def test_ccxt_positions_use_spot_balance_not_derivatives_positions() -> None:
                 "instrument_id": f"{currency}/{quote}@ccxt-spot",
                 "average_price": "100",
                 "market_price": "101",
-                "at": NOW,
+                "observed_at": NOW,
+                "max_age_seconds": 60,
             }
 
     exchange = FakeCcxtExchange(_market())
@@ -265,6 +266,7 @@ def test_ccxt_positions_use_spot_balance_not_derivatives_positions() -> None:
         ccxt_settings(),
         exchange=exchange,
         valuation_provider=Valuation(),
+        clock=lambda: NOW,
     )
 
     positions = broker.positions()

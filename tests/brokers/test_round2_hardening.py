@@ -174,7 +174,8 @@ def test_ccxt_standard_balance_skips_quote_cash_and_uses_local_valuation() -> No
                 "instrument_id": f"{currency}/USDT@ccxt-spot",
                 "average_price": "10",
                 "market_price": "11",
-                "at": NOW,
+                "observed_at": NOW,
+                "max_age_seconds": 60,
             }
 
     exchange = OrderedExchange(_market())

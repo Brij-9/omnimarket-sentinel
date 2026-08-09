@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol, TypeVar
 
@@ -29,6 +29,7 @@ from market_sentinel.domain.enums import OperatingMode
 from market_sentinel.execution.base import BrokerCapabilities
 
 _T = TypeVar("_T")
+_MAX_VALUATION_AGE_SECONDS = 300
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -239,6 +240,7 @@ class CcxtSpotBroker:
 
     def positions(self) -> tuple[Position, ...]:
         try:
+            now = self._now()
             balance = self._call(self._prepare_exchange().fetch_balance)
             total = _standard_total(balance)
             positions: list[Position] = []
@@ -246,13 +248,13 @@ class CcxtSpotBroker:
                 quantity = decimal(raw_quantity, nonnegative=True)
                 if quantity == 0 or currency == self._quote:
                     continue
-                positions.append(self._valued_position(currency, quantity))
+                positions.append(self._valued_position(currency, quantity, now))
             return tuple(positions)
         except Exception:
             pass
         raise RuntimeError("ccxt client operation failed")
 
-    def _valued_position(self, currency: str, quantity: Decimal) -> Position:
+    def _valued_position(self, currency: str, quantity: Decimal, now: datetime) -> Position:
         if self._valuation is None:
             raise RuntimeError("ccxt client operation failed")
         valuation = self._valuation
@@ -266,8 +268,18 @@ class CcxtSpotBroker:
         )
         if record.get("instrument_id") != f"{currency}/{self._quote}@{self.broker_name}":
             raise RuntimeError("ccxt client operation failed")
-        at = record.get("at")
-        if type(at) is not datetime or at.tzinfo is None or at.utcoffset() is None:
+        observed_at = record.get("observed_at")
+        max_age = record.get("max_age_seconds")
+        if (
+            type(observed_at) is not datetime
+            or observed_at.tzinfo is None
+            or observed_at.utcoffset() is None
+            or type(max_age) is not int
+            or not 0 <= max_age <= _MAX_VALUATION_AGE_SECONDS
+        ):
+            raise RuntimeError("ccxt client operation failed")
+        observed_at = observed_at.astimezone(UTC)
+        if observed_at > now or now - observed_at > timedelta(seconds=max_age):
             raise RuntimeError("ccxt client operation failed")
         average, market = (
             decimal(record.get("average_price"), positive=True),
@@ -341,11 +353,12 @@ class CcxtSpotBroker:
 
 def _standard_total(balance: object) -> Mapping[str, object]:
     data = mapping(balance)
-    if set(data) - {"free", "used", "total", "info"}:
-        raise RuntimeError("ccxt client operation failed")
-    if not all(isinstance(data.get(key), Mapping) for key in ("free", "used", "total", "info")):
-        raise RuntimeError("ccxt client operation failed")
-    return mapping(data["total"])
+    total = mapping(data.get("total"))
+    for currency, amount in total.items():
+        if not isinstance(currency, str) or not currency or currency != currency.strip():
+            raise RuntimeError("ccxt client operation failed")
+        decimal(amount, nonnegative=True)
+    return total
 
 
 def _snapshot_reference(snapshot: MarketSnapshot, instrument_id: str, now: datetime) -> Decimal:
