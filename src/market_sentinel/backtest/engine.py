@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-from typing import Any
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 from market_sentinel.domain.enums import Side
@@ -14,7 +12,12 @@ from market_sentinel.domain.models import Bar, Fill, Instrument, MarketSnapshot,
 from market_sentinel.portfolio.ledger import PortfolioLedger
 from market_sentinel.risk.engine import PositionSizer, RiskEngine, portfolio_hash
 from market_sentinel.risk.policy import RiskPolicy
-from market_sentinel.strategies.base import Strategy, StrategyContext, StrategyMetadata
+from market_sentinel.strategies.base import (
+    Strategy,
+    StrategyConfiguration,
+    StrategyContext,
+    StrategyMetadata,
+)
 
 _BPS = Decimal("10000")
 
@@ -89,7 +92,8 @@ class BacktestResult:
 
     strategy_id: str
     strategy_version: str
-    parameters: tuple[tuple[str, str], ...]
+    strategy_configuration: StrategyConfiguration
+    costs: CostModel
     data_cutoff: datetime
     events: tuple[BacktestEvent, ...]
     fills: tuple[Fill, ...]
@@ -128,26 +132,48 @@ class FillModel:
         side: Side,
         quantity: Decimal,
         reference_price: Decimal,
+        submitted_at: datetime,
         filled_at: datetime,
     ) -> Fill:
         """Create one full fill with adverse half-spread and slippage exactly once."""
-        if not isinstance(quantity, Decimal) or quantity <= Decimal("0"):
+        if not _finite_positive(quantity):
             raise ValueError("quantity must be a positive Decimal")
-        if not isinstance(reference_price, Decimal) or reference_price <= Decimal("0"):
+        if not _finite_positive(reference_price):
             raise ValueError("reference_price must be a positive Decimal")
+        if not isinstance(side, Side):
+            raise ValueError("side must be a Side")
+        if not isinstance(instrument, Instrument):
+            raise ValueError("instrument must be an Instrument")
+        if not _finite_positive(instrument.price_tick) or not _finite_positive(
+            instrument.quantity_step
+        ):
+            raise ValueError("instrument precision must be finite and positive")
+        if not _step_aligned(quantity, instrument.quantity_step):
+            raise ValueError("quantity must align with the instrument quantity step")
+        if not self.can_fill(submitted_at=submitted_at, event_at=filled_at):
+            raise ValueError("fill event occurs before the latency deadline")
         impact_bps = self.costs.spread_bps / Decimal("2") + self.costs.slippage_bps
+        if side is Side.SELL and impact_bps >= _BPS:
+            raise ValueError("sell execution impact must be below 10000 bps")
         multiplier = (
             Decimal("1") + impact_bps / _BPS
             if side is Side.BUY
             else Decimal("1") - impact_bps / _BPS
         )
-        raw_price = reference_price * multiplier
-        rounding = ROUND_CEILING if side is Side.BUY else ROUND_FLOOR
-        price = (
-            (raw_price / instrument.price_tick).to_integral_value(rounding=rounding)
-            * instrument.price_tick
-        )
-        fee = quantity * price * self.costs.fee_bps / _BPS
+        try:
+            raw_price = reference_price * multiplier
+            rounding = ROUND_CEILING if side is Side.BUY else ROUND_FLOOR
+            price = (
+                (raw_price / instrument.price_tick).to_integral_value(rounding=rounding)
+                * instrument.price_tick
+            )
+            fee = quantity * price * self.costs.fee_bps / _BPS
+        except (InvalidOperation, OverflowError, ZeroDivisionError) as error:
+            raise ValueError("fill arithmetic must remain finite") from error
+        if not _finite_positive(price):
+            raise ValueError("rounded fill price must be finite and positive")
+        if not _finite_nonnegative(fee):
+            raise ValueError("fill fee must be finite and nonnegative")
         return Fill(
             fill_id=fill_id,
             order_id=order_id,
@@ -159,6 +185,14 @@ class FillModel:
             filled_at=filled_at,
         )
 
+    def can_fill(self, *, submitted_at: datetime, event_at: datetime) -> bool:
+        """Return latency eligibility after validating aware chronological timestamps."""
+        _require_aware_datetime(submitted_at, "submitted_at")
+        _require_aware_datetime(event_at, "event_at")
+        if event_at < submitted_at:
+            raise ValueError("event_at must not precede submitted_at")
+        return event_at >= submitted_at + self.costs.latency
+
 
 @dataclass(frozen=True, slots=True)
 class _PendingOrder:
@@ -169,6 +203,9 @@ class _PendingOrder:
     submitted_at: datetime
     stop_loss: Decimal | None = None
     take_profit: Decimal | None = None
+    limit_price: Decimal | None = None
+    approved_notional: Decimal | None = None
+    approved_stop_risk: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,18 +239,20 @@ class BacktestEngine:
         bars: tuple[Bar, ...],
         strategy: Strategy,
         initial_cash: Decimal,
-        parameters: Mapping[str, Any] | None = None,
     ) -> BacktestResult:
         """Evaluate only prefixes and route every long entry through shared risk approval."""
-        if not bars:
-            raise ValueError("bars must not be empty")
-        if any(left.at >= right.at for left, right in zip(bars, bars[1:], strict=False)):
-            raise ValueError("bars must be strictly chronological")
-        if not isinstance(initial_cash, Decimal) or initial_cash <= Decimal("0"):
+        _validate_bars(bars)
+        if not _finite_positive(initial_cash):
             raise ValueError("initial_cash must be a positive Decimal")
         metadata = getattr(strategy, "metadata", None)
         if not isinstance(metadata, StrategyMetadata):
             raise ValueError("strategy must expose StrategyMetadata")
+        configuration = getattr(strategy, "configuration", None)
+        if not isinstance(configuration, StrategyConfiguration) or (
+            configuration.strategy_id != metadata.strategy_id
+            or configuration.strategy_version != metadata.version
+        ):
+            raise ValueError("strategy must expose matching canonical configuration")
 
         instrument_id = f"{instrument.symbol}@{instrument.venue}"
         horizon = metadata.allowed_horizons[0]
@@ -233,52 +272,57 @@ class BacktestEngine:
             if (
                 pending is not None
                 and index > pending.submitted_index
-                and bar.at >= pending.submitted_at + self.fill_model.costs.latency
+                and self.fill_model.can_fill(
+                    submitted_at=pending.submitted_at,
+                    event_at=bar.at,
+                )
             ):
-                fill = self.fill_model.fill(
-                    fill_id=f"backtest-fill-{len(fills) + 1}",
-                    order_id=pending.order_id,
+                fill = _create_pending_fill(
+                    pending=pending,
+                    bar=bar,
+                    fill_model=self.fill_model,
                     instrument=instrument,
-                    side=pending.side,
-                    quantity=pending.quantity,
-                    reference_price=bar.open,
-                    filled_at=bar.at,
+                    fill_id=f"backtest-fill-{len(fills) + 1}",
+                    available_cash=ledger.cash,
                 )
-                ledger.apply_fill(fill)
-                execution_impact += (
-                    fill.quantity * (fill.price - bar.open)
-                    if fill.side is Side.BUY
-                    else fill.quantity * (bar.open - fill.price)
-                )
-                fills.append(fill)
-                events.append(BacktestEvent(at=bar.at, kind="FILL"))
-                if fill.side is Side.BUY:
-                    assert pending.stop_loss is not None and pending.take_profit is not None
-                    open_trade = _OpenTrade(
-                        quantity=fill.quantity,
-                        stop_loss=pending.stop_loss,
-                        take_profit=pending.take_profit,
-                        opened_index=index,
-                        entry_fill=fill,
-                    )
+                if fill is None:
+                    events.append(BacktestEvent(at=bar.at, kind="ORDER_NOT_EXECUTABLE"))
                 else:
-                    assert open_trade is not None
-                    fees = open_trade.entry_fill.fee + fill.fee
-                    completed_trades.append(
-                        CompletedTrade(
-                            opened_at=open_trade.entry_fill.filled_at,
-                            closed_at=fill.filled_at,
-                            quantity=fill.quantity,
-                            entry_price=open_trade.entry_fill.price,
-                            exit_price=fill.price,
-                            fees=fees,
-                            net_pnl=(fill.price - open_trade.entry_fill.price)
-                            * fill.quantity
-                            - fees,
-                        )
+                    ledger.apply_fill(fill)
+                    execution_impact += (
+                        fill.quantity * (fill.price - bar.open)
+                        if fill.side is Side.BUY
+                        else fill.quantity * (bar.open - fill.price)
                     )
-                    open_trade = None
-                pending = None
+                    fills.append(fill)
+                    events.append(BacktestEvent(at=bar.at, kind="FILL"))
+                    if fill.side is Side.BUY:
+                        assert pending.stop_loss is not None and pending.take_profit is not None
+                        open_trade = _OpenTrade(
+                            quantity=fill.quantity,
+                            stop_loss=pending.stop_loss,
+                            take_profit=pending.take_profit,
+                            opened_index=index,
+                            entry_fill=fill,
+                        )
+                    else:
+                        assert open_trade is not None
+                        fees = open_trade.entry_fill.fee + fill.fee
+                        completed_trades.append(
+                            CompletedTrade(
+                                opened_at=open_trade.entry_fill.filled_at,
+                                closed_at=fill.filled_at,
+                                quantity=fill.quantity,
+                                entry_price=open_trade.entry_fill.price,
+                                exit_price=fill.price,
+                                fees=fees,
+                                net_pnl=(fill.price - open_trade.entry_fill.price)
+                                * fill.quantity
+                                - fees,
+                            )
+                        )
+                        open_trade = None
+                    pending = None
 
             snapshot = ledger.mark({instrument_id: bar.close}, bar.at)
             if snapshot.positions:
@@ -365,6 +409,20 @@ class BacktestEngine:
                     )
                 )
                 continue
+            if (
+                decision.approved_notional is None
+                or sized.limit_price is None
+                or sized.stop_loss is None
+                or sized.take_profit is None
+            ):
+                events.append(
+                    BacktestEvent(
+                        at=bar.at,
+                        kind="RISK_REJECTED",
+                        reason_codes=("INVALID_APPROVAL_BOUNDS",),
+                    )
+                )
+                continue
             pending = _PendingOrder(
                 order_id=sized.intent_id,
                 side=Side.BUY,
@@ -373,6 +431,10 @@ class BacktestEngine:
                 submitted_at=bar.at,
                 stop_loss=sized.stop_loss,
                 take_profit=sized.take_profit,
+                limit_price=sized.limit_price,
+                approved_notional=decision.approved_notional,
+                approved_stop_risk=decision.approved_quantity
+                * (sized.limit_price - sized.stop_loss),
             )
             events.append(BacktestEvent(at=bar.at, kind="ORDER_APPROVED"))
 
@@ -381,13 +443,11 @@ class BacktestEngine:
             EquityPoint(at=bar.at, value=initial_cash * bar.close / bars[0].close)
             for bar in bars
         )
-        normalized_parameters = tuple(
-            sorted((str(key), repr(value)) for key, value in (parameters or {}).items())
-        )
         return BacktestResult(
             strategy_id=metadata.strategy_id,
             strategy_version=metadata.version,
-            parameters=normalized_parameters,
+            strategy_configuration=configuration,
+            costs=self.fill_model.costs,
             data_cutoff=bars[-1].at,
             events=tuple(events),
             fills=tuple(fills),
@@ -411,7 +471,6 @@ class BacktestEngine:
         bars: tuple[Bar, ...],
         strategy: Strategy,
         initial_cash: Decimal,
-        parameters: Mapping[str, Any] | None = None,
     ) -> RobustnessResult:
         """Run base and 2x-cost simulations with the exact same strategy parameters."""
         base = self.run(
@@ -419,7 +478,6 @@ class BacktestEngine:
             bars=bars,
             strategy=strategy,
             initial_cash=initial_cash,
-            parameters=parameters,
         )
         stressed_costs = self.fill_model.costs.stressed()
         stressed = BacktestEngine(
@@ -430,6 +488,100 @@ class BacktestEngine:
             bars=bars,
             strategy=strategy,
             initial_cash=initial_cash,
-            parameters=parameters,
         )
         return RobustnessResult(base=base, stressed=stressed, stressed_costs=stressed_costs)
+
+
+def _create_pending_fill(
+    *,
+    pending: _PendingOrder,
+    bar: Bar,
+    fill_model: FillModel,
+    instrument: Instrument,
+    fill_id: str,
+    available_cash: Decimal,
+) -> Fill | None:
+    if pending.side is Side.SELL:
+        return fill_model.fill(
+            fill_id=fill_id,
+            order_id=pending.order_id,
+            instrument=instrument,
+            side=Side.SELL,
+            quantity=pending.quantity,
+            reference_price=bar.open,
+            submitted_at=pending.submitted_at,
+            filled_at=bar.at,
+        )
+
+    assert pending.limit_price is not None
+    assert pending.approved_notional is not None
+    assert pending.approved_stop_risk is not None
+    assert pending.stop_loss is not None
+    assert pending.take_profit is not None
+    if bar.low > pending.limit_price:
+        return None
+    candidate = fill_model.fill(
+        fill_id=fill_id,
+        order_id=pending.order_id,
+        instrument=instrument,
+        side=Side.BUY,
+        quantity=pending.quantity,
+        reference_price=min(bar.open, pending.limit_price),
+        submitted_at=pending.submitted_at,
+        filled_at=bar.at,
+    )
+    actual_notional = candidate.quantity * candidate.price
+    actual_stop_risk = candidate.quantity * (candidate.price - pending.stop_loss)
+    if (
+        candidate.price > pending.limit_price
+        or actual_notional > pending.approved_notional
+        or actual_notional < instrument.minimum_notional
+        or actual_notional + candidate.fee > available_cash
+        or not pending.stop_loss < candidate.price < pending.take_profit
+        or actual_stop_risk < Decimal("0")
+        or actual_stop_risk > pending.approved_stop_risk
+    ):
+        return None
+    return candidate
+
+
+def _validate_bars(bars: object) -> None:
+    if not isinstance(bars, tuple) or not bars:
+        raise ValueError("bars must be a nonempty tuple")
+    previous: datetime | None = None
+    for bar in bars:
+        if not isinstance(bar, Bar):
+            raise ValueError("bars must contain Bar instances")
+        _require_aware_datetime(bar.at, "bars timestamps")
+        prices = (bar.open, bar.high, bar.low, bar.close)
+        if not all(_finite_positive(value) for value in prices):
+            raise ValueError("bars must contain finite positive Decimal OHLC values")
+        if not bar.low <= min(bar.open, bar.close) <= max(bar.open, bar.close) <= bar.high:
+            raise ValueError("bars must have consistent OHLC ordering")
+        if not _finite_nonnegative(bar.volume):
+            raise ValueError("bars must contain finite nonnegative Decimal volume")
+        if previous is not None and previous >= bar.at:
+            raise ValueError("bars must be strictly chronological")
+        previous = bar.at
+
+
+def _require_aware_datetime(value: object, name: str) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    return value
+
+
+def _finite_positive(value: object) -> bool:
+    return isinstance(value, Decimal) and value.is_finite() and value > Decimal("0")
+
+
+def _finite_nonnegative(value: object) -> bool:
+    return isinstance(value, Decimal) and value.is_finite() and value >= Decimal("0")
+
+
+def _step_aligned(value: Decimal, step: Decimal) -> bool:
+    try:
+        quotient = value / step
+        return quotient.is_finite() and quotient == quotient.to_integral_value()
+    except (InvalidOperation, ValueError, ZeroDivisionError):
+        return False

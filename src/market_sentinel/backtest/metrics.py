@@ -133,9 +133,10 @@ def walk_forward_splits[T](
     """Return expanding-train windows whose validation/test observations never overlap."""
     if min(train_size, validation_size, test_size) <= 0:
         raise ValueError("walk-forward sizes must be positive")
-    stride = test_size if step is None else step
-    if stride <= 0:
-        raise ValueError("step must be positive")
+    minimum_stride = validation_size + test_size
+    stride = minimum_stride if step is None else step
+    if stride < minimum_stride:
+        raise ValueError("step must be at least validation_size plus test_size")
     windows: list[ChronologicalSplit[T]] = []
     train_end = train_size
     while train_end + validation_size + test_size <= len(items):
@@ -172,6 +173,7 @@ def _maximum_drawdown(curve: tuple[Decimal, ...]) -> Decimal:
 def _annualized_ratios(
     returns: tuple[Decimal, ...], periods_per_year: int
 ) -> tuple[Decimal | None, Decimal | None]:
+    """Use population volatility and target-zero semideviation over every period."""
     if not returns:
         return None, None
     mean = sum(returns, _ZERO) / Decimal(len(returns))
@@ -179,12 +181,12 @@ def _annualized_ratios(
     standard_deviation = variance.sqrt()
     scale = Decimal(periods_per_year).sqrt()
     sharpe = mean / standard_deviation * scale if standard_deviation > _ZERO else None
-    negative = tuple(value for value in returns if value < _ZERO)
-    if not negative:
+    downside_squares = tuple(min(value, _ZERO) ** 2 for value in returns)
+    if not any(downside_squares):
         sortino = None
     else:
         downside_deviation = (
-            sum((value**2 for value in negative), _ZERO) / Decimal(len(negative))
+            sum(downside_squares, _ZERO) / Decimal(len(returns))
         ).sqrt()
         sortino = mean / downside_deviation * scale if downside_deviation > _ZERO else None
     return sharpe, sortino

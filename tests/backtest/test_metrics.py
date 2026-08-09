@@ -78,7 +78,7 @@ def test_chronological_helpers_leave_each_test_window_untouched() -> None:
     """Overlapping training with a reported test window would contaminate OOS evidence."""
     split = chronological_split(tuple(range(10)), train_size=6, validation_size=2)
     windows = walk_forward_splits(
-        tuple(range(12)), train_size=4, validation_size=2, test_size=2, step=2
+        tuple(range(12)), train_size=4, validation_size=2, test_size=2, step=4
     )
 
     assert split.train == (0, 1, 2, 3, 4, 5)
@@ -86,10 +86,49 @@ def test_chronological_helpers_leave_each_test_window_untouched() -> None:
     assert split.test == (8, 9)
     assert tuple(window.test for window in windows) == (
         (6, 7),
-        (8, 9),
         (10, 11),
     )
     assert all(set(window.train + window.validation).isdisjoint(window.test) for window in windows)
+
+
+def test_walk_forward_rejects_stride_that_recycles_prior_test_as_validation() -> None:
+    """A step smaller than validation plus test reuses OOS evidence in the next fold."""
+    with pytest.raises(ValueError, match="step"):
+        walk_forward_splits(
+            tuple(range(12)),
+            train_size=4,
+            validation_size=2,
+            test_size=2,
+            step=2,
+        )
+
+
+def test_walk_forward_oos_observations_are_globally_disjoint_by_identity() -> None:
+    """No object may appear in validation/test evidence for more than one fold."""
+    observations = tuple(object() for _ in range(16))
+    windows = walk_forward_splits(
+        observations,
+        train_size=4,
+        validation_size=2,
+        test_size=2,
+    )
+    oos_ids = [id(item) for window in windows for item in window.validation + window.test]
+
+    assert len(oos_ids) == len(set(oos_ids))
+
+
+def test_sortino_uses_target_semideviation_over_every_period() -> None:
+    """Excluding nonnegative periods from the denominator understates downside deviation."""
+    metrics = calculate_performance_metrics(
+        equity_curve=(Decimal("100"), Decimal("110"), Decimal("104.5")),
+        benchmark_curve=(Decimal("100"), Decimal("100"), Decimal("100")),
+        completed_trade_pnls=(),
+        traded_notional=Decimal("0"),
+        exposed_periods=0,
+        periods_per_year=4,
+    )
+
+    assert metrics.annualized_sortino == Decimal("1.414213562373095048801688724")
 
 
 def test_result_metrics_use_after_cost_equity_and_completed_trades() -> None:

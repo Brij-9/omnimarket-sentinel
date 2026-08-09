@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from decimal import Decimal
+from typing import cast
 
 import pytest
 
@@ -165,3 +166,19 @@ def test_live_rejections_have_stable_order_and_slippage_boundary() -> None:
         "UNEXPLAINED_RECONCILIATION_EVENT",
         "REALIZED_SLIPPAGE_EXCEEDS_STRESS",
     )
+
+
+def test_backtest_rejects_non_horizon_value_before_selecting_thresholds() -> None:
+    """An unknown string must not silently receive the lower swing trade threshold."""
+    with pytest.raises(ValueError, match="Horizon"):
+        PromotionEvaluator().evaluate_backtest(
+            metrics=_metrics(completed_trade_count=30),
+            stressed_total_return=Decimal("0.01"),
+            horizon=cast("Horizon", "unknown"),
+        )
+
+
+def test_paper_evidence_rejects_non_horizon_value() -> None:
+    """Invalid runtime horizons must fail at the evidence boundary, not branch as swing."""
+    with pytest.raises(ValueError, match="Horizon"):
+        replace(_paper(), horizon=cast("Horizon", "swing"))

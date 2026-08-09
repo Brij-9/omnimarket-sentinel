@@ -1,8 +1,10 @@
-"""Immutable input contract shared by deterministic strategies."""
+"""Immutable input and canonical evidence contracts for deterministic strategies."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import time, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 from market_sentinel.domain.enums import Horizon, SignalDirection
@@ -59,6 +61,61 @@ class StrategyMetadata:
             raise ValueError("pre-close policy and buffer must be declared together")
         if self.preclose_buffer is not None and self.preclose_buffer <= timedelta(0):
             raise ValueError("preclose_buffer must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalParameter:
+    """One explicitly typed, stable strategy-configuration value."""
+
+    name: str
+    kind: str
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyConfiguration:
+    """Canonical configuration derived only from the actual strategy instance."""
+
+    strategy_id: str
+    strategy_version: str
+    parameters: tuple[CanonicalParameter, ...]
+
+
+def canonical_strategy_configuration(
+    *, metadata: StrategyMetadata, parameters: Mapping[str, object]
+) -> StrategyConfiguration:
+    """Canonicalize the small stable value set supported by strategy constructors."""
+    canonical: list[CanonicalParameter] = []
+    for name, value in sorted(parameters.items()):
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("canonical parameter names must be nonempty strings")
+        kind, text = _canonical_value(value)
+        canonical.append(CanonicalParameter(name=name, kind=kind, value=text))
+    return StrategyConfiguration(
+        strategy_id=metadata.strategy_id,
+        strategy_version=metadata.version,
+        parameters=tuple(canonical),
+    )
+
+
+def _canonical_value(value: object) -> tuple[str, str]:
+    if isinstance(value, bool):
+        return "boolean", "true" if value else "false"
+    if type(value) is int:
+        return "integer", str(value)
+    if isinstance(value, Decimal) and value.is_finite():
+        return "decimal", "0" if value.is_zero() else format(value.normalize(), "f")
+    if isinstance(value, StrEnum):
+        return "enum", value.value
+    if isinstance(value, str):
+        return "string", value
+    if isinstance(value, time) and value.tzinfo is None:
+        return "time", value.isoformat()
+    if isinstance(value, timedelta):
+        return "timedelta", f"{value.days}:{value.seconds}:{value.microseconds}"
+    if value is None:
+        return "null", "null"
+    raise ValueError("strategy configuration contains a noncanonical value")
 
 
 @runtime_checkable

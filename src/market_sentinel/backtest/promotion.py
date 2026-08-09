@@ -39,6 +39,8 @@ class PaperEvidence:
     stressed_slippage_bps: Decimal
 
     def __post_init__(self) -> None:
+        if not isinstance(self.horizon, Horizon):
+            raise ValueError("horizon must be a Horizon")
         if min(self.trading_days, self.calendar_days, self.completed_trade_count) < 0:
             raise ValueError("paper durations and trade count must be nonnegative")
         for name, value in (
@@ -63,6 +65,8 @@ class PromotionEvaluator:
         horizon: Horizon,
     ) -> PromotionDecision:
         """Evaluate untouched OOS base- and stressed-cost evidence for paper eligibility."""
+        if not isinstance(horizon, Horizon):
+            raise ValueError("horizon must be a Horizon")
         if not isinstance(stressed_total_return, Decimal) or not stressed_total_return.is_finite():
             raise ValueError("stressed_total_return must be a finite Decimal")
         required_trades = 100 if horizon is Horizon.INTRADAY else 30

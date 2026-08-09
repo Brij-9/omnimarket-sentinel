@@ -4,7 +4,12 @@ from decimal import Decimal, InvalidOperation
 
 from market_sentinel.domain.enums import Horizon, SignalDirection
 from market_sentinel.domain.models import Signal
-from market_sentinel.strategies.base import StrategyContext, StrategyMetadata
+from market_sentinel.strategies.base import (
+    StrategyConfiguration,
+    StrategyContext,
+    StrategyMetadata,
+    canonical_strategy_configuration,
+)
 from market_sentinel.strategies.indicators import atr
 from market_sentinel.strategies.validation import bars_are_strictly_valid
 
@@ -37,6 +42,18 @@ class CryptoVolatilityBreakoutStrategy:
         self.min_average_volume = _positive_decimal(min_average_volume)
         if self.min_atr_percentage >= self.max_atr_percentage:
             raise ValueError("minimum ATR percentage must be below maximum")
+
+    @property
+    def configuration(self) -> StrategyConfiguration:
+        return canonical_strategy_configuration(
+            metadata=self.metadata,
+            parameters={
+                "max_atr_percentage": self.max_atr_percentage,
+                "max_spread_bps": self.max_spread_bps,
+                "min_atr_percentage": self.min_atr_percentage,
+                "min_average_volume": self.min_average_volume,
+            },
+        )
 
     def evaluate(self, context: StrategyContext) -> Signal | None:
         """Evaluate only a complete trailing prefix and otherwise abstain."""

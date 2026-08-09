@@ -6,7 +6,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from market_sentinel.domain.enums import Horizon, SignalDirection
 from market_sentinel.domain.models import Signal
-from market_sentinel.strategies.base import StrategyContext, StrategyMetadata
+from market_sentinel.strategies.base import (
+    StrategyConfiguration,
+    StrategyContext,
+    StrategyMetadata,
+    canonical_strategy_configuration,
+)
 from market_sentinel.strategies.indicators import vwap
 from market_sentinel.strategies.validation import bars_are_strictly_valid
 
@@ -62,6 +67,21 @@ class OpeningRangeVwapStrategy:
             allowed_directions=(SignalDirection.LONG,),
             mandatory_preclose_closeout=True,
             preclose_buffer=closeout_buffer,
+        )
+
+    @property
+    def configuration(self) -> StrategyConfiguration:
+        return canonical_strategy_configuration(
+            metadata=self.metadata,
+            parameters={
+                "closeout_buffer": self.closeout_buffer,
+                "max_spread_bps": self.max_spread_bps,
+                "min_average_volume": self.min_average_volume,
+                "opening_range_bars": self.opening_range_bars,
+                "session_end": self.session_end,
+                "session_start": self.session_start,
+                "session_timezone": self.session_timezone,
+            },
         )
 
     def evaluate(self, context: StrategyContext) -> Signal | None:

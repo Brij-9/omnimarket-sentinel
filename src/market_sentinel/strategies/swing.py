@@ -4,7 +4,12 @@ from decimal import Decimal, InvalidOperation
 
 from market_sentinel.domain.enums import Horizon, SignalDirection
 from market_sentinel.domain.models import Signal
-from market_sentinel.strategies.base import StrategyContext, StrategyMetadata
+from market_sentinel.strategies.base import (
+    StrategyConfiguration,
+    StrategyContext,
+    StrategyMetadata,
+    canonical_strategy_configuration,
+)
 from market_sentinel.strategies.indicators import atr, sma
 from market_sentinel.strategies.regime import MarketRegime, classify_regime
 from market_sentinel.strategies.validation import bars_are_strictly_valid
@@ -31,6 +36,16 @@ class SwingBreakoutStrategy:
     ) -> None:
         self.max_spread_bps = _positive_decimal(max_spread_bps)
         self.min_average_volume = _positive_decimal(min_average_volume)
+
+    @property
+    def configuration(self) -> StrategyConfiguration:
+        return canonical_strategy_configuration(
+            metadata=self.metadata,
+            parameters={
+                "max_spread_bps": self.max_spread_bps,
+                "min_average_volume": self.min_average_volume,
+            },
+        )
 
     def evaluate(self, context: StrategyContext) -> Signal | None:
         """Evaluate only the supplied point-in-time history and otherwise abstain."""
