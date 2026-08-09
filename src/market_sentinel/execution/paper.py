@@ -137,12 +137,14 @@ class _MarketCursor:
     total_count: int
     digest: str
     window: tuple[Bar, ...]
+    last_delta_digest: str | None = None
 
 
 @dataclass(slots=True)
 class _PaperState:
     orders: dict[str, _PaperOrderRecord]
     client_orders: dict[str, str]
+    active_order_ids: dict[str, tuple[str, ...]]
     snapshots: dict[str, MarketSnapshot]
     cursors: dict[str, _MarketCursor]
     fills: list[Fill]
@@ -173,6 +175,7 @@ class _StateJournal:
     state: _PaperState
     order_values: dict[str, _PaperOrderRecord | _Missing]
     client_values: dict[str, str | _Missing]
+    active_order_values: dict[str, tuple[str, ...] | _Missing]
     snapshot_values: dict[str, MarketSnapshot | _Missing]
     cursor_values: dict[str, _MarketCursor | _Missing]
     instrument_values: dict[str, Instrument | _Missing]
@@ -198,11 +201,26 @@ class _StateJournal:
     ) -> _StateJournal:
         order_keys = tuple(order_ids)
         client_keys = tuple(client_ids)
-        instrument_keys = tuple(instrument_ids)
+        instrument_keys = tuple(
+            dict.fromkeys(
+                (
+                    *instrument_ids,
+                    *(
+                        state.orders[order_id].order.instrument_id
+                        for order_id in order_keys
+                        if order_id in state.orders
+                    ),
+                )
+            )
+        )
         return cls(
             state=state,
             order_values=_capture_mapping_values(state.orders, order_keys),
             client_values=_capture_mapping_values(state.client_orders, client_keys),
+            active_order_values=_capture_mapping_values(
+                state.active_order_ids,
+                instrument_keys,
+            ),
             snapshot_values=_capture_mapping_values(state.snapshots, instrument_keys),
             cursor_values=_capture_mapping_values(state.cursors, instrument_keys),
             instrument_values=_capture_mapping_values(state.instruments, instrument_keys),
@@ -230,6 +248,10 @@ class _StateJournal:
         del self.state.fills[self.fills_length :]
         _restore_mapping_values(self.state.orders, self.order_values)
         _restore_mapping_values(self.state.client_orders, self.client_values)
+        _restore_mapping_values(
+            self.state.active_order_ids,
+            self.active_order_values,
+        )
         _restore_mapping_values(self.state.snapshots, self.snapshot_values)
         _restore_mapping_values(self.state.cursors, self.cursor_values)
         _restore_mapping_values(self.state.instruments, self.instrument_values)
@@ -376,6 +398,7 @@ class PaperBroker:
         self._state = _PaperState(
             orders={},
             client_orders={},
+            active_order_ids={},
             snapshots={},
             cursors={},
             fills=[],
@@ -588,6 +611,9 @@ class PaperBroker:
                 if snapshot.instrument_id != instrument_id:
                     raise ValueError("snapshot and instrument identity must match")
                 previous = self._state.snapshots.get(instrument_id)
+                previous_instrument = self._state.instruments.get(instrument_id)
+                if previous_instrument is not None and previous_instrument != instrument:
+                    raise ValueError("instrument metadata changed within the paper session")
                 duplicate = previous is not None and snapshot == previous
                 if not duplicate and previous is not None:
                     if len(snapshot.bars) > len(previous.bars) + 1:
@@ -636,8 +662,8 @@ class PaperBroker:
             commit_at = max(snapshot.observed_at for _, snapshot, _, _ in validated)
             order_ids = tuple(
                 order_id
-                for order_id, record in self._state.orders.items()
-                if record.order.instrument_id in seen_instruments
+                for instrument_id in sorted(seen_instruments)
+                for order_id in self._state.active_order_ids.get(instrument_id, ())
             )
             journal = _StateJournal.capture(
                 self._state,
@@ -893,6 +919,8 @@ class PaperBroker:
                 return record, None, available_liquidity, tuple(specs)
 
         old_filled = order.filled_quantity
+        if record.fill_count >= _MAX_FILLS_PER_ORDER:
+            raise ValueError("paper order exceeds the bounded fill count")
         new_filled = old_filled + candidate.quantity
         if order.requested_quantity is not None and new_filled > order.requested_quantity:
             raise RuntimeError("paper fill would exceed requested quantity")
@@ -1387,6 +1415,7 @@ def _execute_submit_kernel(
         submission_reference_price=snapshot.bars[-1].close,
         remaining_notional=intent.notional,
     )
+    _sync_active_order(staged, staged.orders[order_id])
     staged.client_orders[intent.intent_id] = order_id
     staged.snapshots[intent.instrument_id] = _bounded_snapshot(snapshot)
     staged.cursors[intent.instrument_id] = cursor
@@ -1450,6 +1479,7 @@ def _execute_resolution_kernel(
         )
     specs.append(_transition_spec(transition))
     staged.orders[order_id] = replace(record, order=updated)
+    _sync_active_order(staged, staged.orders[order_id])
     staged.latest_at = resolved_at
     return staged, specs, updated, resolved_at
 
@@ -1503,6 +1533,17 @@ def _execute_market_kernel(
             total_count=prior_cursor.total_count + 1,
             digest=_next_bar_digest(prior_cursor.digest, bar),
             window=(prior_cursor.window + (bar,))[-_MARKET_CURSOR_WINDOW:],
+            last_delta_digest=_market_delta_digest(
+                instrument_id=snapshot.instrument_id,
+                prior_bar_count=prior_cursor.total_count,
+                prior_bars_digest=prior_cursor.digest,
+                overlap=prior_cursor.window,
+                new_bar=bar,
+                observed_at=snapshot.observed_at,
+                source_at=snapshot.source_at,
+                provider=snapshot.provider,
+                max_age_seconds=snapshot.max_age_seconds,
+            ),
         )
         liquidity = fill_model.liquidity_budget(
             event_volume=bar.volume,
@@ -1514,10 +1555,9 @@ def _execute_market_kernel(
         if previous_instrument is not None and previous_instrument != instrument:
             raise ValueError("instrument metadata changed within the paper session")
         staged.instruments[snapshot.instrument_id] = instrument
-        for order_id in sorted(staged.orders):
+        for order_id in staged.active_order_ids.get(snapshot.instrument_id, ()):
             record = staged.orders[order_id]
-            if record.order.instrument_id != snapshot.instrument_id:
-                continue
+            prior_status = record.order.status
             record, fill, liquidity, order_specs = PaperBroker._process_order(
                 state=staged,
                 record=record,
@@ -1529,6 +1569,8 @@ def _execute_market_kernel(
                 session_id=session_id,
             )
             staged.orders[order_id] = record
+            if record.order.status is not prior_status:
+                _sync_active_order(staged, record)
             specs.extend(order_specs)
             if fill is not None:
                 produced.append(fill)
@@ -1590,6 +1632,8 @@ def _execute_reconciliation_kernel(
     record = staged.orders.get(authoritative_order.order_id)
     if record is None or record.order.status is not OrderStatus.UNKNOWN:
         raise ValueError("authoritative fill requires one UNKNOWN paper order")
+    if record.fill_count + len(new_fills) > _MAX_FILLS_PER_ORDER:
+        raise ValueError("authoritative fill exceeds the bounded order fill count")
     current = record.order
     at = _aware_utc(authoritative_order.updated_at, "authoritative update")
     _validate_watermark(previous, at)
@@ -1753,6 +1797,7 @@ def _execute_reconciliation_kernel(
         last_fill_at=new_fills[-1].filled_at,
         last_fill_id=new_fills[-1].fill_id,
     )
+    _sync_active_order(staged, staged.orders[current.order_id])
     for fill in new_fills:
         staged.fill_ids_digest = _next_fill_ids_digest(
             staged.fill_ids_digest,
@@ -1969,10 +2014,12 @@ def _normalize_full_prefix(
     cursor = state.cursors.get(instrument_id)
     if previous is None or cursor is None:
         raise ValueError("snapshot has no submitted paper cursor")
-    # A provider rewriting an already accepted prefix is a history revision even
-    # when the rewritten candle is internally malformed.  Classify it before the
-    # generic bar validator so callers receive the stable cursor-contract error.
-    if len(snapshot.bars) == cursor.total_count and snapshot != previous:
+    # Preserve the stable revision classification for the directly retained case.
+    if (
+        len(snapshot.bars) == cursor.total_count
+        and len(snapshot.bars) == len(previous.bars)
+        and snapshot != previous
+    ):
         raise ValueError("snapshot revision or backward event is not allowed")
     _validate_snapshot(
         snapshot,
@@ -1988,7 +2035,12 @@ def _normalize_full_prefix(
         and snapshot.max_age_seconds == previous.max_age_seconds
     )
     if len(snapshot.bars) == cursor.total_count:
-        if same_metadata and snapshot.bars[-len(cursor.window) :] == cursor.window:
+        if (
+            same_metadata
+            and snapshot.bars[-1] == cursor.window[-1]
+            and snapshot.bars[-len(cursor.window) :] == cursor.window
+            and _bars_digest(snapshot.bars) == cursor.digest
+        ):
             return previous
         raise ValueError("snapshot revision or backward event is not allowed")
     if cursor.total_count >= _MAX_INITIAL_BARS:
@@ -2011,17 +2063,18 @@ def _snapshot_from_rolling_window(
         raise ValueError("rolling input must be a RollingMarketWindow")
     instrument_id = _instrument_id(instrument)
     cursor = state.cursors.get(instrument_id)
+    previous = state.snapshots.get(instrument_id)
+    previous_instrument = state.instruments.get(instrument_id)
+    if previous_instrument is not None and previous_instrument != instrument:
+        raise ValueError("rolling instrument metadata changed within the paper session")
     if (
         cursor is None
+        or previous is None
         or window.instrument_id != instrument_id
         or type(window.prior_bar_count) is not int
-        or window.prior_bar_count != cursor.total_count
         or not isinstance(window.prior_bars_digest, str)
-        or window.prior_bars_digest != cursor.digest
         or _SNAPSHOT_HASH.fullmatch(window.prior_bars_digest) is None
         or not isinstance(window.overlap, tuple)
-        or len(window.overlap) != len(cursor.window)
-        or window.overlap != cursor.window
         or not isinstance(window.new_bar, Bar)
     ):
         raise ValueError("rolling input does not match the retained market cursor")
@@ -2038,7 +2091,41 @@ def _snapshot_from_rolling_window(
         expected_instrument_id=instrument_id,
         max_bars=_MARKET_CURSOR_WINDOW + 1,
     )
-    return snapshot
+    if window.prior_bar_count == cursor.total_count:
+        if (
+            window.prior_bars_digest != cursor.digest
+            or len(window.overlap) != len(cursor.window)
+            or window.overlap != cursor.window
+        ):
+            raise ValueError("rolling input does not match the retained market cursor")
+        return snapshot
+    retry_digest = _market_delta_digest(
+        instrument_id=instrument_id,
+        prior_bar_count=window.prior_bar_count,
+        prior_bars_digest=window.prior_bars_digest,
+        overlap=window.overlap,
+        new_bar=window.new_bar,
+        observed_at=window.observed_at,
+        source_at=window.source_at,
+        provider=window.provider,
+        max_age_seconds=window.max_age_seconds,
+    )
+    same_metadata = (
+        window.observed_at == previous.observed_at
+        and window.source_at == previous.source_at
+        and window.provider == previous.provider
+        and window.max_age_seconds == previous.max_age_seconds
+    )
+    if (
+        window.prior_bar_count + 1 == cursor.total_count
+        and _next_bar_digest(window.prior_bars_digest, window.new_bar) == cursor.digest
+        and (window.overlap + (window.new_bar,))[-_MARKET_CURSOR_WINDOW:]
+        == cursor.window
+        and same_metadata
+        and retry_digest == cursor.last_delta_digest
+    ):
+        return previous
+    raise ValueError("rolling input does not match the retained market cursor")
 
 
 def _validate_protective_prices(
@@ -2156,27 +2243,39 @@ def _state_positions(state: _PaperState) -> tuple[Position, ...]:
     return state.ledger.snapshot(state.latest_at).positions
 
 
+def _sync_active_order(state: _PaperState, record: _PaperOrderRecord) -> None:
+    """Maintain one immutable sorted executable-order tuple for its instrument."""
+    instrument_id = record.order.instrument_id
+    order_id = record.order.order_id
+    current = state.active_order_ids.get(instrument_id, ())
+    executable = (
+        record.order.status not in _CLOSED
+        and record.order.status is not OrderStatus.UNKNOWN
+    )
+    if executable:
+        if order_id not in current:
+            state.active_order_ids[instrument_id] = tuple(sorted((*current, order_id)))
+        return
+    if order_id in current:
+        remaining = tuple(candidate for candidate in current if candidate != order_id)
+        if remaining:
+            state.active_order_ids[instrument_id] = remaining
+        else:
+            state.active_order_ids.pop(instrument_id, None)
+
+
 def _relevant_instrument_ids(state: _PaperState) -> set[str]:
-    active = {
-        record.order.instrument_id
-        for record in state.orders.values()
-        if record.order.status not in _CLOSED
-    }
     positions = {position.instrument_id for position in _state_positions(state)}
-    return active | positions
+    return set(state.active_order_ids) | positions
 
 
 def _validate_admission_liveness(state: _PaperState, instrument_id: str) -> None:
     """Ensure the worst next cohort grammar fits before admitting active exposure."""
-    active_records = [
-        record for record in state.orders.values() if record.order.status not in _CLOSED
-    ]
-    active_instruments = {
-        record.order.instrument_id for record in active_records
-    } | {instrument_id}
+    active_count = sum(len(order_ids) for order_ids in state.active_order_ids.values())
+    active_instruments = set(state.active_order_ids) | {instrument_id}
     position_instruments = {position.instrument_id for position in _state_positions(state)}
     market_rows = len(active_instruments | position_instruments)
-    worst_order_rows = 3 * (len(active_records) + 1)
+    worst_order_rows = 3 * (active_count + 1)
     if market_rows + worst_order_rows > _MAX_GROUP_ACTIVITIES:
         raise ValueError("submission would exceed the next market activity capacity")
 
@@ -2554,6 +2653,34 @@ def _next_bar_digest(previous_digest: str, bar: Bar) -> str:
     return hashlib.sha256(bytes.fromhex(previous_digest) + b"\0" + encoded).hexdigest()
 
 
+def _market_delta_digest(
+    *,
+    instrument_id: str,
+    prior_bar_count: int,
+    prior_bars_digest: str,
+    overlap: tuple[Bar, ...],
+    new_bar: Bar,
+    observed_at: datetime,
+    source_at: datetime,
+    provider: str,
+    max_age_seconds: int,
+) -> str:
+    """Bind the exact bounded caller delta needed for immediate retry identity."""
+    return _canonical_digest(
+        {
+            "instrument_id": instrument_id,
+            "prior_bar_count": prior_bar_count,
+            "prior_bars_digest": prior_bars_digest,
+            "overlap": [_bar_payload(bar) for bar in overlap],
+            "new_bar": _bar_payload(new_bar),
+            "observed_at": _datetime_text(observed_at),
+            "source_at": _datetime_text(source_at),
+            "provider": provider,
+            "max_age_seconds": max_age_seconds,
+        }
+    )
+
+
 def _cursor_from_bars(bars: tuple[Bar, ...]) -> _MarketCursor:
     return _MarketCursor(
         total_count=len(bars),
@@ -2774,7 +2901,7 @@ def _validate_state_limits(state: _PaperState, *, activity_count: int) -> None:
         | set(state.cursors)
         | set(state.instruments)
         | set(state.market_prices)
-        | {record.order.instrument_id for record in state.orders.values()}
+        | set(state.active_order_ids)
         | {position.instrument_id for position in _state_positions(state)}
     )
     if (
@@ -2783,7 +2910,17 @@ def _validate_state_limits(state: _PaperState, *, activity_count: int) -> None:
         or len(state.fills) > _MAX_SESSION_FILLS
         or len(instrument_ids) > _MAX_SESSION_INSTRUMENTS
         or activity_count > _MAX_GROUP_ACTIVITIES
-        or any(record.fill_count > _MAX_FILLS_PER_ORDER for record in state.orders.values())
+        or any(
+            order_ids != tuple(sorted(set(order_ids)))
+            or any(
+                order_id not in state.orders
+                or state.orders[order_id].order.instrument_id != instrument_id
+                or state.orders[order_id].order.status in _CLOSED
+                or state.orders[order_id].order.status is OrderStatus.UNKNOWN
+                for order_id in order_ids
+            )
+            for instrument_id, order_ids in state.active_order_ids.items()
+        )
         or any(
             len(snapshot.bars) > _MARKET_CURSOR_WINDOW
             for snapshot in state.snapshots.values()
@@ -2899,6 +3036,7 @@ def _blank_state(configuration: _ReplayConfiguration) -> _PaperState:
     return _PaperState(
         orders={},
         client_orders={},
+        active_order_ids={},
         snapshots={},
         cursors={},
         fills=[],

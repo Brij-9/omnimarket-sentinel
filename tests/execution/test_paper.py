@@ -3365,3 +3365,531 @@ def test_submit_replay_rejects_split_operation_timestamp_with_recomputed_head(
             audit_log=audit,
             expected_head=forged_head,
         )
+
+
+def test_same_100_bar_full_prefix_retry_is_audited_without_state_change() -> None:
+    """A retained 64-bar window must still recognize its exact bounded full prefix."""
+    bars = tuple(_bar(minute, open_price="100") for minute in range(100))
+    snapshot = _snapshot(*bars)
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    order = broker.submit(
+        _intent(
+            created_at=bars[-1].at,
+            expires_at=bars[-1].at + timedelta(minutes=10),
+        ),
+        snapshot,
+    )
+    before = (broker.list_orders(), broker.fills, broker.cash, broker.session_head)
+
+    fills = broker.on_snapshot(snapshot, _instrument())
+
+    assert fills == ()
+    assert (broker.list_orders(), broker.fills, broker.cash) == before[:3]
+    assert broker.get_order(order.order_id) == order
+    assert broker.audit_events[-1].kind == "paper.snapshot.duplicate"
+    assert broker.session_head.operation_count == before[3].operation_count + 1
+    assert broker.session_head.event_count == before[3].event_count + 2
+
+
+def test_same_100_bar_full_prefix_retry_survives_durable_rehydration(
+    tmp_path: Path,
+) -> None:
+    """Exact full-prefix retry remains idempotent after trusted-store recovery."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'prefix-retry.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    bars = tuple(_bar(minute, open_price="100") for minute in range(100))
+    snapshot = _snapshot(*bars)
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=audit,
+        durable=True,
+        session_id="prefix-retry",
+    )
+    broker.submit(
+        _intent(
+            created_at=bars[-1].at,
+            expires_at=bars[-1].at + timedelta(minutes=10),
+        ),
+        snapshot,
+    )
+    restored = PaperBroker.rehydrate_durable(audit, expected_head=broker.session_head)
+    before = (restored.list_orders(), restored.fills, restored.cash)
+
+    assert restored.on_snapshot(snapshot, _instrument()) == ()
+    assert (restored.list_orders(), restored.fills, restored.cash) == before
+    assert restored.audit_events[-1].kind == "paper.snapshot.duplicate"
+    assert tuple(store.stream("prefix-retry"))[-2].kind == "paper.snapshot.duplicate"
+
+
+def test_same_count_full_prefix_revisions_remain_fail_closed() -> None:
+    """A digest or provider change cannot masquerade as a compacted-prefix retry."""
+    bars = tuple(_bar(minute, open_price="100") for minute in range(100))
+    snapshot = _snapshot(*bars)
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    broker.submit(
+        _intent(
+            created_at=bars[-1].at,
+            expires_at=bars[-1].at + timedelta(minutes=10),
+        ),
+        snapshot,
+    )
+    changed_history = _snapshot(_bar(0, open_price="101"), *bars[1:])
+    changed_provider = snapshot.model_copy(update={"provider": "paper"})
+    before = (broker.list_orders(), broker.fills, broker.cash, broker.audit_events)
+
+    for revision in (changed_history, changed_provider):
+        with pytest.raises(ValueError, match="revision"):
+            broker.on_snapshot(revision, _instrument())
+        assert (broker.list_orders(), broker.fills, broker.cash, broker.audit_events) == before
+
+
+def test_immediate_rolling_window_retry_is_audited_before_and_after_recovery(
+    tmp_path: Path,
+) -> None:
+    """The last committed cursor delta has one stable duplicate identity."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'rolling-retry.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    bars = tuple(_bar(minute, open_price="100") for minute in range(64))
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=audit,
+        durable=True,
+        session_id="rolling-retry",
+    )
+    broker.submit(
+        _intent(
+            created_at=bars[-1].at,
+            expires_at=bars[-1].at + timedelta(minutes=10),
+        ),
+        _snapshot(*bars),
+    )
+    new_bar = _bar(64, open_price="100", volume="0")
+    window = paper_module.RollingMarketWindow(
+        instrument_id="AAPL@alpaca",
+        observed_at=new_bar.at,
+        source_at=new_bar.at,
+        prior_bar_count=64,
+        prior_bars_digest=paper_module._bars_digest(bars),
+        overlap=bars,
+        new_bar=new_bar,
+        provider="fixture",
+        max_age_seconds=60,
+    )
+    broker.on_rolling_snapshot(window, _instrument())
+    before = (broker.list_orders(), broker.fills, broker.cash)
+
+    assert broker.on_rolling_snapshot(window, _instrument()) == ()
+    assert (broker.list_orders(), broker.fills, broker.cash) == before
+    assert broker.audit_events[-1].kind == "paper.snapshot.duplicate"
+
+    restored = PaperBroker.rehydrate_durable(audit, expected_head=broker.session_head)
+    restored_before = (restored.list_orders(), restored.fills, restored.cash)
+    assert restored.on_rolling_snapshot(window, _instrument()) == ()
+    assert (restored.list_orders(), restored.fills, restored.cash) == restored_before
+    assert restored.audit_events[-1].kind == "paper.snapshot.duplicate"
+
+
+def test_immediate_rolling_retry_rejects_overlap_metadata_digest_and_time_mutations() -> None:
+    """Every caller-controlled rolling field remains bound to the committed delta."""
+    bars = tuple(_bar(minute, open_price="100") for minute in range(64))
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    broker.submit(
+        _intent(
+            created_at=bars[-1].at,
+            expires_at=bars[-1].at + timedelta(minutes=10),
+        ),
+        _snapshot(*bars),
+    )
+    new_bar = _bar(64, open_price="100", volume="0")
+    window = paper_module.RollingMarketWindow(
+        instrument_id="AAPL@alpaca",
+        observed_at=new_bar.at,
+        source_at=new_bar.at,
+        prior_bar_count=64,
+        prior_bars_digest=paper_module._bars_digest(bars),
+        overlap=bars,
+        new_bar=new_bar,
+        provider="fixture",
+        max_age_seconds=60,
+    )
+    broker.on_rolling_snapshot(window, _instrument())
+    changed_overlap = (_bar(0, open_price="101"),) + bars[1:]
+    revisions = (
+        replace(window, overlap=changed_overlap),
+        replace(window, provider="paper"),
+        replace(window, prior_bars_digest="f" * 64),
+        replace(window, observed_at=window.observed_at + timedelta(seconds=1)),
+    )
+    before = (broker.list_orders(), broker.fills, broker.cash, broker.audit_events)
+
+    for revision in revisions:
+        with pytest.raises(ValueError, match="rolling"):
+            broker.on_rolling_snapshot(revision, _instrument())
+        assert (broker.list_orders(), broker.fills, broker.cash, broker.audit_events) == before
+    with pytest.raises(ValueError, match="instrument metadata"):
+        broker.on_rolling_snapshot(
+            window,
+            _instrument(quantity_step=Decimal("0.2")),
+        )
+
+
+def test_market_processing_visits_only_one_active_order_after_200_cancellations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal same-instrument history cannot make MARKET work grow linearly."""
+    broker = PaperBroker(starting_cash=Decimal("100000"))
+    initial = _snapshot(_bar(0, open_price="100"))
+    for index in range(200):
+        order = broker.submit(_intent(intent_id=f"cancelled-{index}"), initial)
+        broker.cancel(order.order_id, at=AT)
+    active = broker.submit(_intent(intent_id="active"), initial)
+    calls: list[str] = []
+    original = PaperBroker._process_order
+
+    def count_process_order(**kwargs: Any) -> Any:
+        record = kwargs["record"]
+        assert isinstance(record, paper_module._PaperOrderRecord)
+        calls.append(record.order.order_id)
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        PaperBroker,
+        "_process_order",
+        staticmethod(count_process_order),
+    )
+
+    broker.on_snapshot(
+        _snapshot(_bar(0, open_price="100"), _bar(1, open_price="100")),
+        _instrument(),
+    )
+
+    assert calls == [active.order_id]
+    assert len(calls) <= 1
+    assert len(broker.list_orders()) == 201
+
+
+def test_market_active_index_tracks_expiry_fill_unknown_and_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every executable/non-executable status edge updates the cohort index."""
+    broker = PaperBroker(starting_cash=Decimal("10000"))
+    initial = _snapshot(_bar(0, open_price="100"))
+    expiring = broker.submit(
+        _intent(intent_id="expiring", expires_at=AT + timedelta(minutes=1)),
+        initial,
+    )
+    fillable = broker.submit(_intent(intent_id="fillable"), initial)
+    sentinel = broker.submit(
+        _intent(
+            intent_id="sentinel",
+            order_type=OrderType.STOP,
+            trigger_price=Decimal("150"),
+            take_profit=Decimal("180"),
+        ),
+        initial,
+    )
+    survivor = broker.submit(
+        _intent(
+            intent_id="survivor",
+            order_type=OrderType.STOP,
+            trigger_price=Decimal("150"),
+            take_profit=Decimal("180"),
+        ),
+        initial,
+    )
+    first_market = _snapshot(
+        *initial.bars,
+        _bar(1, open_price="100", high="100", low="100", volume="10"),
+    )
+    broker.on_snapshot(first_market, _instrument())
+    assert broker.get_order(expiring.order_id).status is OrderStatus.EXPIRED
+    assert broker.get_order(fillable.order_id).status is OrderStatus.FILLED
+    unknown = broker.mark_unknown(sentinel.order_id, at=AT + timedelta(minutes=1, seconds=1))
+    calls: list[str] = []
+    original = PaperBroker._process_order
+
+    def count_process_order(**kwargs: Any) -> Any:
+        record = kwargs["record"]
+        assert isinstance(record, paper_module._PaperOrderRecord)
+        calls.append(record.order.order_id)
+        return original(**kwargs)
+
+    monkeypatch.setattr(PaperBroker, "_process_order", staticmethod(count_process_order))
+    second_market = _snapshot(
+        *first_market.bars,
+        _bar(2, open_price="100", high="100", low="100"),
+    )
+    broker.on_snapshot(second_market, _instrument())
+    assert calls == [survivor.order_id]
+
+    calls.clear()
+    broker.reconcile_unknown(
+        unknown.order_id,
+        OrderStatus.ACKNOWLEDGED,
+        at=AT + timedelta(minutes=2, seconds=1),
+    )
+    broker.on_snapshot(
+        _snapshot(
+            *second_market.bars,
+            _bar(3, open_price="100", high="100", low="100"),
+        ),
+        _instrument(),
+    )
+
+    assert calls == sorted((sentinel.order_id, survivor.order_id))
+
+
+def test_market_index_rolls_back_and_rehydrates_without_terminal_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Durable replay derives the exact executable cohort without terminal history."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'active-index.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("10000"),
+        audit_log=audit,
+        durable=True,
+        session_id="active-index",
+    )
+    initial = _snapshot(_bar(0, open_price="100"))
+    for index in range(5):
+        order = broker.submit(_intent(intent_id=f"history-{index}"), initial)
+        broker.cancel(order.order_id, at=AT)
+    active = broker.submit(
+        _intent(
+            intent_id="active-stop",
+            order_type=OrderType.STOP,
+            trigger_price=Decimal("150"),
+            take_profit=Decimal("180"),
+        ),
+        initial,
+    )
+    restored = PaperBroker.rehydrate_durable(audit, expected_head=broker.session_head)
+    calls: list[str] = []
+    original = PaperBroker._process_order
+
+    def count_process_order(**kwargs: Any) -> Any:
+        record = kwargs["record"]
+        assert isinstance(record, paper_module._PaperOrderRecord)
+        calls.append(record.order.order_id)
+        return original(**kwargs)
+
+    monkeypatch.setattr(PaperBroker, "_process_order", staticmethod(count_process_order))
+    restored.on_snapshot(
+        _snapshot(
+            _bar(0, open_price="100"),
+            _bar(1, open_price="100", high="100", low="100"),
+        ),
+        _instrument(),
+    )
+
+    assert calls == [active.order_id]
+
+
+def test_authoritative_partial_fill_readds_only_the_reconciled_order_to_market_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """UNKNOWN authoritative truth restores executability without historical scans."""
+    broker = PaperBroker(starting_cash=Decimal("10000"))
+    bar0 = _bar(0, open_price="100")
+    initial = _snapshot(bar0)
+    for index in range(5):
+        old = broker.submit(_intent(intent_id=f"authoritative-old-{index}"), initial)
+        broker.cancel(old.order_id, at=AT)
+    order = broker.submit(
+        _intent(intent_id="authoritative-active", quantity=Decimal("2")),
+        initial,
+    )
+    quiet_bar = bar0.model_copy(
+        update={"at": AT + timedelta(microseconds=1), "volume": Decimal("0")}
+    )
+    quiet = _snapshot(
+        bar0,
+        quiet_bar,
+        observed_at=quiet_bar.at,
+        source_at=quiet_bar.at,
+    )
+    broker.on_snapshot(quiet, _instrument(quantity_step=Decimal("1")))
+    unknown = broker.mark_unknown(order.order_id, at=AT + timedelta(seconds=1))
+    authoritative = unknown.model_copy(
+        update={
+            "status": OrderStatus.PARTIALLY_FILLED,
+            "filled_quantity": Decimal("1"),
+            "average_fill_price": Decimal("100"),
+            "updated_at": AT + timedelta(seconds=2),
+        }
+    )
+    broker.reconcile_unknown_fills(
+        authoritative,
+        (
+            Fill(
+                fill_id="authoritative-index-fill",
+                order_id=order.order_id,
+                instrument_id=order.instrument_id,
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                price=Decimal("100"),
+                fee=Decimal("0"),
+                filled_at=AT + timedelta(seconds=1, microseconds=1),
+            ),
+        ),
+        instrument=_instrument(quantity_step=Decimal("1")),
+    )
+    calls: list[str] = []
+    original = PaperBroker._process_order
+
+    def count_process_order(**kwargs: Any) -> Any:
+        record = kwargs["record"]
+        assert isinstance(record, paper_module._PaperOrderRecord)
+        calls.append(record.order.order_id)
+        return original(**kwargs)
+
+    monkeypatch.setattr(PaperBroker, "_process_order", staticmethod(count_process_order))
+    next_bar = _bar(1, open_price="100")
+    broker.on_snapshot(
+        _snapshot(*quiet.bars, next_bar),
+        _instrument(quantity_step=Decimal("1")),
+    )
+
+    assert calls == [order.order_id]
+
+
+def test_failed_market_persistence_restores_active_index_for_exact_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late durable failure cannot strand an order outside the executable index."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'index-rollback.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("10000"),
+        audit_log=audit,
+        durable=True,
+        session_id="index-rollback",
+    )
+    initial = _snapshot(_bar(0, open_price="100"))
+    market = broker.submit(_intent(intent_id="rollback-market"), initial)
+    sentinel = broker.submit(
+        _intent(
+            intent_id="rollback-sentinel",
+            order_type=OrderType.STOP,
+            trigger_price=Decimal("150"),
+            take_profit=Decimal("180"),
+        ),
+        initial,
+    )
+    next_snapshot = _snapshot(
+        *initial.bars,
+        _bar(1, open_price="100", high="100", low="100"),
+    )
+    before = (
+        broker.list_orders(),
+        broker.fills,
+        broker.cash,
+        broker.session_head,
+        tuple(store.stream("index-rollback")),
+    )
+    original_append = store.append_many
+
+    def fail_append(events: object) -> None:
+        del events
+        raise RuntimeError("durable store unavailable")
+
+    monkeypatch.setattr(store, "append_many", fail_append)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        broker.on_snapshot(next_snapshot, _instrument())
+    assert (
+        broker.list_orders(),
+        broker.fills,
+        broker.cash,
+        broker.session_head,
+        tuple(store.stream("index-rollback")),
+    ) == before
+
+    monkeypatch.setattr(store, "append_many", original_append)
+    calls: list[str] = []
+    original_process = PaperBroker._process_order
+
+    def count_process_order(**kwargs: Any) -> Any:
+        record = kwargs["record"]
+        assert isinstance(record, paper_module._PaperOrderRecord)
+        calls.append(record.order.order_id)
+        return original_process(**kwargs)
+
+    monkeypatch.setattr(PaperBroker, "_process_order", staticmethod(count_process_order))
+    broker.on_snapshot(next_snapshot, _instrument())
+
+    assert calls == sorted((market.order_id, sentinel.order_id))
+    assert broker.get_order(market.order_id).status is OrderStatus.FILLED
+
+
+def test_multi_instrument_market_index_preserves_canonical_cohort_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Indexed cohorts retain instrument then broker-order canonical ordering."""
+    broker = PaperBroker(starting_cash=Decimal("10000"))
+    active_orders = []
+    for instrument_id in ("BBB@alpaca", "AAA@alpaca"):
+        initial = _snapshot(_bar(0, open_price="100"), instrument_id=instrument_id)
+        old = broker.submit(
+            _intent(intent_id=f"old-{instrument_id}", instrument_id=instrument_id),
+            initial,
+        )
+        broker.cancel(old.order_id, at=AT)
+        active_orders.append(
+            broker.submit(
+                _intent(
+                    intent_id=f"active-{instrument_id}",
+                    instrument_id=instrument_id,
+                    order_type=OrderType.STOP,
+                    trigger_price=Decimal("150"),
+                    take_profit=Decimal("180"),
+                ),
+                initial,
+            )
+        )
+    calls: list[str] = []
+    original = PaperBroker._process_order
+
+    def count_process_order(**kwargs: Any) -> Any:
+        record = kwargs["record"]
+        assert isinstance(record, paper_module._PaperOrderRecord)
+        calls.append(record.order.order_id)
+        return original(**kwargs)
+
+    monkeypatch.setattr(PaperBroker, "_process_order", staticmethod(count_process_order))
+    broker.on_snapshots(
+        (
+            (
+                _snapshot(
+                    _bar(0, open_price="100"),
+                    _bar(1, open_price="100"),
+                    instrument_id="BBB@alpaca",
+                ),
+                _instrument(instrument_id="BBB@alpaca"),
+            ),
+            (
+                _snapshot(
+                    _bar(0, open_price="100"),
+                    _bar(1, open_price="100"),
+                    instrument_id="AAA@alpaca",
+                ),
+                _instrument(instrument_id="AAA@alpaca"),
+            ),
+        )
+    )
+
+    expected = [
+        order.order_id
+        for order in sorted(active_orders, key=lambda item: item.instrument_id)
+    ]
+    assert calls == expected
