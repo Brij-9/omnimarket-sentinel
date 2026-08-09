@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta
@@ -108,6 +109,7 @@ def _snapshot(
     observed_at: datetime | None = None,
     source_at: datetime | None = None,
     max_age_seconds: int = 60,
+    provider: str = "fixture",
 ) -> MarketSnapshot:
     latest = bars[-1].at
     return MarketSnapshot(
@@ -115,7 +117,7 @@ def _snapshot(
         observed_at=latest if observed_at is None else observed_at,
         source_at=latest if source_at is None else source_at,
         bars=tuple(bars),
-        provider="fixture",
+        provider=provider,
         max_age_seconds=max_age_seconds,
     )
 
@@ -685,6 +687,8 @@ def test_fill_and_transition_audit_payloads_are_safe_and_complete() -> None:
         "quantity": "1",
             "price": "100",
             "fee": "0",
+            "filled_at": "2026-08-09T10:01:00+00:00",
+            "observed_at": "2026-08-09T10:01:00+00:00",
             "instrument": {
                 "symbol": "AAPL",
                 "venue": "alpaca",
@@ -799,9 +803,9 @@ def test_notional_residual_is_retained_for_a_later_lower_price() -> None:
     assert broker.get_order(order.order_id).status is OrderStatus.PARTIALLY_FILLED
     fill_events = [event for event in broker.audit_events if event.kind == "paper.order.fill"]
     assert fill_events[-1].payload["requested_notional"] == "19"
-    assert fill_events[-1].payload["cumulative_filled_notional"] == "18.0"
-    assert fill_events[-1].payload["remaining_notional"] == "1.0"
-    assert fill_events[-1].payload["cumulative_fees"] == "0.0"
+    assert fill_events[-1].payload["cumulative_filled_notional"] == "18"
+    assert fill_events[-1].payload["remaining_notional"] == "1"
+    assert fill_events[-1].payload["cumulative_fees"] == "0"
 
 
 def test_unknown_order_can_only_be_resolved_by_reconciliation() -> None:
@@ -993,15 +997,17 @@ def test_durable_mode_persists_rows_and_rehydrates_idempotently(tmp_path: Path) 
     rows = tuple(store.stream("durable-session"))
 
     assert [(row.sequence, row.kind, row.occurred_at) for row in rows] == [
-        (1, "paper.order.submitted", AT),
-        (2, "paper.order.transition", AT),
+        (1, "paper.market.submission", AT),
+        (2, "paper.order.submitted", AT),
         (3, "paper.order.transition", AT),
         (4, "paper.order.transition", AT),
         (5, "paper.order.transition", AT),
-        (6, "paper.state.committed", AT),
-        (7, "paper.order.transition", AT + timedelta(minutes=1)),
-        (8, "paper.order.fill", AT + timedelta(minutes=1)),
-        (9, "paper.state.committed", AT + timedelta(minutes=1)),
+        (6, "paper.order.transition", AT),
+        (7, "paper.state.committed", AT),
+        (8, "paper.order.transition", AT + timedelta(minutes=1)),
+        (9, "paper.order.fill", AT + timedelta(minutes=1)),
+        (10, "paper.market.observed", AT + timedelta(minutes=1)),
+        (11, "paper.state.committed", AT + timedelta(minutes=1)),
     ]
     assert all(row.occurred_at != clock.now() for row in rows)
     assert len({row.event_id for row in rows}) == len(rows)
@@ -1024,8 +1030,8 @@ def test_two_durable_brokers_never_collide_event_or_fill_ids(tmp_path: Path) -> 
     store = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'shared.db'}"))
     audit = AuditLog(store, FrozenClock(AT))
     bar0 = _bar(0, open_price="100")
-    fill_ids = []
-    event_ids = []
+    fill_ids: list[str] = []
+    event_ids: list[str] = []
     for index in range(2):
         session_id = f"session-{index}"
         broker = PaperBroker(
@@ -1255,7 +1261,7 @@ def test_rehydrate_rejects_incomplete_duplicate_or_reordered_streams(
     rows, _, audit, _ = _durable_stream(tmp_path)
 
     with pytest.raises(ValueError, match="invalid durable paper stream"):
-        PaperBroker.rehydrate(corrupt(rows), audit_log=audit)  # type: ignore[arg-type,operator]
+        PaperBroker.rehydrate(corrupt(rows), audit_log=audit)  # type: ignore[operator]
 
 
 def test_rehydrate_rejects_renumbered_state_without_lifecycle_history(
@@ -1303,44 +1309,62 @@ def test_rehydrate_rejects_tampered_lifecycle_payload(
         PaperBroker.rehydrate(corrupted, audit_log=audit)
 
 
+def test_rehydrate_rejects_unknown_or_reordered_lifecycle_activities(
+    tmp_path: Path,
+) -> None:
+    """Only the canonical activity vocabulary and reducer order can advance state."""
+    rows, _, audit, _ = _durable_stream(tmp_path)
+    fill_index = next(
+        index for index, row in enumerate(rows) if row.kind == "paper.order.fill"
+    )
+    transition_index = fill_index - 1
+    assert rows[transition_index].kind == "paper.order.transition"
+    unknown = rows[:fill_index] + (
+        replace(rows[fill_index], kind="paper.order.unknown_activity"),
+    ) + rows[fill_index + 1 :]
+    reordered = list(rows)
+    transition = rows[transition_index]
+    fill = rows[fill_index]
+    reordered[transition_index] = replace(
+        transition,
+        kind=fill.kind,
+        payload=fill.payload,
+        occurred_at=fill.occurred_at,
+    )
+    reordered[fill_index] = replace(
+        fill,
+        kind=transition.kind,
+        payload=transition.payload,
+        occurred_at=transition.occurred_at,
+    )
+
+    for corrupted in (unknown, tuple(reordered)):
+        with pytest.raises(ValueError, match="invalid durable paper stream"):
+            PaperBroker.rehydrate(corrupted, audit_log=audit)
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
         lambda state: state.update({"event_sequence": "9"}),
-        lambda state: state.update({"fill_sequence": True}),
-        lambda state: state["orders"][0].update({"stop_triggered": "false"}),
-        lambda state: state["orders"][0].update(
-            {"cumulative_filled_notional": "NaN"}
+        lambda state: state.update({"operation_sequence": True}),
+        lambda state: state.update({"activity_count": "3"}),
+        lambda state: state.update({"previous_state_digest": "0" * 64}),
+        lambda state: state.update({"state_digest": "0" * 64}),
+        lambda state: state["ledger"].update({"cash": "NaN"}),
+        lambda state: state["ledger"]["market_prices"].append(
+            {"instrument_id": "AAPL@alpaca", "price": "100"}
         ),
-        lambda state: state["orders"].append(state["orders"][0]),
-        lambda state: state["snapshots"].append(state["snapshots"][0]),
         lambda state: state.update({"unexpected": "field"}),
-        lambda state: state.setdefault("configuration", {}).update(
-            {"max_volume_participation": "2"}
-        ),
-        lambda state: state.setdefault(
-            "instruments",
-            [
-                {
-                    "symbol": "AAPL",
-                    "venue": "alpaca",
-                    "asset_class": "equity",
-                    "quote_currency": "USD",
-                    "timezone": "UTC",
-                    "price_tick": "0.01",
-                    "quantity_step": "0.1",
-                    "minimum_notional": "1",
-                    "session_calendar": None,
-                }
-            ],
-        )[0].update({"price_tick": "0.02"}),
+        lambda state: state.update({"configuration": {}}),
+        lambda state: state.update({"capabilities": {}}),
     ],
 )
 def test_rehydrate_strictly_rejects_tampered_state_payloads(
     tmp_path: Path,
     mutate: object,
 ) -> None:
-    """Malformed primitives, duplicates, extra keys, or venue metadata fail closed."""
+    """Malformed checkpoint primitives, digests, valuation, or extra keys fail closed."""
     rows, _, audit, _ = _durable_stream(tmp_path)
     corrupted = _tamper_latest_state(rows, mutate)
 
@@ -1403,7 +1427,7 @@ def test_multi_instrument_singular_events_fail_regardless_of_symbol_order() -> N
 
         with pytest.raises(ValueError, match="on_snapshots"):
             broker.on_snapshot(event, venue)
-        with pytest.raises(ValueError, match="active instruments"):
+        with pytest.raises(ValueError, match="cohort"):
             broker.on_snapshots(((event, venue),))
 
         assert (broker.list_orders(), broker.fills, broker.cash, broker.audit_events) == before
@@ -1434,8 +1458,14 @@ def test_status_only_unknown_resolution_cannot_invent_a_fill() -> None:
 def test_authoritative_unknown_fill_reconciliation_updates_all_state_atomically() -> None:
     """Partial and final broker truth must reconcile order, fills, cash, position, and audit."""
     broker = PaperBroker(starting_cash=Decimal("1000"))
-    order = broker.submit(_intent(), _snapshot(_bar(0, open_price="100")))
-    unknown = broker.mark_unknown(order.order_id, at=AT + timedelta(seconds=1))
+    bars = [_bar(0, open_price="100")]
+    order = broker.submit(_intent(), _snapshot(*bars))
+    bars.append(_bar(1, open_price="100", volume="0"))
+    broker.on_snapshot(_snapshot(*bars), _instrument())
+    unknown = broker.mark_unknown(
+        order.order_id,
+        at=AT + timedelta(minutes=1, seconds=1),
+    )
     partial_fill = Fill(
         fill_id="authoritative-fill-1",
         order_id=order.order_id,
@@ -1444,14 +1474,14 @@ def test_authoritative_unknown_fill_reconciliation_updates_all_state_atomically(
         quantity=Decimal("0.4"),
         price=Decimal("100"),
         fee=Decimal("1"),
-        filled_at=AT + timedelta(seconds=1, microseconds=1),
+        filled_at=AT + timedelta(minutes=1, seconds=1, microseconds=1),
     )
     partial_truth = unknown.model_copy(
         update={
             "status": OrderStatus.PARTIALLY_FILLED,
             "filled_quantity": Decimal("0.4"),
             "average_fill_price": Decimal("100"),
-            "updated_at": AT + timedelta(seconds=2),
+            "updated_at": AT + timedelta(minutes=1, seconds=2),
         }
     )
 
@@ -1464,7 +1494,10 @@ def test_authoritative_unknown_fill_reconciliation_updates_all_state_atomically(
     assert broker.cash == Decimal("959")
     assert broker.positions()[0].quantity == Decimal("0.4")
 
-    unknown_again = broker.mark_unknown(order.order_id, at=AT + timedelta(seconds=3))
+    unknown_again = broker.mark_unknown(
+        order.order_id,
+        at=AT + timedelta(minutes=1, seconds=3),
+    )
     final_fill = Fill(
         fill_id="authoritative-fill-2",
         order_id=order.order_id,
@@ -1473,14 +1506,14 @@ def test_authoritative_unknown_fill_reconciliation_updates_all_state_atomically(
         quantity=Decimal("0.6"),
         price=Decimal("102"),
         fee=Decimal("0"),
-        filled_at=AT + timedelta(seconds=3, microseconds=1),
+        filled_at=AT + timedelta(minutes=1, seconds=3, microseconds=1),
     )
     final_truth = unknown_again.model_copy(
         update={
             "status": OrderStatus.FILLED,
             "filled_quantity": Decimal("1"),
             "average_fill_price": Decimal("101.2"),
-            "updated_at": AT + timedelta(seconds=4),
+            "updated_at": AT + timedelta(minutes=1, seconds=4),
         }
     )
 
@@ -1591,3 +1624,435 @@ def test_broker_capability_name_must_be_one_safe_stable_identifier(
     base = _PAPER_CAPABILITY_VALUES | values
     with pytest.raises(ValueError, match="broker"):
         BrokerCapabilities(**base)  # type: ignore[arg-type]
+
+
+def test_rehydrate_rejects_removed_partial_fill_rows_even_when_commit_is_renumbered(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint cannot invent the fill suffix omitted from its activity group."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'omitted-fill.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        max_volume_participation=Decimal("0.5"),
+        audit_log=audit,
+        durable=True,
+        session_id="omitted-fill-session",
+    )
+    bars = [_bar(0, open_price="100")]
+    broker.submit(_intent(), _snapshot(*bars))
+    bars.append(_bar(1, open_price="100", volume="1"))
+    broker.on_snapshot(_snapshot(*bars), _instrument())
+    bars.append(_bar(2, open_price="100", volume="0.6"))
+    broker.on_snapshot(_snapshot(*bars), _instrument())
+    assert broker.get_order_by_client_id("intent-1").filled_quantity == Decimal("0.8")
+    assert broker.cash == Decimal("920.0")
+    rows = tuple(store.stream("omitted-fill-session"))
+    final_commit_index = max(
+        index for index, row in enumerate(rows) if row.kind == "paper.state.committed"
+    )
+    prior_commit_index = max(
+        index
+        for index, row in enumerate(rows[:final_commit_index])
+        if row.kind == "paper.state.committed"
+    )
+    removed = {
+        index
+        for index in range(prior_commit_index + 1, final_commit_index)
+        if rows[index].kind in {"paper.order.transition", "paper.order.fill"}
+    }
+    corrupted: list[EventRecord] = []
+    for row in (item for index, item in enumerate(rows) if index not in removed):
+        local = len(corrupted) + 1
+        payload = _mutable_payload(row.payload)
+        assert isinstance(payload, dict)
+        if row.kind == "paper.state.committed":
+            payload["event_sequence"] = local
+        corrupted.append(
+            replace(
+                row,
+                event_id=f"omitted-fill-session:event:{local:020d}",
+                payload=payload,
+            )
+        )
+
+    with pytest.raises(ValueError, match="invalid durable paper stream"):
+        PaperBroker.rehydrate(tuple(corrupted), audit_log=audit)
+
+
+def test_rehydrate_recomputes_marks_instead_of_trusting_ledger_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """A self-consistent forged valuation must disagree with the audited market event."""
+    _, store, audit, broker = _durable_stream(tmp_path, participation=Decimal("1"))
+    broker.on_snapshot(
+        _snapshot(
+            _bar(0, open_price="100"),
+            _bar(1, open_price="100", volume="10"),
+            _bar(2, open_price="150"),
+        ),
+        _instrument(),
+    )
+    rows = tuple(store.stream("round-two-session"))
+
+    def forge_valuation(state: dict[str, object]) -> None:
+        if "market_prices" in state:
+            market_prices = state["market_prices"]
+            assert isinstance(market_prices, dict)
+            market_prices["AAPL@alpaca"] = "110"
+        ledger = state["ledger"]
+        assert isinstance(ledger, dict)
+        prices = ledger["market_prices"]
+        assert isinstance(prices, list)
+        assert isinstance(prices[0], dict)
+        prices[0]["price"] = "110"
+        ledger["equity"] = "1010"
+        ledger["peak_equity"] = "1010"
+        ledger["drawdown"] = "0"
+
+    corrupted = _tamper_latest_state(rows, forge_valuation)
+
+    with pytest.raises(ValueError, match="invalid durable paper stream"):
+        PaperBroker.rehydrate(corrupted, audit_log=audit)
+
+
+def test_market_cohort_includes_terminal_orders_with_open_positions() -> None:
+    """A terminal ZZZ order still requires ZZZ marks while its position remains open."""
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    z_bars = [_bar(0, open_price="100")]
+    broker.submit(
+        _intent(intent_id="z", instrument_id="ZZZ@alpaca"),
+        _snapshot(*z_bars, instrument_id="ZZZ@alpaca"),
+    )
+    z_bars.append(_bar(1, open_price="100"))
+    broker.on_snapshot(
+        _snapshot(*z_bars, instrument_id="ZZZ@alpaca"),
+        _instrument(instrument_id="ZZZ@alpaca"),
+    )
+    a_bars = [_bar(1, open_price="100")]
+    broker.submit(
+        _intent(
+            intent_id="a",
+            instrument_id="AAA@alpaca",
+            created_at=AT + timedelta(minutes=1),
+        ),
+        _snapshot(*a_bars, instrument_id="AAA@alpaca"),
+    )
+    a_bars.append(_bar(2, open_price="100"))
+    before = (broker.list_orders(), broker.cash, broker.fills, broker.audit_events)
+
+    with pytest.raises(ValueError, match="on_snapshots"):
+        broker.on_snapshot(
+            _snapshot(*a_bars, instrument_id="AAA@alpaca"),
+            _instrument(instrument_id="AAA@alpaca"),
+        )
+    with pytest.raises(ValueError, match="cohort"):
+        broker.on_snapshots(
+            (
+                (
+                    _snapshot(*a_bars, instrument_id="AAA@alpaca"),
+                    _instrument(instrument_id="AAA@alpaca"),
+                ),
+            )
+        )
+
+    assert (broker.list_orders(), broker.cash, broker.fills, broker.audit_events) == before
+
+
+def test_market_cohort_rejects_mixed_observation_instants_atomically() -> None:
+    """A shared-cash cohort must represent one availability instant."""
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    a0 = _snapshot(_bar(0, open_price="100"), instrument_id="AAA@alpaca")
+    z0 = _snapshot(_bar(0, open_price="100"), instrument_id="ZZZ@alpaca")
+    broker.submit(_intent(intent_id="a", instrument_id="AAA@alpaca"), a0)
+    broker.submit(_intent(intent_id="z", instrument_id="ZZZ@alpaca"), z0)
+    a1 = _snapshot(*a0.bars, _bar(1, open_price="100"), instrument_id="AAA@alpaca")
+    z1 = _snapshot(
+        *z0.bars,
+        _bar(1, open_price="100"),
+        instrument_id="ZZZ@alpaca",
+        observed_at=AT + timedelta(minutes=1, seconds=1),
+    )
+    before = (broker.list_orders(), broker.cash, broker.fills, broker.audit_events)
+
+    with pytest.raises(ValueError, match="observed_at"):
+        broker.on_snapshots(
+            (
+                (a1, _instrument(instrument_id="AAA@alpaca")),
+                (z1, _instrument(instrument_id="ZZZ@alpaca")),
+            )
+        )
+
+    assert (broker.list_orders(), broker.cash, broker.fills, broker.audit_events) == before
+
+
+@pytest.mark.parametrize(
+    ("quantity", "price"),
+    [
+        (Decimal("0.35"), Decimal("100")),
+        (Decimal("0.4"), Decimal("100.001")),
+    ],
+)
+def test_authoritative_reconciliation_enforces_venue_precision(
+    quantity: Decimal,
+    price: Decimal,
+) -> None:
+    """Broker evidence cannot bypass the persisted venue's quantity or price steps."""
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    bars = [_bar(0, open_price="100")]
+    order = broker.submit(_intent(), _snapshot(*bars))
+    bars.append(_bar(1, open_price="100", volume="0"))
+    broker.on_snapshot(_snapshot(*bars), _instrument())
+    unknown = broker.mark_unknown(order.order_id, at=AT + timedelta(minutes=1, seconds=1))
+    fill = Fill(
+        fill_id="bad-venue-precision",
+        order_id=order.order_id,
+        instrument_id=order.instrument_id,
+        side=Side.BUY,
+        quantity=quantity,
+        price=price,
+        fee=Decimal("0"),
+        filled_at=AT + timedelta(minutes=1, seconds=2),
+    )
+    truth = unknown.model_copy(
+        update={
+            "status": OrderStatus.PARTIALLY_FILLED,
+            "filled_quantity": quantity,
+            "average_fill_price": price,
+            "updated_at": AT + timedelta(minutes=1, seconds=3),
+        }
+    )
+    before = (broker.get_order(order.order_id), broker.cash, broker.fills, broker.audit_events)
+
+    with pytest.raises(ValueError, match="authoritative fill"):
+        broker.reconcile_unknown_fills(truth, (fill,), instrument=_instrument())
+
+    assert (
+        broker.get_order(order.order_id),
+        broker.cash,
+        broker.fills,
+        broker.audit_events,
+    ) == before
+
+
+def test_provider_must_be_canonical_and_secret_like_value_never_reaches_audit() -> None:
+    """A regex-safe credential-shaped provider is not a supported market source."""
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    snapshot = _snapshot(
+        _bar(0, open_price="100"),
+        provider="sk_live_SUPERSECRET123",
+    )
+
+    with pytest.raises(ValueError, match="provider"):
+        broker.submit(_intent(), snapshot)
+
+    assert broker.order_count == 0
+    assert broker.audit_events == ()
+    assert "SUPERSECRET" not in repr(broker.audit_events)
+
+
+@pytest.mark.parametrize("quantity", [Decimal("1E+130"), Decimal("1E+999999999")])
+def test_decimal_encoding_rejects_oversized_exponent_before_durable_audit(
+    tmp_path: Path,
+    quantity: Decimal,
+) -> None:
+    """Every accepted Decimal must have one bounded, replayable canonical encoding."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'decimal.db'}")
+    )
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=AuditLog(store, FrozenClock(AT)),
+        durable=True,
+        session_id="decimal-session",
+    )
+
+    with pytest.raises(ValueError, match="Decimal"):
+        broker.submit(
+            _intent(quantity=quantity),
+            _snapshot(_bar(0, open_price="100")),
+        )
+
+    assert broker.order_count == 0
+    assert tuple(store.stream("decimal-session")) == ()
+
+
+def test_decimal_boundary_roundtrips_through_durable_recovery(tmp_path: Path) -> None:
+    """The largest supported exponent remains symmetric across encode and replay."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'decimal-boundary.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=audit,
+        durable=True,
+        session_id="decimal-boundary-session",
+    )
+    expected = broker.submit(
+        _intent(quantity=Decimal("1E+64")),
+        _snapshot(_bar(0, open_price="100")),
+    )
+
+    restored = PaperBroker.rehydrate(
+        tuple(store.stream("decimal-boundary-session")),
+        audit_log=audit,
+    )
+
+    assert restored.get_order(expected.order_id) == expected
+
+
+def test_progressed_order_retry_uses_current_state_not_obsolete_submission_snapshot() -> None:
+    """Idempotency must remain available after the original snapshot falls behind."""
+    original = _snapshot(_bar(0, open_price="100"))
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        max_volume_participation=Decimal("0.5"),
+    )
+    order = broker.submit(_intent(), original)
+    broker.on_snapshot(
+        _snapshot(*original.bars, _bar(1, open_price="100", volume="1")),
+        _instrument(),
+    )
+    current = broker.get_order(order.order_id)
+
+    assert broker.submit(_intent(), original) == current
+    assert broker.audit_events[-1].kind == "paper.order.duplicate"
+    assert broker.audit_events[-1].occurred_at == AT + timedelta(minutes=1)
+
+    with pytest.raises(DuplicateIntentConflict):
+        broker.submit(_intent(quantity=Decimal("2")), original)
+    assert broker.audit_events[-1].kind == "paper.order.duplicate_conflict"
+    assert broker.audit_events[-1].occurred_at == AT + timedelta(minutes=1)
+
+
+def test_paper_audit_payloads_are_recursively_immutable_live_and_after_replay(
+    tmp_path: Path,
+) -> None:
+    """Nested evidence cannot be mutated through an otherwise frozen audit event."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'freeze.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=audit,
+        durable=True,
+        session_id="freeze-session",
+    )
+    broker.submit(_intent(), _snapshot(_bar(0, open_price="100")))
+    live = next(event for event in broker.audit_events if event.kind == "paper.order.submitted")
+    live_intent = live.payload["intent"]
+    assert isinstance(live_intent, Mapping)
+
+    with pytest.raises(TypeError):
+        live_intent["quantity"] = "9"  # type: ignore[index]
+
+    restored = PaperBroker.rehydrate(
+        tuple(store.stream("freeze-session")),
+        audit_log=audit,
+    )
+    replayed = next(
+        event for event in restored.audit_events if event.kind == "paper.order.submitted"
+    )
+    replayed_intent = replayed.payload["intent"]
+    assert isinstance(replayed_intent, Mapping)
+    with pytest.raises(TypeError):
+        replayed_intent["quantity"] = "9"  # type: ignore[index]
+    assert live.payload["intent"] == replayed.payload["intent"]
+
+
+def test_durable_market_history_payload_growth_is_linear_and_replayable(
+    tmp_path: Path,
+) -> None:
+    """Later marks persist one cursor delta, never the complete growing bar prefix."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'linear.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=audit,
+        durable=True,
+        session_id="linear-session",
+    )
+    bars = [_bar(0, open_price="100")]
+    broker.submit(_intent(), _snapshot(*bars))
+    for minute in range(1, 41):
+        bars.append(_bar(minute, open_price=str(100 + minute), volume="10"))
+        broker.on_snapshot(_snapshot(*bars), _instrument())
+    rows = tuple(store.stream("linear-session"))
+    commit_sizes = [
+        len(json.dumps(_mutable_payload(row.payload), sort_keys=True))
+        for row in rows
+        if row.kind == "paper.state.committed"
+    ]
+    commits: list[dict[str, object]] = []
+    for row in rows:
+        if row.kind != "paper.state.committed":
+            continue
+        commit = _mutable_payload(row.payload)
+        assert isinstance(commit, dict)
+        commits.append(commit)
+
+    assert len(commit_sizes) == 41
+    assert max(commit_sizes) - min(commit_sizes) < 768
+    assert sum(
+        len(json.dumps(_mutable_payload(row.payload), sort_keys=True)) for row in rows
+    ) < len(rows) * 4096
+    assert all(
+        commits[index]["previous_state_digest"]
+        == commits[index - 1]["state_digest"]
+        for index in range(1, len(commits))
+    )
+    assert all(
+        isinstance(commit["state_digest"], str)
+        and len(commit["state_digest"]) == 64
+        for commit in commits
+    )
+    restored = PaperBroker.rehydrate(rows, audit_log=audit)
+    assert restored.portfolio_snapshot() == broker.portfolio_snapshot()
+    assert restored.fills == broker.fills
+
+
+def test_durable_second_order_references_existing_snapshot_without_repeating_bars(
+    tmp_path: Path,
+) -> None:
+    """Same-instrument submissions remain replayable without duplicating bar history."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'reference.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=audit,
+        durable=True,
+        session_id="reference-session",
+    )
+    snapshot = _snapshot(_bar(0, open_price="100"))
+    broker.submit(_intent(intent_id="first"), snapshot)
+    broker.submit(_intent(intent_id="second"), snapshot)
+    rows = tuple(store.stream("reference-session"))
+
+    assert sum(row.kind == "paper.market.submission" for row in rows) == 1
+    assert sum(row.kind == "paper.market.submission_reference" for row in rows) == 1
+    restored = PaperBroker.rehydrate(rows, audit_log=audit)
+    assert restored.list_orders() == broker.list_orders()
+
+
+def test_oversized_initial_bar_history_fails_before_audit() -> None:
+    """The per-instrument history bound is enforced before creating durable evidence."""
+    bars = tuple(_bar(minute, open_price="100") for minute in range(1025))
+    at = bars[-1].at
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+
+    with pytest.raises(ValueError, match="bar"):
+        broker.submit(
+            _intent(created_at=at, expires_at=at + timedelta(minutes=10)),
+            _snapshot(*bars),
+        )
+
+    assert broker.order_count == 0
+    assert broker.audit_events == ()
