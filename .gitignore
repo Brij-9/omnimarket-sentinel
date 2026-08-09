@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 .superpowers/
+.worktrees/
 .pytest_cache/
 .ruff_cache/
 .venv/
