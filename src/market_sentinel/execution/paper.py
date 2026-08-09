@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import re
@@ -31,8 +30,8 @@ from market_sentinel.domain.models import (
 from market_sentinel.execution.base import AuditRecorder, BrokerCapabilities
 from market_sentinel.execution.state_machine import OrderStateMachine, OrderTransitionEvent
 from market_sentinel.operations.audit import AuditEvent, AuditLog
-from market_sentinel.portfolio.ledger import PortfolioLedger
-from market_sentinel.storage.events import EventRecord, validate_event_payload
+from market_sentinel.portfolio.ledger import PortfolioLedger, PortfolioLedgerCompactState
+from market_sentinel.storage.events import EventRecord, EventStore, validate_event_payload
 
 
 class DuplicateIntentConflict(ValueError):
@@ -77,6 +76,21 @@ class SessionHead:
 
 
 @dataclass(frozen=True, slots=True)
+class RollingMarketWindow:
+    """One explicit post-prefix market delta bound to the retained cursor."""
+
+    instrument_id: str
+    observed_at: datetime
+    source_at: datetime
+    prior_bar_count: int
+    prior_bars_digest: str
+    overlap: tuple[Bar, ...]
+    new_bar: Bar
+    provider: str
+    max_age_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
 class _PaperOrderRecord:
     intent: OrderIntent
     order: BrokerOrder
@@ -87,6 +101,8 @@ class _PaperOrderRecord:
     cumulative_fees: Decimal = Decimal("0")
     stop_triggered: bool = False
     fill_count: int = 0
+    last_fill_at: datetime | None = None
+    last_fill_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,24 +157,108 @@ class _PaperState:
     latest_at: datetime | None
     last_event_key: tuple[datetime, datetime, str] | None
 
-    def clone(self) -> _PaperState:
-        return _PaperState(
-            orders=dict(self.orders),
-            client_orders=dict(self.client_orders),
-            snapshots=dict(self.snapshots),
-            cursors=dict(self.cursors),
-            fills=list(self.fills),
-            event_sequence=self.event_sequence,
-            operation_sequence=self.operation_sequence,
-            fill_sequence=self.fill_sequence,
-            state_digest=self.state_digest,
-            fill_ids_digest=self.fill_ids_digest,
-            ledger=copy.deepcopy(self.ledger),
-            market_prices=dict(self.market_prices),
-            instruments=dict(self.instruments),
-            latest_at=self.latest_at,
-            last_event_key=self.last_event_key,
+
+@dataclass(frozen=True, slots=True)
+class _Missing:
+    pass
+
+
+_MISSING = _Missing()
+
+
+@dataclass(slots=True)
+class _StateJournal:
+    """Key-scoped undo data for one staged in-place operation."""
+
+    state: _PaperState
+    order_values: dict[str, _PaperOrderRecord | _Missing]
+    client_values: dict[str, str | _Missing]
+    snapshot_values: dict[str, MarketSnapshot | _Missing]
+    cursor_values: dict[str, _MarketCursor | _Missing]
+    instrument_values: dict[str, Instrument | _Missing]
+    market_price_values: dict[str, Decimal | _Missing]
+    fills_length: int
+    ledger_state: PortfolioLedgerCompactState
+    event_sequence: int
+    operation_sequence: int
+    fill_sequence: int
+    state_digest: str
+    fill_ids_digest: str
+    latest_at: datetime | None
+    last_event_key: tuple[datetime, datetime, str] | None
+
+    @classmethod
+    def capture(
+        cls,
+        state: _PaperState,
+        *,
+        order_ids: Iterable[str] = (),
+        client_ids: Iterable[str] = (),
+        instrument_ids: Iterable[str] = (),
+    ) -> _StateJournal:
+        order_keys = tuple(order_ids)
+        client_keys = tuple(client_ids)
+        instrument_keys = tuple(instrument_ids)
+        return cls(
+            state=state,
+            order_values=_capture_mapping_values(state.orders, order_keys),
+            client_values=_capture_mapping_values(state.client_orders, client_keys),
+            snapshot_values=_capture_mapping_values(state.snapshots, instrument_keys),
+            cursor_values=_capture_mapping_values(state.cursors, instrument_keys),
+            instrument_values=_capture_mapping_values(state.instruments, instrument_keys),
+            market_price_values=_capture_mapping_values(
+                state.market_prices,
+                instrument_keys,
+            ),
+            fills_length=len(state.fills),
+            ledger_state=state.ledger.compact_state(),
+            event_sequence=state.event_sequence,
+            operation_sequence=state.operation_sequence,
+            fill_sequence=state.fill_sequence,
+            state_digest=state.state_digest,
+            fill_ids_digest=state.fill_ids_digest,
+            latest_at=state.latest_at,
+            last_event_key=state.last_event_key,
         )
+
+    def rollback(self) -> None:
+        added_fills = tuple(self.state.fills[self.fills_length :])
+        self.state.ledger.restore_compact_state(
+            self.ledger_state,
+            added_fill_ids=tuple(fill.fill_id for fill in added_fills),
+        )
+        del self.state.fills[self.fills_length :]
+        _restore_mapping_values(self.state.orders, self.order_values)
+        _restore_mapping_values(self.state.client_orders, self.client_values)
+        _restore_mapping_values(self.state.snapshots, self.snapshot_values)
+        _restore_mapping_values(self.state.cursors, self.cursor_values)
+        _restore_mapping_values(self.state.instruments, self.instrument_values)
+        _restore_mapping_values(self.state.market_prices, self.market_price_values)
+        self.state.event_sequence = self.event_sequence
+        self.state.operation_sequence = self.operation_sequence
+        self.state.fill_sequence = self.fill_sequence
+        self.state.state_digest = self.state_digest
+        self.state.fill_ids_digest = self.fill_ids_digest
+        self.state.latest_at = self.latest_at
+        self.state.last_event_key = self.last_event_key
+
+
+def _capture_mapping_values[MappingValue](
+    mapping: Mapping[str, MappingValue],
+    keys: Iterable[str],
+) -> dict[str, MappingValue | _Missing]:
+    return {key: mapping.get(key, _MISSING) for key in keys}
+
+
+def _restore_mapping_values[MappingValue](
+    mapping: dict[str, MappingValue],
+    values: Mapping[str, MappingValue | _Missing],
+) -> None:
+    for key, value in values.items():
+        if isinstance(value, _Missing):
+            mapping.pop(key, None)
+        else:
+            mapping[key] = value
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")
@@ -211,9 +311,9 @@ class PaperBroker:
     """Maintain an atomic current-session ledger, optionally backed by durable events.
 
     The default mode is explicitly process-local ``current_session`` state. Crash-durable
-    operation requires ``durable=True``, a stable caller-supplied ``session_id``, and an
-    ``AuditRecorder`` whose ``record_many`` is transactional. Each committed operation
-    persists its first-class activity rows plus a replayable state event in one batch.
+    operation requires ``durable=True``, a stable caller-supplied ``session_id``, and the
+    application's exact EventStore-backed ``AuditLog``. Durable continuation must use
+    :meth:`rehydrate_durable` with that same log and an externally protected session head.
     """
 
     broker_name = "paper"
@@ -239,7 +339,10 @@ class PaperBroker:
             raise ValueError("currency must be a safe uppercase identifier")
         if type(durable) is not bool:
             raise ValueError("durable must be an exact bool")
-        if durable and type(audit_log) is not AuditLog:
+        if durable and (
+            type(audit_log) is not AuditLog
+            or type(audit_log.event_store) is not EventStore
+        ):
             raise ValueError("durable paper execution requires the application AuditLog")
         if audit_log is not None and not callable(getattr(audit_log, "record_many", None)):
             raise ValueError("audit recorder must expose transactional record_many")
@@ -344,137 +447,45 @@ class PaperBroker:
             if not isinstance(intent, OrderIntent):
                 raise ValueError("intent must be an OrderIntent")
             _validate_intent_shape(intent)
-            duplicate_order_id = self._state.client_orders.get(intent.intent_id)
-            if duplicate_order_id is not None:
-                staged = self._state.clone()
-                existing = staged.orders[duplicate_order_id]
-                at = staged.latest_at or existing.order.updated_at
-                kind = (
-                    "paper.order.duplicate"
-                    if existing.intent == intent
-                    else "paper.order.duplicate_conflict"
+            if intent.intent_id in self._state.client_orders:
+                order_id = self._state.client_orders[intent.intent_id]
+                journal = _StateJournal.capture(
+                    self._state,
+                    order_ids=(order_id,),
+                    client_ids=(intent.intent_id,),
                 )
-                self._commit(
-                    staged,
-                    [
-                        _activity_spec(
-                            kind=kind,
-                            order=existing.order,
-                            at=at,
-                            payload={
-                                "outcome": (
-                                    "IDEMPOTENT_REPLAY"
-                                    if existing.intent == intent
-                                    else "CONFLICT"
-                                )
-                            },
-                        )
-                    ],
-                    at=at,
-                )
-                if existing.intent != intent:
+                try:
+                    staged, specs, existing, conflict, at = _execute_idempotency_kernel(
+                        self._state,
+                        intent,
+                    )
+                    self._commit(staged, specs, at=at)
+                except BaseException:
+                    journal.rollback()
+                    raise
+                if conflict:
                     raise DuplicateIntentConflict(
                         "client intent ID already belongs to a different canonical intent"
                     )
                 return existing.order
-            _validate_snapshot(snapshot, expected_instrument_id=intent.instrument_id)
-            _validate_intent(intent, snapshot=snapshot)
-            submitted_at = snapshot.observed_at.astimezone(UTC)
-            _validate_watermark(self._state, submitted_at)
-            if intent.created_at.astimezone(UTC) > submitted_at:
-                raise ValueError("intent creation must not be after submission snapshot")
-            if intent.expires_at.astimezone(UTC) <= submitted_at:
-                raise ValueError("intent must remain unexpired at submission")
-            staged = self._state.clone()
-            previous_snapshot = staged.snapshots.get(intent.instrument_id)
-            if previous_snapshot is not None and previous_snapshot != snapshot:
-                raise ValueError("submit snapshot revision requires on_snapshot processing first")
-            if previous_snapshot is None:
-                cursor = _cursor_from_bars(snapshot.bars)
-                market_kind = "paper.market.submission"
-                market_payload: Mapping[str, object] = MappingProxyType(
-                    {
-                        "snapshot": _snapshot_payload(snapshot),
-                        "bar_count": cursor.total_count,
-                        "bars_digest": cursor.digest,
-                    }
-                )
-            else:
-                cursor = staged.cursors[intent.instrument_id]
-                market_kind = "paper.market.submission_reference"
-                market_payload = MappingProxyType(
-                    {
-                        "bar_count": cursor.total_count,
-                        "bars_digest": cursor.digest,
-                    }
-                )
-            specs: list[_AuditSpec] = [
-                _AuditSpec(
-                    kind=market_kind,
-                    client_intent_id=intent.instrument_id,
-                    broker_order_id=intent.instrument_id,
-                    occurred_at=submitted_at,
-                    prior_status=None,
-                    new_status=None,
-                    payload=market_payload,
-                )
-            ]
-
             order_id = _paper_order_id(self._session_id, intent.intent_id)
-            order = BrokerOrder(
-                order_id=order_id,
-                client_order_id=intent.intent_id,
-                broker=self.broker_name,
-                instrument_id=intent.instrument_id,
-                status=OrderStatus.PROPOSED,
-                requested_quantity=intent.quantity,
-                filled_quantity=Decimal("0"),
-                average_fill_price=None,
-                submitted_at=submitted_at,
-                updated_at=submitted_at,
+            journal = _StateJournal.capture(
+                self._state,
+                order_ids=(order_id,),
+                client_ids=(intent.intent_id,),
+                instrument_ids=(intent.instrument_id,),
             )
-            specs.append(
-                _AuditSpec(
-                    kind="paper.order.submitted",
-                    client_intent_id=intent.intent_id,
-                    broker_order_id=order_id,
-                    occurred_at=submitted_at,
-                    prior_status=None,
-                    new_status=OrderStatus.PROPOSED,
-                    payload=MappingProxyType(
-                        {
-                            "instrument_id": intent.instrument_id,
-                            "side": intent.side.value,
-                            "order_type": intent.order_type.value,
-                            "intent": _intent_payload(intent),
-                        }
-                    ),
+            try:
+                staged, specs, order, submitted_at = _execute_submit_kernel(
+                    self._state,
+                    intent,
+                    snapshot,
+                    session_id=self._session_id,
                 )
-            )
-            for target in (
-                OrderStatus.RISK_APPROVED,
-                OrderStatus.CONFIRMED,
-                OrderStatus.SUBMITTING,
-                OrderStatus.ACKNOWLEDGED,
-            ):
-                order, transition = _stage_transition(order, target, submitted_at)
-                specs.append(_transition_spec(transition))
-            staged.orders[order_id] = _PaperOrderRecord(
-                intent=intent,
-                order=order,
-                submitted_source_at=snapshot.source_at.astimezone(UTC),
-                submission_reference_price=snapshot.bars[-1].close,
-                remaining_notional=intent.notional,
-            )
-            staged.client_orders[intent.intent_id] = order_id
-            staged.snapshots[intent.instrument_id] = _bounded_snapshot(snapshot)
-            staged.cursors[intent.instrument_id] = cursor
-            staged.latest_at = (
-                submitted_at
-                if staged.latest_at is None
-                else max(staged.latest_at, submitted_at)
-            )
-            self._commit(staged, specs, at=submitted_at)
+                self._commit(staged, specs, at=submitted_at)
+            except BaseException:
+                journal.rollback()
+                raise
             return order
 
     def on_snapshot(
@@ -494,18 +505,79 @@ class PaperBroker:
         self,
         events: tuple[tuple[MarketSnapshot, Instrument], ...],
     ) -> tuple[Fill, ...]:
-        """Atomically process a globally sorted batch of current market events."""
+        """Process natural full prefixes up to the 1,024-bar public input bound."""
         with self._lock:
             if not isinstance(events, tuple) or not events:
                 raise ValueError("snapshot batch must be a nonempty tuple")
+            normalized: list[tuple[MarketSnapshot, Instrument]] = []
+            for item in events:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    raise ValueError("snapshot batch entries must contain snapshot and instrument")
+                snapshot, instrument = item
+                instrument_id = _instrument_id(instrument)
+                if not isinstance(snapshot, MarketSnapshot):
+                    raise ValueError("snapshot must be a MarketSnapshot")
+                if snapshot.instrument_id != instrument_id:
+                    raise ValueError("snapshot and instrument identity must match")
+                normalized.append(
+                    (
+                        _normalize_full_prefix(self._state, snapshot, instrument_id),
+                        instrument,
+                    )
+                )
+            return self._process_snapshots(tuple(normalized))
+
+    def on_rolling_snapshot(
+        self,
+        window: RollingMarketWindow,
+        instrument: Instrument,
+    ) -> tuple[Fill, ...]:
+        """Process one explicit cursor-bound 64-bar overlap plus one unseen bar."""
+        with self._lock:
+            if len(_relevant_instrument_ids(self._state)) != 1:
+                raise ValueError(
+                    "market cohort requires one atomic on_rolling_snapshots batch"
+                )
+            return self.on_rolling_snapshots(((window, instrument),))
+
+    def on_rolling_snapshots(
+        self,
+        events: tuple[tuple[RollingMarketWindow, Instrument], ...],
+    ) -> tuple[Fill, ...]:
+        """Atomically process an exact same-time cohort of explicit rolling deltas."""
+        with self._lock:
+            if not isinstance(events, tuple) or not events:
+                raise ValueError("rolling snapshot batch must be a nonempty tuple")
+            normalized: list[tuple[MarketSnapshot, Instrument]] = []
+            for item in events:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    raise ValueError("rolling entries must contain window and instrument")
+                window, instrument = item
+                instrument_id = _instrument_id(instrument)
+                if not isinstance(window, RollingMarketWindow):
+                    raise ValueError("rolling input must be a RollingMarketWindow")
+                if window.instrument_id != instrument_id:
+                    raise ValueError("rolling input and instrument identity must match")
+                normalized.append(
+                    (
+                        _snapshot_from_rolling_window(self._state, window, instrument),
+                        instrument,
+                    )
+                )
+            return self._process_snapshots(tuple(normalized))
+
+    def _process_snapshots(
+        self,
+        events: tuple[tuple[MarketSnapshot, Instrument], ...],
+    ) -> tuple[Fill, ...]:
+        """Process prevalidated bounded snapshots through the shared market kernel."""
+        with self._lock:
             validated: list[
                 tuple[tuple[datetime, datetime, str], MarketSnapshot, Instrument, bool]
             ] = []
             seen_instruments: set[str] = set()
             relevant_instruments = _relevant_instrument_ids(self._state)
             for item in events:
-                if not isinstance(item, tuple) or len(item) != 2:
-                    raise ValueError("snapshot batch entries must contain snapshot and instrument")
                 snapshot, instrument = item
                 instrument_id = _instrument_id(instrument)
                 if instrument_id in seen_instruments:
@@ -562,17 +634,31 @@ class PaperBroker:
                     raise ValueError("global chronology keys must be strictly increasing")
 
             commit_at = max(snapshot.observed_at for _, snapshot, _, _ in validated)
-            staged, specs, produced = _execute_market_kernel(
-                self._state,
-                tuple(
-                    _MarketInput(snapshot, instrument, duplicate)
-                    for _, snapshot, instrument, duplicate in validated
-                ),
-                fill_model=self._fill_model,
-                max_volume_participation=self._max_volume_participation,
-                session_id=self._session_id,
+            order_ids = tuple(
+                order_id
+                for order_id, record in self._state.orders.items()
+                if record.order.instrument_id in seen_instruments
             )
-            self._commit(staged, specs, at=commit_at)
+            journal = _StateJournal.capture(
+                self._state,
+                order_ids=order_ids,
+                instrument_ids=seen_instruments,
+            )
+            try:
+                staged, specs, produced = _execute_market_kernel(
+                    self._state,
+                    tuple(
+                        _MarketInput(snapshot, instrument, duplicate)
+                        for _, snapshot, instrument, duplicate in validated
+                    ),
+                    fill_model=self._fill_model,
+                    max_volume_participation=self._max_volume_participation,
+                    session_id=self._session_id,
+                )
+                self._commit(staged, specs, at=commit_at)
+            except BaseException:
+                journal.rollback()
+                raise
             return produced
 
     def get_order(self, order_id: str) -> BrokerOrder:
@@ -646,14 +732,23 @@ class PaperBroker:
     ) -> BrokerOrder:
         """Atomically apply authoritative fill evidence for one UNKNOWN order."""
         with self._lock:
-            staged, specs, at = _execute_reconciliation_kernel(
+            journal = _StateJournal.capture(
                 self._state,
-                authoritative_order,
-                new_fills,
-                instrument,
-                currency=self._currency,
+                order_ids=(authoritative_order.order_id,),
+                instrument_ids=(_instrument_id(instrument),),
             )
-            self._commit(staged, specs, at=at)
+            try:
+                staged, specs, at = _execute_reconciliation_kernel(
+                    self._state,
+                    authoritative_order,
+                    new_fills,
+                    instrument,
+                    currency=self._currency,
+                )
+                self._commit(staged, specs, at=at)
+            except BaseException:
+                journal.rollback()
+                raise
             return authoritative_order
 
     def _resolve(
@@ -665,28 +760,19 @@ class PaperBroker:
         activity: tuple[str, Mapping[str, object]] | None = None,
     ) -> BrokerOrder:
         with self._lock:
-            staged = self._state.clone()
-            record = staged.orders.get(order_id)
-            if record is None:
-                raise KeyError("paper order not found")
-            resolved_at = _aware_utc(at, "resolution timestamp")
-            _validate_watermark(self._state, resolved_at)
-            updated, transition = _stage_transition(record.order, status, resolved_at)
-            specs: list[_AuditSpec] = []
-            if activity is not None:
-                specs.append(
-                    _activity_spec(
-                        kind=activity[0],
-                        order=record.order,
-                        at=resolved_at,
-                        payload=activity[1],
-                        new_status=status,
-                    )
+            journal = _StateJournal.capture(self._state, order_ids=(order_id,))
+            try:
+                staged, specs, updated, resolved_at = _execute_resolution_kernel(
+                    self._state,
+                    order_id,
+                    status,
+                    at=at,
+                    activity=activity,
                 )
-            specs.append(_transition_spec(transition))
-            staged.orders[order_id] = replace(record, order=updated)
-            staged.latest_at = resolved_at
-            self._commit(staged, specs, at=resolved_at)
+                self._commit(staged, specs, at=resolved_at)
+            except BaseException:
+                journal.rollback()
+                raise
             return updated
 
     @staticmethod
@@ -850,6 +936,8 @@ class PaperBroker:
             cumulative_filled_notional=cumulative_notional,
             cumulative_fees=cumulative_fees,
             fill_count=record.fill_count + 1,
+            last_fill_at=candidate.filled_at,
+            last_fill_id=candidate.fill_id,
         )
         state.ledger.apply_fill(candidate)
         state.fill_sequence += 1
@@ -913,14 +1001,17 @@ class PaperBroker:
         occurred_at = _aware_utc(at, "commit timestamp")
         if not specs:
             raise ValueError("paper operation requires first-class activity evidence")
+        previous_event_sequence = self._state.event_sequence
+        previous_operation_sequence = self._state.operation_sequence
+        previous_state_digest = self._state.state_digest
         activity_count = len(specs)
-        first_sequence = self._state.event_sequence + 1
-        final_sequence = self._state.event_sequence + activity_count + 1
+        first_sequence = previous_event_sequence + 1
+        final_sequence = previous_event_sequence + activity_count + 1
         staged.event_sequence = final_sequence
-        staged.operation_sequence = self._state.operation_sequence + 1
+        staged.operation_sequence = previous_operation_sequence + 1
         _validate_state_limits(staged, activity_count=activity_count)
         staged.state_digest = _next_state_digest(
-            self._state.state_digest,
+            previous_state_digest,
             _spec_activity_facts(specs),
             staged,
         )
@@ -943,7 +1034,7 @@ class PaperBroker:
                         first_activity_sequence=first_sequence,
                         activity_count=activity_count,
                         operation_kind=_operation_kind(specs),
-                        previous_state_digest=_state_digest(self._state),
+                        previous_state_digest=previous_state_digest,
                     )
                 ),
             )
@@ -986,7 +1077,7 @@ class PaperBroker:
         cls,
         records: Iterable[EventRecord],
         *,
-        audit_log: AuditRecorder,
+        audit_log: AuditRecorder | None = None,
         expected_head: SessionHead | None = None,
         starting_cash: Decimal | None = None,
         session_id: str | None = None,
@@ -994,12 +1085,63 @@ class PaperBroker:
         fill_model: FillModel | None = None,
         max_volume_participation: Decimal | None = None,
     ) -> PaperBroker:
-        """Deterministically reduce a complete durable activity stream."""
-        if expected_head is None:
+        """Replay caller-supplied records into non-durable current-session state."""
+        del audit_log
+        return cls._rehydrate_records(
+            records,
+            expected_head=expected_head,
+            starting_cash=starting_cash,
+            session_id=session_id,
+            currency=currency,
+            fill_model=fill_model,
+            max_volume_participation=max_volume_participation,
+            continuation_audit=None,
+        )
+
+    @classmethod
+    def rehydrate_durable(
+        cls,
+        audit_log: AuditLog,
+        *,
+        expected_head: SessionHead,
+        starting_cash: Decimal | None = None,
+        session_id: str | None = None,
+        currency: str | None = None,
+        fill_model: FillModel | None = None,
+        max_volume_participation: Decimal | None = None,
+    ) -> PaperBroker:
+        """Recover and continue from the exact EventStore retained by ``audit_log``."""
+        if type(audit_log) is not AuditLog or type(audit_log.event_store) is not EventStore:
+            raise ValueError("durable recovery requires an EventStore-backed AuditLog")
+        if type(expected_head) is not SessionHead:
+            raise ValueError("trusted session head must be an exact SessionHead")
+        return cls._rehydrate_records(
+            audit_log.event_store.stream(expected_head.session_id),
+            expected_head=expected_head,
+            starting_cash=starting_cash,
+            session_id=session_id,
+            currency=currency,
+            fill_model=fill_model,
+            max_volume_participation=max_volume_participation,
+            continuation_audit=audit_log,
+        )
+
+    @classmethod
+    def _rehydrate_records(
+        cls,
+        records: Iterable[EventRecord],
+        *,
+        expected_head: SessionHead | None,
+        starting_cash: Decimal | None,
+        session_id: str | None,
+        currency: str | None,
+        fill_model: FillModel | None,
+        max_volume_participation: Decimal | None,
+        continuation_audit: AuditLog | None,
+    ) -> PaperBroker:
+        if type(expected_head) is not SessionHead:
             raise ValueError("trusted session head is required for durable recovery")
         try:
-            if type(audit_log) is not AuditLog:
-                raise ValueError
             rows = tuple(islice(iter(records), _MAX_SESSION_EVENTS + 1))
             if not rows or len(rows) > _MAX_SESSION_EVENTS:
                 raise ValueError
@@ -1115,8 +1257,8 @@ class PaperBroker:
                 starting_cash=configuration.starting_cash,
                 currency=configuration.currency,
                 max_volume_participation=configuration.max_volume_participation,
-                audit_log=audit_log,
-                durable=True,
+                audit_log=continuation_audit,
+                durable=continuation_audit is not None,
                 session_id=configuration.session_id,
             )
             broker._state = state
@@ -1148,6 +1290,170 @@ def _stage_transition(
     return updated, event
 
 
+def _execute_submit_kernel(
+    previous: _PaperState,
+    intent: OrderIntent,
+    snapshot: MarketSnapshot,
+    *,
+    session_id: str,
+) -> tuple[_PaperState, list[_AuditSpec], BrokerOrder, datetime]:
+    """Deterministically validate and project one new canonical submission."""
+    _validate_intent_shape(intent)
+    if intent.intent_id in previous.client_orders:
+        raise ValueError("new submission kernel requires an unused client intent ID")
+    _validate_snapshot(snapshot, expected_instrument_id=intent.instrument_id)
+    _validate_intent(intent, snapshot=snapshot)
+    submitted_at = snapshot.observed_at.astimezone(UTC)
+    _validate_watermark(previous, submitted_at)
+    if intent.created_at.astimezone(UTC) > submitted_at:
+        raise ValueError("intent creation must not be after submission snapshot")
+    if intent.expires_at.astimezone(UTC) <= submitted_at:
+        raise ValueError("intent must remain unexpired at submission")
+    _validate_admission_liveness(previous, intent.instrument_id)
+    staged = previous
+    previous_snapshot = staged.snapshots.get(intent.instrument_id)
+    if previous_snapshot is not None and previous_snapshot != snapshot:
+        raise ValueError("submit snapshot revision requires on_snapshot processing first")
+    if previous_snapshot is None:
+        cursor = _cursor_from_bars(snapshot.bars)
+        market_kind = "paper.market.submission"
+        market_payload: Mapping[str, object] = MappingProxyType(
+            {
+                "snapshot": _snapshot_payload(snapshot),
+                "bar_count": cursor.total_count,
+                "bars_digest": cursor.digest,
+            }
+        )
+    else:
+        cursor = staged.cursors[intent.instrument_id]
+        market_kind = "paper.market.submission_reference"
+        market_payload = MappingProxyType(
+            {"bar_count": cursor.total_count, "bars_digest": cursor.digest}
+        )
+    specs: list[_AuditSpec] = [
+        _AuditSpec(
+            kind=market_kind,
+            client_intent_id=intent.instrument_id,
+            broker_order_id=intent.instrument_id,
+            occurred_at=submitted_at,
+            prior_status=None,
+            new_status=None,
+            payload=market_payload,
+        )
+    ]
+    order_id = _paper_order_id(session_id, intent.intent_id)
+    order = BrokerOrder(
+        order_id=order_id,
+        client_order_id=intent.intent_id,
+        broker=_PAPER_CAPABILITIES.broker,
+        instrument_id=intent.instrument_id,
+        status=OrderStatus.PROPOSED,
+        requested_quantity=intent.quantity,
+        filled_quantity=Decimal("0"),
+        average_fill_price=None,
+        submitted_at=submitted_at,
+        updated_at=submitted_at,
+    )
+    specs.append(
+        _AuditSpec(
+            kind="paper.order.submitted",
+            client_intent_id=intent.intent_id,
+            broker_order_id=order_id,
+            occurred_at=submitted_at,
+            prior_status=None,
+            new_status=OrderStatus.PROPOSED,
+            payload=MappingProxyType(
+                {
+                    "instrument_id": intent.instrument_id,
+                    "side": intent.side.value,
+                    "order_type": intent.order_type.value,
+                    "intent": _intent_payload(intent),
+                }
+            ),
+        )
+    )
+    for target in (
+        OrderStatus.RISK_APPROVED,
+        OrderStatus.CONFIRMED,
+        OrderStatus.SUBMITTING,
+        OrderStatus.ACKNOWLEDGED,
+    ):
+        order, transition = _stage_transition(order, target, submitted_at)
+        specs.append(_transition_spec(transition))
+    staged.orders[order_id] = _PaperOrderRecord(
+        intent=intent,
+        order=order,
+        submitted_source_at=snapshot.source_at.astimezone(UTC),
+        submission_reference_price=snapshot.bars[-1].close,
+        remaining_notional=intent.notional,
+    )
+    staged.client_orders[intent.intent_id] = order_id
+    staged.snapshots[intent.instrument_id] = _bounded_snapshot(snapshot)
+    staged.cursors[intent.instrument_id] = cursor
+    staged.latest_at = max(staged.latest_at or submitted_at, submitted_at)
+    return staged, specs, order, submitted_at
+
+
+def _execute_idempotency_kernel(
+    previous: _PaperState,
+    intent: OrderIntent,
+) -> tuple[_PaperState, list[_AuditSpec], _PaperOrderRecord, bool, datetime]:
+    """Deterministically project one canonical duplicate or conflict outcome."""
+    _validate_intent_shape(intent)
+    order_id = previous.client_orders.get(intent.intent_id)
+    if order_id is None:
+        raise ValueError("idempotency kernel requires an existing client intent ID")
+    staged = previous
+    existing = staged.orders[order_id]
+    at = staged.latest_at or existing.order.updated_at
+    conflict = existing.intent != intent
+    specs = [
+        _activity_spec(
+            kind=("paper.order.duplicate_conflict" if conflict else "paper.order.duplicate"),
+            order=existing.order,
+            at=at,
+            payload={
+                "outcome": "CONFLICT" if conflict else "IDEMPOTENT_REPLAY",
+                "intent": _intent_payload(intent),
+            },
+        )
+    ]
+    return staged, specs, existing, conflict, at
+
+
+def _execute_resolution_kernel(
+    previous: _PaperState,
+    order_id: str,
+    status: OrderStatus,
+    *,
+    at: datetime,
+    activity: tuple[str, Mapping[str, object]] | None = None,
+) -> tuple[_PaperState, list[_AuditSpec], BrokerOrder, datetime]:
+    """Deterministically project one non-fill broker status resolution."""
+    staged = previous
+    record = staged.orders.get(order_id)
+    if record is None:
+        raise KeyError("paper order not found")
+    resolved_at = _aware_utc(at, "resolution timestamp")
+    _validate_watermark(previous, resolved_at)
+    updated, transition = _stage_transition(record.order, status, resolved_at)
+    specs: list[_AuditSpec] = []
+    if activity is not None:
+        specs.append(
+            _activity_spec(
+                kind=activity[0],
+                order=record.order,
+                at=resolved_at,
+                payload=activity[1],
+                new_status=status,
+            )
+        )
+    specs.append(_transition_spec(transition))
+    staged.orders[order_id] = replace(record, order=updated)
+    staged.latest_at = resolved_at
+    return staged, specs, updated, resolved_at
+
+
 def _execute_market_kernel(
     previous: _PaperState,
     inputs: tuple[_MarketInput, ...],
@@ -1157,7 +1463,7 @@ def _execute_market_kernel(
     session_id: str,
 ) -> tuple[_PaperState, list[_AuditSpec], tuple[Fill, ...]]:
     """Purely project one canonical cohort into state and exact activity grammar."""
-    staged = previous.clone()
+    staged = previous
     specs: list[_AuditSpec] = []
     produced: list[Fill] = []
     for market_input in inputs:
@@ -1274,7 +1580,13 @@ def _execute_reconciliation_kernel(
     """Purely validate and project one authoritative UNKNOWN-fill operation."""
     if not isinstance(authoritative_order, BrokerOrder):
         raise ValueError("authoritative fill order is invalid")
-    staged = previous.clone()
+    if (
+        not isinstance(new_fills, tuple)
+        or not new_fills
+        or len(new_fills) + 1 > _MAX_GROUP_ACTIVITIES
+    ):
+        raise ValueError("authoritative fill evidence exceeds activity capacity")
+    staged = previous
     record = staged.orders.get(authoritative_order.order_id)
     if record is None or record.order.status is not OrderStatus.UNKNOWN:
         raise ValueError("authoritative fill requires one UNKNOWN paper order")
@@ -1295,8 +1607,6 @@ def _execute_reconciliation_kernel(
         not in {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED}
         or authoritative_order.filled_quantity <= current.filled_quantity
         or authoritative_order.average_fill_price is None
-        or not isinstance(new_fills, tuple)
-        or not new_fills
     ):
         raise ValueError("authoritative fill order identity or status is invalid")
     prior_instrument = staged.instruments.get(instrument_id)
@@ -1307,21 +1617,24 @@ def _execute_reconciliation_kernel(
     if _original_requested_notional(record) < instrument.minimum_notional:
         raise ValueError("authoritative order violates venue minimum notional")
 
-    existing_fill_ids = {fill.fill_id for fill in staged.fills}
     delta = authoritative_order.filled_quantity - current.filled_quantity
-    prior_at = max(
-        (
-            fill.filled_at
-            for fill in staged.fills
-            if fill.order_id == current.order_id
-        ),
-        default=current.submitted_at,
+    prior_key = (
+        record.last_fill_at or current.submitted_at,
+        record.last_fill_id or "",
     )
-    prior_key = (prior_at, "")
     fill_notional = Decimal("0")
     fill_fees = Decimal("0")
     fill_quantity = Decimal("0")
     seen_fill_ids: set[str] = set()
+    available_cash = staged.ledger.cash
+    available_position = next(
+        (
+            position.quantity
+            for position in _state_positions(staged)
+            if position.instrument_id == current.instrument_id
+        ),
+        Decimal("0"),
+    )
     for fill in new_fills:
         if not isinstance(fill, Fill):
             raise ValueError("authoritative fill evidence is invalid")
@@ -1330,7 +1643,7 @@ def _execute_reconciliation_kernel(
         if (
             not isinstance(fill.fill_id, str)
             or _IDENTIFIER.fullmatch(fill.fill_id) is None
-            or fill.fill_id in existing_fill_ids
+            or staged.ledger.has_fill_id(fill.fill_id)
             or fill.fill_id in seen_fill_ids
             or fill.order_id != current.order_id
             or fill.instrument_id != current.instrument_id
@@ -1351,20 +1664,14 @@ def _execute_reconciliation_kernel(
         if not _respects_order_prices(record.intent, fill.price):
             raise ValueError("authoritative fill price violates order protection")
         if record.intent.side is Side.BUY:
-            if fill.quantity * fill.price + fill.fee > staged.ledger.cash:
+            consideration = fill.quantity * fill.price + fill.fee
+            if consideration > available_cash:
                 raise ValueError("authoritative fill exceeds paper cash")
+            available_cash -= consideration
         else:
-            held = next(
-                (
-                    position.quantity
-                    for position in _state_positions(staged)
-                    if position.instrument_id == current.instrument_id
-                ),
-                Decimal("0"),
-            )
-            if fill.quantity > held:
+            if fill.quantity > available_position:
                 raise ValueError("authoritative fill exceeds paper position")
-        staged.ledger.apply_fill(fill)
+            available_position -= fill.quantity
         seen_fill_ids.add(fill.fill_id)
         fill_quantity += fill.quantity
         fill_notional += fill.quantity * fill.price
@@ -1430,6 +1737,12 @@ def _execute_reconciliation_kernel(
                 },
             )
         )
+    # Pair each staged ledger mutation with the journal-visible fill suffix.  Any
+    # later mark, persistence, or commit failure can then remove exactly these IDs
+    # without visiting or copying historical fill identity state.
+    for fill in new_fills:
+        staged.ledger.apply_fill(fill)
+        staged.fills.append(fill)
     staged.orders[current.order_id] = replace(
         record,
         order=authoritative_order,
@@ -1437,8 +1750,9 @@ def _execute_reconciliation_kernel(
         cumulative_filled_notional=total_notional,
         cumulative_fees=record.cumulative_fees + fill_fees,
         fill_count=record.fill_count + len(new_fills),
+        last_fill_at=new_fills[-1].filled_at,
+        last_fill_id=new_fills[-1].fill_id,
     )
-    staged.fills.extend(new_fills)
     for fill in new_fills:
         staged.fill_ids_digest = _next_fill_ids_digest(
             staged.fill_ids_digest,
@@ -1645,6 +1959,88 @@ def _validate_snapshot(
         raise ValueError("snapshot source timestamp must equal its latest bar")
 
 
+def _normalize_full_prefix(
+    state: _PaperState,
+    snapshot: MarketSnapshot,
+    instrument_id: str,
+) -> MarketSnapshot:
+    """Normalize a natural bounded provider prefix against the retained cursor window."""
+    previous = state.snapshots.get(instrument_id)
+    cursor = state.cursors.get(instrument_id)
+    if previous is None or cursor is None:
+        raise ValueError("snapshot has no submitted paper cursor")
+    # A provider rewriting an already accepted prefix is a history revision even
+    # when the rewritten candle is internally malformed.  Classify it before the
+    # generic bar validator so callers receive the stable cursor-contract error.
+    if len(snapshot.bars) == cursor.total_count and snapshot != previous:
+        raise ValueError("snapshot revision or backward event is not allowed")
+    _validate_snapshot(
+        snapshot,
+        expected_instrument_id=instrument_id,
+        max_bars=_MAX_INITIAL_BARS,
+    )
+    if snapshot == previous:
+        return snapshot
+    same_metadata = (
+        snapshot.observed_at == previous.observed_at
+        and snapshot.source_at == previous.source_at
+        and snapshot.provider == previous.provider
+        and snapshot.max_age_seconds == previous.max_age_seconds
+    )
+    if len(snapshot.bars) == cursor.total_count:
+        if same_metadata and snapshot.bars[-len(cursor.window) :] == cursor.window:
+            return previous
+        raise ValueError("snapshot revision or backward event is not allowed")
+    if cursor.total_count >= _MAX_INITIAL_BARS:
+        raise ValueError("snapshot requires the explicit rolling window API")
+    if len(snapshot.bars) != cursor.total_count + 1:
+        raise ValueError("snapshot must contain exactly one unseen event")
+    overlap = snapshot.bars[-(len(cursor.window) + 1) : -1]
+    if overlap != cursor.window:
+        raise ValueError("snapshot trailing overlap does not match the retained cursor")
+    return snapshot.model_copy(update={"bars": cursor.window + (snapshot.bars[-1],)})
+
+
+def _snapshot_from_rolling_window(
+    state: _PaperState,
+    window: RollingMarketWindow,
+    instrument: Instrument,
+) -> MarketSnapshot:
+    """Validate one explicit rolling input and return its bounded kernel snapshot."""
+    if type(window) is not RollingMarketWindow:
+        raise ValueError("rolling input must be a RollingMarketWindow")
+    instrument_id = _instrument_id(instrument)
+    cursor = state.cursors.get(instrument_id)
+    if (
+        cursor is None
+        or window.instrument_id != instrument_id
+        or type(window.prior_bar_count) is not int
+        or window.prior_bar_count != cursor.total_count
+        or not isinstance(window.prior_bars_digest, str)
+        or window.prior_bars_digest != cursor.digest
+        or _SNAPSHOT_HASH.fullmatch(window.prior_bars_digest) is None
+        or not isinstance(window.overlap, tuple)
+        or len(window.overlap) != len(cursor.window)
+        or window.overlap != cursor.window
+        or not isinstance(window.new_bar, Bar)
+    ):
+        raise ValueError("rolling input does not match the retained market cursor")
+    snapshot = MarketSnapshot(
+        instrument_id=instrument_id,
+        observed_at=window.observed_at,
+        source_at=window.source_at,
+        bars=window.overlap + (window.new_bar,),
+        provider=window.provider,
+        max_age_seconds=window.max_age_seconds,
+    )
+    _validate_snapshot(
+        snapshot,
+        expected_instrument_id=instrument_id,
+        max_bars=_MARKET_CURSOR_WINDOW + 1,
+    )
+    return snapshot
+
+
 def _validate_protective_prices(
     intent: OrderIntent,
     snapshot: MarketSnapshot,
@@ -1766,10 +2162,23 @@ def _relevant_instrument_ids(state: _PaperState) -> set[str]:
         for record in state.orders.values()
         if record.order.status not in _CLOSED
     }
-    positions = {
-        position.instrument_id for position in state.ledger.export_state().positions
-    }
+    positions = {position.instrument_id for position in _state_positions(state)}
     return active | positions
+
+
+def _validate_admission_liveness(state: _PaperState, instrument_id: str) -> None:
+    """Ensure the worst next cohort grammar fits before admitting active exposure."""
+    active_records = [
+        record for record in state.orders.values() if record.order.status not in _CLOSED
+    ]
+    active_instruments = {
+        record.order.instrument_id for record in active_records
+    } | {instrument_id}
+    position_instruments = {position.instrument_id for position in _state_positions(state)}
+    market_rows = len(active_instruments | position_instruments)
+    worst_order_rows = 3 * (len(active_records) + 1)
+    if market_rows + worst_order_rows > _MAX_GROUP_ACTIVITIES:
+        raise ValueError("submission would exceed the next market activity capacity")
 
 
 def _validate_watermark(state: _PaperState, at: datetime) -> None:
@@ -2203,7 +2612,7 @@ def _next_fill_ids_digest(previous_digest: str, fill_id: str) -> str:
 
 
 def _ledger_checkpoint_payload(state: _PaperState) -> Mapping[str, object]:
-    ledger_state = state.ledger.export_state()
+    ledger_state = state.ledger.compact_state()
     positions_digest = hashlib.sha256(
         json.dumps(
             [
@@ -2366,10 +2775,7 @@ def _validate_state_limits(state: _PaperState, *, activity_count: int) -> None:
         | set(state.instruments)
         | set(state.market_prices)
         | {record.order.instrument_id for record in state.orders.values()}
-        | {
-            position.instrument_id
-            for position in state.ledger.export_state().positions
-        }
+        | {position.instrument_id for position in _state_positions(state)}
     )
     if (
         state.event_sequence > _MAX_SESSION_EVENTS
@@ -2577,167 +2983,154 @@ def _reduce_activity_group(
             records,
             configuration=configuration,
         )
-    state = previous.clone()
-    for row in records:
-        payload = _strict_mapping(row.payload)
-        client_id = _strict_identifier(payload.get("client_intent_id"))
-        broker_id = _strict_identifier(payload.get("broker_order_id"))
-        at = _aware_utc(row.occurred_at, "replay activity timestamp")
-        if row.kind == "paper.market.submission":
-            _require_exact_keys(
-                payload,
-                {
-                    "client_intent_id",
-                    "broker_order_id",
-                    "snapshot",
-                    "bar_count",
-                    "bars_digest",
-                },
-            )
-            snapshot = _snapshot_from_payload(_strict_mapping(payload["snapshot"]))
-            cursor = _cursor_from_bars(snapshot.bars)
-            if (
-                client_id != broker_id
-                or client_id != snapshot.instrument_id
-                or snapshot.instrument_id in state.snapshots
-                or _strict_nonnegative_int(payload["bar_count"])
-                != cursor.total_count
-                or payload["bars_digest"] != cursor.digest
-                or at != snapshot.observed_at
-            ):
-                raise ValueError
-            state.snapshots[snapshot.instrument_id] = _bounded_snapshot(snapshot)
-            state.cursors[snapshot.instrument_id] = cursor
-            state.latest_at = max(state.latest_at or at, at)
-            continue
-        if row.kind == "paper.market.submission_reference":
-            _require_exact_keys(
-                payload,
-                {
-                    "client_intent_id",
-                    "broker_order_id",
-                    "bar_count",
-                    "bars_digest",
-                },
-            )
-            referenced_snapshot = state.snapshots.get(client_id)
-            referenced_cursor = state.cursors.get(client_id)
-            if (
-                referenced_snapshot is None
-                or referenced_cursor is None
-                or client_id != broker_id
-                or at != referenced_snapshot.observed_at
-                or _strict_nonnegative_int(payload["bar_count"])
-                != referenced_cursor.total_count
-                or payload["bars_digest"] != referenced_cursor.digest
-            ):
-                raise ValueError
-            state.latest_at = max(state.latest_at or at, at)
-            continue
-        record = state.orders.get(broker_id)
-        if row.kind == "paper.order.submitted":
-            _require_exact_keys(
-                payload,
-                {
-                    "client_intent_id",
-                    "broker_order_id",
-                    "instrument_id",
-                    "side",
-                    "order_type",
-                    "intent",
-                    "new_status",
-                },
-            )
-            intent = _intent_from_payload(_strict_mapping(payload["intent"]))
-            submission_snapshot = state.snapshots.get(intent.instrument_id)
-            if submission_snapshot is None:
-                raise ValueError
-            _validate_intent(intent, snapshot=submission_snapshot)
-            if (
-                record is not None
-                or intent.intent_id in state.client_orders
-                or client_id != intent.intent_id
-                or broker_id != _paper_order_id(configuration.session_id, client_id)
-                or payload["instrument_id"] != intent.instrument_id
-                or payload["side"] != intent.side.value
-                or payload["order_type"] != intent.order_type.value
-                or payload["new_status"] != OrderStatus.PROPOSED.value
-            ):
-                raise ValueError
-            order = BrokerOrder(
-                order_id=broker_id,
-                client_order_id=client_id,
-                broker=_PAPER_CAPABILITIES.broker,
-                instrument_id=intent.instrument_id,
-                status=OrderStatus.PROPOSED,
-                requested_quantity=intent.quantity,
-                filled_quantity=Decimal("0"),
-                average_fill_price=None,
-                submitted_at=at,
-                updated_at=at,
-            )
-            state.orders[broker_id] = _PaperOrderRecord(
-                intent=intent,
-                order=order,
-                submitted_source_at=submission_snapshot.source_at,
-                submission_reference_price=submission_snapshot.bars[-1].close,
-                remaining_notional=intent.notional,
-            )
-            state.client_orders[client_id] = broker_id
-            state.latest_at = max(state.latest_at or at, at)
-            continue
-        if record is None or record.order.client_order_id != client_id:
+    if operation_kind == "SUBMIT":
+        return _replay_submit_group(previous, records, configuration=configuration)
+    if operation_kind == "IDEMPOTENCY":
+        return _replay_idempotency_group(previous, records)
+    if operation_kind == "RESOLUTION":
+        return _replay_resolution_group(previous, records)
+    raise ValueError
+
+
+def _replay_submit_group(
+    previous: _PaperState,
+    records: tuple[EventRecord, ...],
+    *,
+    configuration: _ReplayConfiguration,
+) -> _PaperState:
+    market_payload = _strict_mapping(records[0].payload)
+    submitted_payload = _strict_mapping(records[1].payload)
+    _require_exact_keys(
+        submitted_payload,
+        {
+            "client_intent_id",
+            "broker_order_id",
+            "instrument_id",
+            "side",
+            "order_type",
+            "intent",
+            "new_status",
+        },
+    )
+    intent = _intent_from_payload(_strict_mapping(submitted_payload["intent"]))
+    if records[0].kind == "paper.market.submission":
+        _require_exact_keys(
+            market_payload,
+            {
+                "client_intent_id",
+                "broker_order_id",
+                "snapshot",
+                "bar_count",
+                "bars_digest",
+            },
+        )
+        snapshot = _snapshot_from_payload(_strict_mapping(market_payload["snapshot"]))
+    else:
+        _require_exact_keys(
+            market_payload,
+            {
+                "client_intent_id",
+                "broker_order_id",
+                "bar_count",
+                "bars_digest",
+            },
+        )
+        existing_snapshot = previous.snapshots.get(intent.instrument_id)
+        if existing_snapshot is None:
             raise ValueError
-        if row.kind == "paper.order.transition":
-            _require_exact_keys(
-                payload,
-                {"client_intent_id", "broker_order_id", "prior_status", "new_status"},
-            )
-            prior = OrderStatus(_strict_string(payload["prior_status"]))
-            new = OrderStatus(_strict_string(payload["new_status"]))
-            if record.order.status is not prior:
-                raise ValueError
-            order = OrderStateMachine.transition(
-                record.order,
-                new,
-                at=at,
-                emit=lambda _event: None,
-            )
-            state.orders[broker_id] = replace(record, order=order)
-            state.latest_at = max(state.latest_at or at, at)
-            continue
-        if row.kind == "paper.order.stop_triggered":
-            _require_exact_keys(
-                payload,
-                {
-                    "client_intent_id",
-                    "broker_order_id",
-                    "trigger_price",
-                    "prior_status",
-                    "new_status",
-                },
-            )
-            if (
-                record.stop_triggered
-                or payload["prior_status"] != record.order.status.value
-                or payload["new_status"] != record.order.status.value
-                or _parse_decimal(payload["trigger_price"], positive=True)
-                != record.intent.trigger_price
-            ):
-                raise ValueError
-            state.orders[broker_id] = replace(record, stop_triggered=True)
-            continue
-        if row.kind in {
-            "paper.order.duplicate",
-            "paper.order.duplicate_conflict",
-            "paper.order.rejected",
-        }:
-            _validate_nonmutating_order_activity(row, record)
-            continue
-        if row.kind != "paper.order.fill":
+        snapshot = existing_snapshot
+    candidate, expected_specs, _, _ = _execute_submit_kernel(
+        previous,
+        intent,
+        snapshot,
+        session_id=configuration.session_id,
+    )
+    _require_specs_equal(expected_specs, records)
+    return candidate
+
+
+def _replay_idempotency_group(
+    previous: _PaperState,
+    records: tuple[EventRecord, ...],
+) -> _PaperState:
+    payload = _strict_mapping(records[0].payload)
+    _require_exact_keys(
+        payload,
+        {
+            "client_intent_id",
+            "broker_order_id",
+            "outcome",
+            "intent",
+            "prior_status",
+            "new_status",
+        },
+    )
+    intent = _intent_from_payload(_strict_mapping(payload["intent"]))
+    candidate, expected_specs, _, _, _ = _execute_idempotency_kernel(previous, intent)
+    _require_specs_equal(expected_specs, records)
+    return candidate
+
+
+def _replay_resolution_group(
+    previous: _PaperState,
+    records: tuple[EventRecord, ...],
+) -> _PaperState:
+    transition_payload = _strict_mapping(records[-1].payload)
+    _require_exact_keys(
+        transition_payload,
+        {"client_intent_id", "broker_order_id", "prior_status", "new_status"},
+    )
+    order_id = _strict_identifier(transition_payload["broker_order_id"])
+    status = OrderStatus(_strict_string(transition_payload["new_status"]))
+    at = _aware_utc(records[-1].occurred_at, "replay resolution timestamp")
+    activity: tuple[str, Mapping[str, object]] | None = None
+    if len(records) == 2:
+        rejected_payload = _strict_mapping(records[0].payload)
+        _require_exact_keys(
+            rejected_payload,
+            {
+                "client_intent_id",
+                "broker_order_id",
+                "reason_code",
+                "prior_status",
+                "new_status",
+            },
+        )
+        reason_code = rejected_payload["reason_code"]
+        if not isinstance(reason_code, str) or _REASON_CODE.fullmatch(reason_code) is None:
             raise ValueError
+        activity = ("paper.order.rejected", {"reason_code": reason_code})
+    candidate, expected_specs, _, _ = _execute_resolution_kernel(
+        previous,
+        order_id,
+        status,
+        at=at,
+        activity=activity,
+    )
+    _require_specs_equal(expected_specs, records)
+    return candidate
+
+
+def _require_specs_equal(
+    expected_specs: list[_AuditSpec],
+    records: tuple[EventRecord, ...],
+) -> None:
+    expected_bytes = json.dumps(
+        _json_ready(_spec_activity_facts(expected_specs)),
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    recorded_bytes = json.dumps(
+        _json_ready(_record_activity_facts(records)),
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if expected_bytes != recorded_bytes:
         raise ValueError
-    return state
 
 
 def _validate_operation_grammar(

@@ -53,6 +53,23 @@ class PortfolioLedgerState:
     drawdown: Decimal
 
 
+@dataclass(frozen=True, slots=True)
+class PortfolioLedgerCompactState:
+    """Bounded rollback/checkpoint facts that never enumerate historical fill IDs."""
+
+    starting_cash: Decimal
+    currency: str
+    cash: Decimal
+    positions: tuple[PortfolioLedgerPositionState, ...]
+    market_prices: tuple[tuple[str, Decimal], ...]
+    fill_count: int
+    gross_realized_pnl: Decimal
+    fees: Decimal
+    equity: Decimal
+    peak_equity: Decimal
+    drawdown: Decimal
+
+
 class PortfolioLedger:
     """Apply fills once, value open long positions, and produce reconciliation snapshots."""
 
@@ -106,6 +123,66 @@ class PortfolioLedger:
             peak_equity=self._peak_equity,
             drawdown=self._drawdown,
         )
+
+    def compact_state(self) -> PortfolioLedgerCompactState:
+        """Return bounded accounting facts without sorting or copying fill-ID history."""
+        return PortfolioLedgerCompactState(
+            starting_cash=self._starting_cash,
+            currency=self._currency,
+            cash=self._cash,
+            positions=tuple(
+                PortfolioLedgerPositionState(
+                    instrument_id=instrument_id,
+                    quantity=position.quantity,
+                    average_price=position.average_price,
+                )
+                for instrument_id, position in sorted(self._positions.items())
+            ),
+            market_prices=tuple(sorted(self._market_prices.items())),
+            fill_count=len(self._fill_ids),
+            gross_realized_pnl=self._gross_realized_pnl,
+            fees=self._fees,
+            equity=self._equity,
+            peak_equity=self._peak_equity,
+            drawdown=self._drawdown,
+        )
+
+    def restore_compact_state(
+        self,
+        state: PortfolioLedgerCompactState,
+        *,
+        added_fill_ids: tuple[str, ...],
+    ) -> None:
+        """Roll back one failed staged operation without visiting prior fill IDs."""
+        if (
+            type(state) is not PortfolioLedgerCompactState
+            or state.starting_cash != self._starting_cash
+            or state.currency != self._currency
+            or type(state.fill_count) is not int
+            or state.fill_count < 0
+        ):
+            raise ValueError("invalid compact ledger rollback state")
+        for fill_id in added_fill_ids:
+            if fill_id not in self._fill_ids:
+                raise ValueError("compact ledger rollback is missing a staged fill")
+            self._fill_ids.remove(fill_id)
+        if len(self._fill_ids) != state.fill_count:
+            raise ValueError("compact ledger rollback fill count is inconsistent")
+        self._cash = state.cash
+        self._positions = {
+            item.instrument_id: _PositionState(item.quantity, item.average_price)
+            for item in state.positions
+        }
+        self._market_prices = dict(state.market_prices)
+        self._gross_realized_pnl = state.gross_realized_pnl
+        self._fees = state.fees
+        self._equity = state.equity
+        self._peak_equity = state.peak_equity
+        self._drawdown = state.drawdown
+
+    def has_fill_id(self, fill_id: str) -> bool:
+        """Check duplicate evidence in constant expected time."""
+        return fill_id in self._fill_ids
 
     @classmethod
     def from_state(cls, state: PortfolioLedgerState) -> PortfolioLedger:

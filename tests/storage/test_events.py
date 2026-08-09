@@ -184,3 +184,19 @@ def test_event_store_rejects_resource_hostile_payloads_before_json(
         store.append("hostile", "recorded", "aggregate", payload, at)
 
     assert tuple(store.stream("aggregate")) == ()
+
+
+def test_audit_log_rejects_non_event_store_sink_and_exposes_sealed_store() -> None:
+    """A wrapper around an arbitrary append_many callable is not durable provenance."""
+
+    class _FakeSink:
+        def append_many(self, batch: object) -> None:
+            del batch
+
+    at = datetime(2026, 8, 9, 10, tzinfo=UTC)
+    with pytest.raises(ValueError, match="EventStore"):
+        AuditLog(_FakeSink(), FrozenClock(at))  # type: ignore[arg-type]
+
+    store = EventStore(create_engine_and_schema("sqlite+pysqlite:///:memory:"))
+    audit = AuditLog(store, FrozenClock(at))
+    assert audit.event_store is store

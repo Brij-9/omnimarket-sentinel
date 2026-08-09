@@ -24,8 +24,15 @@ class AuditLog:
     """Records redacted events using the application clock."""
 
     def __init__(self, store: EventStore, clock: Clock) -> None:
+        if type(store) is not EventStore:
+            raise ValueError("audit durability requires an exact EventStore")
         self._store = store
         self._clock = clock
+
+    @property
+    def event_store(self) -> EventStore:
+        """Return the sealed durable capability used for both replay and continuation."""
+        return self._store
 
     def record(
         self,

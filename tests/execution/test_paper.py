@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy as copy_module
 import hashlib
 import inspect
 import json
@@ -10,6 +11,8 @@ from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -32,6 +35,7 @@ from market_sentinel.execution.paper import (
 )
 from market_sentinel.execution.state_machine import InvalidOrderTransition
 from market_sentinel.operations.audit import AuditEvent, AuditLog
+from market_sentinel.portfolio.ledger import PortfolioLedger, PortfolioLedgerState
 from market_sentinel.storage.db import create_engine_and_schema
 from market_sentinel.storage.events import EventRecord, EventStore
 
@@ -1371,7 +1375,7 @@ def test_rehydrate_derives_bound_configuration_and_exact_historical_peak(
 )
 def test_rehydrate_rejects_every_mismatched_runtime_expectation(
     tmp_path: Path,
-    kwargs: dict[str, object],
+    kwargs: dict[str, Any],
 ) -> None:
     """Recovery must derive durable configuration rather than silently replacing it."""
     rows, _, audit, broker = _durable_stream(tmp_path, costs=CostModel())
@@ -1382,7 +1386,7 @@ def test_rehydrate_rejects_every_mismatched_runtime_expectation(
             audit_log=audit,
             expected_head=broker.session_head,
             **kwargs,
-        )  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize(
@@ -1757,14 +1761,22 @@ def test_authoritative_partial_fill_uses_shared_kernel_and_rehydrates(
 def test_malformed_authoritative_fill_reconciliation_rolls_back_every_field() -> None:
     """A quantity/evidence mismatch cannot partially apply a broker reconciliation."""
     broker = PaperBroker(starting_cash=Decimal("1000"))
-    order = broker.submit(_intent(), _snapshot(_bar(0, open_price="100")))
-    unknown = broker.mark_unknown(order.order_id, at=AT + timedelta(seconds=1))
+    bar0 = _bar(0, open_price="100")
+    order = broker.submit(_intent(), _snapshot(bar0))
+    broker.on_snapshot(
+        _snapshot(bar0, _bar(1, open_price="100", volume="0")),
+        _instrument(),
+    )
+    unknown = broker.mark_unknown(
+        order.order_id,
+        at=AT + timedelta(minutes=1, seconds=1),
+    )
     truth = unknown.model_copy(
         update={
             "status": OrderStatus.PARTIALLY_FILLED,
             "filled_quantity": Decimal("0.4"),
             "average_fill_price": Decimal("100"),
-            "updated_at": AT + timedelta(seconds=2),
+            "updated_at": AT + timedelta(minutes=1, seconds=2),
         }
     )
     mismatched = Fill(
@@ -1775,7 +1787,7 @@ def test_malformed_authoritative_fill_reconciliation_rolls_back_every_field() ->
         quantity=Decimal("0.3"),
         price=Decimal("100"),
         fee=Decimal("0"),
-        filled_at=AT + timedelta(seconds=1, microseconds=1),
+        filled_at=AT + timedelta(minutes=1, seconds=1, microseconds=1),
     )
     before = (broker.get_order(order.order_id), broker.fills, broker.cash, broker.audit_events)
 
@@ -2774,21 +2786,29 @@ def test_rolling_market_cursor_recovers_open_position_beyond_1024_bars(
     broker.submit(_intent(), _snapshot(bar0))
     bar1 = _bar(1, open_price="100")
     broker.on_snapshot(_snapshot(bar0, bar1), _instrument())
-    window = (bar0, bar1)
+    overlap: tuple[Bar, ...] = (bar0, bar1)
+    prior_digest = paper_module._bars_digest(overlap)
     for minute in range(2, 1_030):
         new_bar = _bar(minute, open_price="100")
-        supplied = window + (new_bar,)
-        broker.on_snapshot(_snapshot(*supplied), _instrument())
-        window = supplied[-64:]
+        rolling = paper_module.RollingMarketWindow(
+            instrument_id="AAPL@alpaca",
+            observed_at=new_bar.at,
+            source_at=new_bar.at,
+            prior_bar_count=minute,
+            prior_bars_digest=prior_digest,
+            overlap=overlap,
+            new_bar=new_bar,
+            provider="fixture",
+            max_age_seconds=60,
+        )
+        broker.on_rolling_snapshot(rolling, _instrument())
+        prior_digest = paper_module._next_bar_digest(prior_digest, new_bar)
+        overlap = (overlap + (new_bar,))[-64:]
 
     rows = tuple(store.stream("rollover"))
     observed = [row for row in rows if row.kind == "paper.market.observed"]
     assert observed[-1].payload["bar_count"] == 1_030
-    restored = PaperBroker.rehydrate(
-        rows,
-        audit_log=audit,
-        expected_head=broker.session_head,
-    )
+    restored = PaperBroker.rehydrate_durable(audit, expected_head=broker.session_head)
 
     assert restored.session_head == broker.session_head
     assert restored.positions() == broker.positions()
@@ -2806,10 +2826,542 @@ def test_instrument_cap_counts_orders_snapshots_cursors_and_positions_atomically
         )
     before = (broker.order_count, broker.audit_events)
 
-    with pytest.raises(ValueError, match="bounded durable limit"):
+    with pytest.raises(ValueError, match="activity|bounded durable limit"):
         broker.submit(
             _intent(intent_id="intent-128", instrument_id="SYM128@alpaca"),
             _snapshot(_bar(0, open_price="100"), instrument_id="SYM128@alpaca"),
         )
 
     assert (broker.order_count, broker.audit_events) == before
+
+
+def test_durable_recovery_streams_and_continues_on_the_same_real_store(
+    tmp_path: Path,
+) -> None:
+    """Recovery and the next contiguous append must share one exact EventStore capability."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'same-store.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=audit,
+        durable=True,
+        session_id="same-store",
+    )
+    order = broker.submit(_intent(), _snapshot(_bar(0, open_price="100")))
+    head = broker.session_head
+
+    recovered = PaperBroker.rehydrate_durable(audit, expected_head=head)
+    recovered.cancel(order.order_id, at=AT + timedelta(seconds=1))
+    rows = tuple(store.stream("same-store"))
+
+    assert recovered.durability_mode == "durable"
+    assert [row.sequence for row in rows] == list(range(1, len(rows) + 1))
+    assert rows[-1].event_id == f"same-store:event:{len(rows):020d}"
+    assert recovered.session_head.event_count == len(rows)
+
+
+def test_generic_record_replay_cannot_continue_durably_into_another_store(
+    tmp_path: Path,
+) -> None:
+    """Caller-supplied store-A rows cannot authorize future writes into store B."""
+    store_a = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'store-a.db'}")
+    )
+    audit_a = AuditLog(store_a, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=audit_a,
+        durable=True,
+        session_id="store-provenance",
+    )
+    order = broker.submit(_intent(), _snapshot(_bar(0, open_price="100")))
+    rows_a = tuple(store_a.stream("store-provenance"))
+    store_b = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'store-b.db'}")
+    )
+    audit_b = AuditLog(store_b, FrozenClock(AT))
+
+    replayed = PaperBroker.rehydrate(
+        rows_a,
+        audit_log=audit_b,
+        expected_head=broker.session_head,
+    )
+    replayed.cancel(order.order_id, at=AT + timedelta(seconds=1))
+
+    assert replayed.durability_mode == "current_session"
+    assert tuple(store_b.stream("store-provenance")) == ()
+
+
+def test_durable_recovery_rollback_keeps_store_and_head_contiguous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed same-store append after recovery must roll back every in-memory field."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'recovery-rollback.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=audit,
+        durable=True,
+        session_id="recovery-rollback",
+    )
+    order = broker.submit(_intent(), _snapshot(_bar(0, open_price="100")))
+    recovered = PaperBroker.rehydrate_durable(audit, expected_head=broker.session_head)
+    before = (
+        recovered.list_orders(),
+        recovered.fills,
+        recovered.cash,
+        recovered.audit_events,
+        recovered.session_head,
+        tuple(store.stream("recovery-rollback")),
+    )
+
+    def fail_append(batch: object) -> None:
+        del batch
+        raise RuntimeError("durable store unavailable")
+
+    monkeypatch.setattr(store, "append_many", fail_append)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        recovered.cancel(order.order_id, at=AT + timedelta(seconds=1))
+
+    assert (
+        recovered.list_orders(),
+        recovered.fills,
+        recovered.cash,
+        recovered.audit_events,
+        recovered.session_head,
+        tuple(store.stream("recovery-rollback")),
+    ) == before
+
+
+def test_recovery_requires_exact_validated_session_head_type(tmp_path: Path) -> None:
+    """Duck-typed mutable head objects cannot establish the external trust boundary."""
+    rows, _, audit, broker = _durable_stream(tmp_path, session_id="exact-head")
+    head = broker.session_head
+    mutable_head = SimpleNamespace(
+        session_id=head.session_id,
+        event_count=head.event_count,
+        operation_count=head.operation_count,
+        head_digest=head.head_digest,
+    )
+
+    with pytest.raises(ValueError, match="trusted session head"):
+        PaperBroker.rehydrate(
+            rows,
+            audit_log=audit,
+            expected_head=mutable_head,  # type: ignore[arg-type]
+        )
+
+
+def test_natural_full_prefix_100_to_101_is_accepted_without_hidden_slicing() -> None:
+    """A normal provider prefix remains valid while it is within the public input bound."""
+    bars = tuple(_bar(minute, open_price="100") for minute in range(100))
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    broker.submit(
+        _intent(created_at=bars[-1].at, expires_at=bars[-1].at + timedelta(minutes=10)),
+        _snapshot(*bars),
+    )
+    next_bar = _bar(100, open_price="101")
+
+    fills = broker.on_snapshot(_snapshot(*bars, next_bar), _instrument())
+
+    assert len(fills) == 1
+    assert broker.portfolio_snapshot().observed_at == next_bar.at
+
+
+def test_explicit_rolling_window_continues_after_1024_and_rejects_bad_overlap() -> None:
+    """The public rolling contract binds prior count/digest and the retained overlap."""
+    first = _bar(0, open_price="100")
+    broker = PaperBroker(starting_cash=Decimal("1000"))
+    broker.submit(
+        _intent(created_at=first.at, expires_at=first.at + timedelta(minutes=2000)),
+        _snapshot(first),
+    )
+    prior_digest = paper_module._bars_digest((first,))
+    overlap: tuple[Bar, ...] = (first,)
+    window: object = None
+    for minute in range(1, 1025):
+        next_bar = _bar(minute, open_price="101")
+        window = paper_module.RollingMarketWindow(
+            instrument_id="AAPL@alpaca",
+            observed_at=next_bar.at,
+            source_at=next_bar.at,
+            prior_bar_count=minute,
+            prior_bars_digest=prior_digest,
+            overlap=overlap,
+            new_bar=next_bar,
+            provider="fixture",
+            max_age_seconds=60,
+        )
+        broker.on_rolling_snapshot(window, _instrument())
+        prior_digest = paper_module._next_bar_digest(prior_digest, next_bar)
+        overlap = (overlap + (next_bar,))[-64:]
+    assert isinstance(window, paper_module.RollingMarketWindow)
+    before = (broker.list_orders(), broker.fills, broker.cash, broker.audit_events)
+    malformed = replace(
+        window,
+        observed_at=_bar(1025, open_price="102").at,
+        source_at=_bar(1025, open_price="102").at,
+        prior_bar_count=1025,
+        prior_bars_digest=prior_digest,
+        new_bar=_bar(1025, open_price="102"),
+        overlap=overlap[-63:],
+    )
+    with pytest.raises(ValueError, match="rolling"):
+        broker.on_rolling_snapshot(malformed, _instrument())
+
+    assert (broker.list_orders(), broker.fills, broker.cash, broker.audit_events) == before
+
+
+def test_submission_admission_keeps_worst_case_market_grammar_consumable(
+    tmp_path: Path,
+) -> None:
+    """The 171st triggerable order is rejected before it can brick the next cohort."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'liveness.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("100000"),
+        audit_log=audit,
+        durable=True,
+        session_id="liveness",
+    )
+    initial = _snapshot(_bar(0, open_price="100"))
+    for index in range(170):
+        broker.submit(
+            _intent(
+                intent_id=f"stop-{index}",
+                quantity=Decimal("0.1"),
+                order_type=OrderType.STOP,
+                trigger_price=Decimal("110"),
+                take_profit=Decimal("150"),
+            ),
+            initial,
+        )
+    before = (broker.order_count, broker.audit_events, broker.session_head)
+
+    with pytest.raises(ValueError, match="activity"):
+        broker.submit(
+            _intent(
+                intent_id="stop-170",
+                quantity=Decimal("0.1"),
+                order_type=OrderType.STOP,
+                trigger_price=Decimal("110"),
+                take_profit=Decimal("150"),
+            ),
+            initial,
+        )
+    assert (broker.order_count, broker.audit_events, broker.session_head) == before
+
+    crossing = _snapshot(
+        *initial.bars,
+        _bar(1, open_price="110", high="115", low="109", volume="1000"),
+    )
+    fills = broker.on_snapshot(crossing, _instrument())
+    restored = PaperBroker.rehydrate_durable(audit, expected_head=broker.session_head)
+
+    assert len(fills) == 170
+    assert restored.list_orders() == broker.list_orders()
+    assert restored.fills == broker.fills
+
+
+def test_admission_budget_includes_open_position_instruments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Position-only market rows count against a multi-instrument cohort's exact grammar."""
+    monkeypatch.setattr(paper_module, "_MAX_GROUP_ACTIVITIES", 7)
+    broker = PaperBroker(starting_cash=Decimal("10000"))
+    b0 = _snapshot(_bar(0, open_price="100"), instrument_id="BBB@alpaca")
+    broker.submit(
+        _intent(intent_id="bbb-position", instrument_id="BBB@alpaca"),
+        b0,
+    )
+    b1 = _snapshot(
+        *b0.bars,
+        _bar(1, open_price="100"),
+        instrument_id="BBB@alpaca",
+    )
+    broker.on_snapshot(b1, _instrument(instrument_id="BBB@alpaca"))
+    a1 = _snapshot(_bar(1, open_price="100"), instrument_id="AAA@alpaca")
+    for index in range(1):
+        broker.submit(
+            _intent(
+                intent_id=f"aaa-stop-{index}",
+                instrument_id="AAA@alpaca",
+                quantity=Decimal("0.1"),
+                order_type=OrderType.STOP,
+                trigger_price=Decimal("110"),
+                take_profit=Decimal("150"),
+                created_at=AT + timedelta(minutes=1),
+                expires_at=AT + timedelta(minutes=10),
+            ),
+            a1,
+        )
+    before = (broker.order_count, broker.audit_events)
+    with pytest.raises(ValueError, match="activity"):
+        broker.submit(
+            _intent(
+                intent_id="aaa-stop-1",
+                instrument_id="AAA@alpaca",
+                quantity=Decimal("0.1"),
+                order_type=OrderType.STOP,
+                trigger_price=Decimal("110"),
+                take_profit=Decimal("150"),
+                created_at=AT + timedelta(minutes=1),
+                expires_at=AT + timedelta(minutes=10),
+            ),
+            a1,
+        )
+    assert (broker.order_count, broker.audit_events) == before
+
+    a2 = _snapshot(
+        *a1.bars,
+        _bar(2, open_price="110", high="115", low="109", volume="100"),
+        instrument_id="AAA@alpaca",
+    )
+    b2 = _snapshot(
+        *b1.bars,
+        _bar(2, open_price="101"),
+        instrument_id="BBB@alpaca",
+    )
+    fills = broker.on_snapshots(
+        (
+            (a2, _instrument(instrument_id="AAA@alpaca")),
+            (b2, _instrument(instrument_id="BBB@alpaca")),
+        )
+    )
+    assert len(fills) == 1
+
+
+def test_staging_does_not_rescan_or_copy_growing_fill_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Many partial fills process only their deltas, not triangular history prefixes."""
+    broker = PaperBroker(starting_cash=Decimal("10000"))
+    order = broker.submit(
+        _intent(quantity=Decimal("30")),
+        _snapshot(_bar(0, open_price="100")),
+    )
+    broker.on_snapshot(
+        _snapshot(_bar(0, open_price="100"), _bar(1, open_price="100", volume="0")),
+        _instrument(quantity_step=Decimal("1")),
+    )
+    clone_history_references = 0
+    export_fill_references = 0
+    original_export = PortfolioLedger.export_state
+
+    original_deepcopy = copy_module.deepcopy
+
+    def count_deepcopy(
+        value: object,
+        memo: dict[int, Any] | None = None,
+    ) -> object:
+        nonlocal clone_history_references
+        if isinstance(value, PortfolioLedger):
+            clone_history_references += len(original_export(value).fill_ids)
+        return original_deepcopy(value, memo)
+
+    def count_export(ledger: PortfolioLedger) -> PortfolioLedgerState:
+        nonlocal export_fill_references
+        exported = original_export(ledger)
+        export_fill_references += len(exported.fill_ids)
+        return exported
+
+    monkeypatch.setattr(copy_module, "deepcopy", count_deepcopy)
+    monkeypatch.setattr(PortfolioLedger, "export_state", count_export)
+    current = order
+    for index in range(30):
+        unknown = broker.mark_unknown(
+            current.order_id,
+            at=AT + timedelta(minutes=1, seconds=index * 3 + 1),
+        )
+        fill = Fill(
+            fill_id=f"complexity-fill-{index}",
+            order_id=order.order_id,
+            instrument_id=order.instrument_id,
+            side=Side.BUY,
+            quantity=Decimal("1"),
+            price=Decimal("100"),
+            fee=Decimal("0"),
+            filled_at=AT + timedelta(minutes=1, seconds=index * 3 + 1, microseconds=1),
+        )
+        quantity = Decimal(index + 1)
+        current = unknown.model_copy(
+            update={
+                "status": (
+                    OrderStatus.FILLED if index == 29 else OrderStatus.PARTIALLY_FILLED
+                ),
+                "filled_quantity": quantity,
+                "average_fill_price": Decimal("100"),
+                "updated_at": AT + timedelta(minutes=1, seconds=index * 3 + 2),
+            }
+        )
+        broker.reconcile_unknown_fills(
+            current,
+            (fill,),
+            instrument=_instrument(quantity_step=Decimal("1")),
+        )
+
+    assert clone_history_references <= 30
+    assert export_fill_references <= 30
+
+
+def test_runtime_and_replay_route_every_non_market_operation_through_same_kernel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Submit, idempotency, resolution, and authoritative truth each have one reducer path."""
+    names = (
+        "_execute_submit_kernel",
+        "_execute_idempotency_kernel",
+        "_execute_resolution_kernel",
+        "_execute_reconciliation_kernel",
+    )
+    calls = dict.fromkeys(names, 0)
+    for name in names:
+        original = getattr(paper_module, name)
+
+        def wrapper(
+            *args: object,
+            _name: str = name,
+            _original: object = original,
+            **kwargs: object,
+        ) -> object:
+            calls[_name] += 1
+            return _original(*args, **kwargs)  # type: ignore[operator]
+
+        monkeypatch.setattr(paper_module, name, wrapper)
+
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'shared-nonmarket.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=audit,
+        durable=True,
+        session_id="shared-nonmarket",
+    )
+    snapshot = _snapshot(_bar(0, open_price="100"))
+    intent = _intent()
+    order = broker.submit(intent, snapshot)
+    broker.submit(intent, snapshot)
+    # Persist exact instrument metadata without making the order eligible for a market fill.
+    broker.on_snapshot(
+        _snapshot(
+            _bar(0, open_price="100"),
+            _bar(0, open_price="100").model_copy(
+                update={"at": AT + timedelta(microseconds=1), "volume": Decimal("0")}
+            ),
+            observed_at=AT + timedelta(microseconds=1),
+            source_at=AT + timedelta(microseconds=1),
+        ),
+        _instrument(),
+    )
+    unknown = broker.mark_unknown(order.order_id, at=AT + timedelta(seconds=1))
+    fill = Fill(
+        fill_id="shared-authoritative-fill",
+        order_id=order.order_id,
+        instrument_id=order.instrument_id,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        price=Decimal("100"),
+        fee=Decimal("0"),
+        filled_at=AT + timedelta(seconds=1, microseconds=1),
+    )
+    truth = unknown.model_copy(
+        update={
+            "status": OrderStatus.FILLED,
+            "filled_quantity": Decimal("1"),
+            "average_fill_price": Decimal("100"),
+            "updated_at": AT + timedelta(seconds=2),
+        }
+    )
+    broker.reconcile_unknown_fills(truth, (fill,), instrument=_instrument())
+    PaperBroker.rehydrate(
+        tuple(store.stream("shared-nonmarket")),
+        audit_log=audit,
+        expected_head=broker.session_head,
+    )
+
+    assert calls["_execute_submit_kernel"] == 2
+    assert calls["_execute_idempotency_kernel"] == 2
+    assert calls["_execute_resolution_kernel"] == 2
+    assert calls["_execute_reconciliation_kernel"] == 2
+
+
+def test_submit_replay_rejects_split_operation_timestamp_with_recomputed_head(
+    tmp_path: Path,
+) -> None:
+    """All submit evidence must share the canonical snapshot availability timestamp."""
+    store = EventStore(
+        create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'split-submit.db'}")
+    )
+    audit = AuditLog(store, FrozenClock(AT))
+    broker = PaperBroker(
+        starting_cash=Decimal("1000"),
+        audit_log=audit,
+        durable=True,
+        session_id="split-submit",
+    )
+    broker.submit(_intent(), _snapshot(_bar(0, open_price="100")))
+    rows = list(store.stream("split-submit"))
+    late = AT + timedelta(seconds=1)
+    for index in range(1, 6):
+        rows[index] = replace(rows[index], occurred_at=late)
+    checkpoint = _mutable_payload(rows[-1].payload)
+    assert isinstance(checkpoint, dict)
+    market = _mutable_payload(rows[0].payload)
+    assert isinstance(market, dict)
+    snapshot = market["snapshot"]
+    assert isinstance(snapshot, dict)
+    bars = snapshot["bars"]
+    assert isinstance(bars, list)
+    last_bar = bars[-1]
+    assert isinstance(last_bar, dict)
+    activities = [
+        {
+            "kind": row.kind,
+            "occurred_at": row.occurred_at.astimezone(UTC).isoformat(),
+            "payload": _mutable_payload(row.payload),
+        }
+        for row in rows[:-1]
+    ]
+    state_digest = _test_canonical_digest(
+        {
+            "previous_state_digest": checkpoint["previous_state_digest"],
+            "activities": activities,
+            "event_sequence": len(rows),
+            "operation_sequence": 1,
+            "fill_sequence": 0,
+            "order_count": 1,
+            "instrument_count": 0,
+            "snapshot_count": 1,
+            "market_cursors": [
+                {
+                    "instrument_id": "AAPL@alpaca",
+                    "total_count": market["bar_count"],
+                    "digest": market["bars_digest"],
+                    "latest_at": last_bar["at"],
+                }
+            ],
+            "latest_at": late.isoformat(),
+            "last_event_key": None,
+            "ledger": checkpoint["ledger"],
+        }
+    )
+    checkpoint["state_digest"] = state_digest
+    rows[-1] = replace(rows[-1], payload=checkpoint, occurred_at=late)
+    forged_head = SessionHead("split-submit", len(rows), 1, state_digest)
+
+    with pytest.raises(ValueError, match="invalid durable paper stream"):
+        PaperBroker.rehydrate(
+            tuple(rows),
+            audit_log=audit,
+            expected_head=forged_head,
+        )
