@@ -11,7 +11,7 @@ from typing import Any, Self
 FIXTURES = Path(__file__).parent / "fixtures"
 
 FIXTURE_CONFIGURATION: dict[str, Any] = {
-    "profile": "fixture-audited-v1",
+    "profile": "tauric-market-only-audited-v3",
     "upstream_commit": "a33fd4c0f134485a43553a2c23a63cb14adbd88f",
     "llm_provider": "fixture",
     "deep_think_llm": "fixture-model",
@@ -28,25 +28,24 @@ FIXTURE_CONFIGURATION: dict[str, Any] = {
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
     "max_recur_limit": 100,
-    "news_article_limit": 20,
-    "global_news_article_limit": 10,
-    "global_news_lookback_days": 7,
-    "global_news_queries": ["fixture macro query"],
+    "news_article_limit": 0,
+    "global_news_article_limit": 0,
+    "global_news_lookback_days": 0,
+    "global_news_queries": [],
     "data_vendors": {
         "core_stock_apis": "yfinance",
-        "technical_indicators": "yfinance",
-        "fundamental_data": "yfinance",
-        "news_data": "yfinance",
-        "macro_data": "fred",
-        "prediction_markets": "polymarket"
+        "technical_indicators": "yfinance"
     },
     "tool_vendors": {},
     "benchmark_ticker": None,
     "benchmark_map": {"": "SPY"},
-    "selected_analysts": ["market", "news", "fundamentals"],
+    "selected_analysts": ["market"],
     "storage_scope": "isolated-per-run",
     "confidence_method": "unit_interval:evidence=0.50,thesis=0.25,bear_case=0.25",
-    "evidence_availability_method": "completed_daily_bar_next_utc_day_v1"
+    "evidence_availability_method": "completed_daily_bar_next_utc_day_v1",
+    "analysis_cutoff_method": "previous_utc_date_v1",
+    "tool_trace_policy": "pinned_market_tools_complete_ordered_v1",
+    "llm_temporal_scope": "not_point_in_time_historical"
 }
 
 
@@ -54,6 +53,13 @@ def tauric_state(filename: str = "tauric_decision.json") -> dict[str, Any]:
     payload = json.loads((FIXTURES / filename).read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise TypeError("Tauric fixture must contain a JSON object")
+    return payload
+
+
+def tauric_trace(filename: str = "tauric_market_trace.json") -> list[dict[str, Any]]:
+    payload = json.loads((FIXTURES / filename).read_text(encoding="utf-8"))
+    if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+        raise TypeError("Tauric trace fixture must contain a list of JSON objects")
     return payload
 
 
@@ -72,6 +78,7 @@ class FakeTauricRunner:
         return cls(
             {
                 "state": copy.deepcopy(dict(state)),
+                "tool_trace": copy.deepcopy(tauric_trace()),
                 "model_id": "fixture-model",
                 "configuration": copy.deepcopy(FIXTURE_CONFIGURATION),
             }

@@ -2,45 +2,23 @@
   "messages": [
     {
       "type": "human",
-      "content": "Research AAPL at the requested cutoff."
+      "content": "Proceed with your assigned analysis for this workflow. The instrument to analyze is `AAPL`. Use this exact ticker in every tool call and report. The analysis date is 2026-08-07."
     },
     {
       "type": "ai",
-      "content": "",
-      "tool_calls": [
-        {
-          "name": "get_stock_data",
-          "args": {
-            "symbol": "AAPL",
-            "start_date": "2026-08-01",
-            "end_date": "2026-08-08"
-          },
-          "id": "call-market-1",
-          "type": "tool_call"
-        }
-      ]
-    },
-    {
-      "type": "tool",
-      "name": "get_stock_data",
-      "tool_call_id": "call-market-1",
-      "content": "# Stock data for AAPL from 2026-08-01 to 2026-08-08\n# Total records: 1\n# Data retrieved on: 2026-08-08 19:20:00\n\nDate,Open,High,Low,Close,Volume\n2026-08-07,220.00,224.00,219.00,223.00,1000\n"
-    },
-    {
-      "type": "ai",
-      "content": "The market report is complete.",
+      "content": "Research-only upstream trader plan; execution fields are not adapted.",
       "tool_calls": []
     }
   ],
   "company_of_interest": "AAPL",
   "asset_type": "stock",
-  "instrument_context": "AAPL equity listed in the United States.",
-  "trade_date": "2026-08-08",
+  "instrument_context": "The instrument to analyze is `AAPL`. Use this exact ticker in every tool call and report.",
+  "trade_date": "2026-08-07",
   "sender": "Risk Judge",
   "market_report": "Price data was retrieved through the configured market-data tool.",
-  "sentiment_report": "Timestamped sentiment evidence was unavailable.",
-  "news_report": "A prose mention of https://untrusted.example/ on 2026-08-08 is not evidence.",
-  "fundamentals_report": "Fundamentals were reviewed without a timestamped structured source.",
+  "sentiment_report": "",
+  "news_report": "",
+  "fundamentals_report": "",
   "investment_debate_state": {
     "bull_history": "Services growth and margin resilience support the constructive case.",
     "bear_history": "Valuation and demand sensitivity support the cautious case.",
@@ -64,5 +42,5 @@
     "count": 3
   },
   "final_trade_decision": "BUY 100 SHARES",
-  "past_context": "No prior context."
+  "past_context": ""
 }

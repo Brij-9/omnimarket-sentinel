@@ -1,0 +1,33 @@
+[
+  {
+    "name": "get_stock_data",
+    "args": {
+      "symbol": "AAPL",
+      "start_date": "2026-08-01",
+      "end_date": "2026-08-07"
+    },
+    "id": "call-market-stock",
+    "content": "# Stock data for AAPL from 2026-08-01 to 2026-08-07\n# Total records: 1\n# Data retrieved on: 2026-08-08 19:20:00\n\nDate,Open,High,Low,Close,Volume\n2026-08-07,220.00,224.00,219.00,223.00,1000\n"
+  },
+  {
+    "name": "get_indicators",
+    "args": {
+      "symbol": "AAPL",
+      "indicator": "rsi",
+      "curr_date": "2026-08-07",
+      "look_back_days": 30
+    },
+    "id": "call-market-indicator",
+    "content": "## rsi values from 2026-07-08 to 2026-08-07:\n\n2026-08-07: 61.50\n2026-08-06: 60.00\n\nRSI: Measures momentum to flag overbought/oversold conditions."
+  },
+  {
+    "name": "get_verified_market_snapshot",
+    "args": {
+      "symbol": "AAPL",
+      "curr_date": "2026-08-07",
+      "look_back_days": 30
+    },
+    "id": "call-market-snapshot",
+    "content": "## Verified market data snapshot for AAPL\n\n- Requested analysis date: 2026-08-07\n- Latest trading row used: 2026-08-07\n- Rows after the requested analysis date are excluded before verification.\n\n### Latest verified OHLCV row\n\n| Field | Value |\n|---|---:|\n| Open | 220.00 |\n| High | 224.00 |\n| Low | 219.00 |\n| Close | 223.00 |\n| Volume | 1000 |\n\n### Recent verified closes (last 1 rows)\n\n| Date | Close |\n|---|---:|\n| 2026-08-07 | 223.00 |"
+  }
+]

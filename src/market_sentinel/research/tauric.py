@@ -16,11 +16,14 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from functools import partial
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
+from threading import Lock
 from typing import Any, Protocol
 from urllib.parse import SplitResult, quote, urlsplit
+from uuid import UUID
 
 from market_sentinel.domain.models import Evidence, Instrument, ResearchPacket
 
@@ -39,19 +42,43 @@ _UPSTREAM_FAILURE_REASON = "Tauric research failed closed"
 _TIMEOUT_REASON = "Tauric research timed out and failed closed"
 _CONFIDENCE_METHOD = "unit_interval:evidence=0.50,thesis=0.25,bear_case=0.25"
 _EVIDENCE_AVAILABILITY_METHOD = "completed_daily_bar_next_utc_day_v1"
-_CONFIG_PROFILE = "tauric-audited-v1"
+_ANALYSIS_CUTOFF_METHOD = "previous_utc_date_v1"
+_TOOL_TRACE_POLICY = "pinned_market_tools_complete_ordered_v1"
+_LLM_TEMPORAL_SCOPE = "not_point_in_time_historical"
+_CONFIG_PROFILE = "tauric-market-only-audited-v3"
 _MAX_STOCK_RECORDS = 100_000
+_TRACE_CAPTURE_FAILURE = "pinned tool trace unavailable"
 
 _SUPPORTED_ENDPOINTS = {
     "openai": "https://api.openai.com/v1",
     "ollama": "http://127.0.0.1:11434/v1",
 }
-_SUPPORTED_ANALYSTS = frozenset({"market", "social", "news", "fundamentals"})
+_MARKET_PROFILE = ("market",)
 _SAFE_SYMBOL = re.compile(r"^[A-Za-z0-9.^=_+-]{1,32}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _SECRET_KEY_PARTS = ("authorization", "credential", "password", "secret", "token", "key")
+_INDICATOR_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}): (.+)$")
+_MARKDOWN_DATE_ROW = re.compile(r"^\| (\d{4}-\d{2}-\d{2}) \| .+ \|$")
+_ISO_DATE_TOKEN = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
+_SUPPORTED_INDICATORS = frozenset(
+    {
+        "close_50_sma",
+        "close_200_sma",
+        "close_10_ema",
+        "macd",
+        "macds",
+        "macdh",
+        "rsi",
+        "boll",
+        "boll_ub",
+        "boll_lb",
+        "atr",
+        "vwma",
+        "mfi",
+    }
+)
 
 _AGENT_STATE_FIELDS = frozenset(
     {
@@ -126,6 +153,9 @@ _PUBLIC_CONFIGURATION_FIELDS = frozenset(
         "storage_scope",
         "confidence_method",
         "evidence_availability_method",
+        "analysis_cutoff_method",
+        "tool_trace_policy",
+        "llm_temporal_scope",
     }
 )
 
@@ -242,13 +272,55 @@ def _validate_debate(value: Any, expected_fields: frozenset[str]) -> dict[str, A
     return result
 
 
+def _deterministic_instrument_context(ticker: str, asset_type: str = "stock") -> str:
+    if asset_type != "stock" or not _is_safe_symbol(ticker):
+        raise RuntimeError("deterministic instrument context unavailable")
+    return (
+        f"The instrument to analyze is `{ticker}`. "
+        "Use this exact ticker in every tool call and report."
+    )
+
+
+def _validate_cleared_messages(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    messages: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        message_type = item.get("type")
+        if message_type == "human" and set(item) == {"type", "content"}:
+            messages.append({"type": "human", "content": _research_text(item["content"])})
+            continue
+        if (
+            message_type == "ai"
+            and set(item) == {"type", "content", "tool_calls"}
+            and item.get("tool_calls") == []
+        ):
+            messages.append({"type": "ai", "content": _research_text(item["content"])})
+            continue
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    if not messages or messages[0]["type"] != "human":
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    return messages
+
+
 def _validate_state(value: Any, symbol: str, requested_date: str) -> dict[str, Any]:
     if not isinstance(value, Mapping) or set(value) != _AGENT_STATE_FIELDS:
         raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
     state: dict[str, Any] = {}
     for key in _STATE_TEXT_FIELDS:
         state[key] = _research_text(value[key], allow_empty=True)
-    if state["company_of_interest"] != symbol or state["trade_date"] != requested_date:
+    if (
+        state["company_of_interest"] != symbol
+        or state["trade_date"] != requested_date
+        or state["asset_type"] != "stock"
+        or state["instrument_context"] != _deterministic_instrument_context(symbol)
+        or any(
+            state[field]
+            for field in ("news_report", "sentiment_report", "fundamentals_report", "past_context")
+        )
+    ):
         raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
     state["investment_debate_state"] = _validate_debate(
         value["investment_debate_state"], _INVEST_DEBATE_FIELDS
@@ -256,30 +328,26 @@ def _validate_state(value: Any, symbol: str, requested_date: str) -> dict[str, A
     state["risk_debate_state"] = _validate_debate(
         value["risk_debate_state"], _RISK_DEBATE_FIELDS
     )
-    messages = value["messages"]
-    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes, bytearray)):
-        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-    state["messages"] = list(messages)
+    state["messages"] = _validate_cleared_messages(value["messages"])
     return state
 
 
-def _validated_stock_call(
-    call: Mapping[str, Any], symbol: str, requested: date
-) -> tuple[str, date, date]:
-    if set(call) != {"name", "args", "id", "type"} or call.get("type") != "tool_call":
+def _validated_stock_trace(
+    entry: Mapping[str, Any], symbol: str, cutoff: date
+) -> date:
+    if set(entry) != {"name", "args", "id", "content"}:
         raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-    call_id = call.get("id")
-    args = call.get("args")
+    call_id = entry.get("id")
+    args = entry.get("args")
     if not _is_safe_id(call_id) or not isinstance(args, Mapping):
         raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
     if set(args) != {"symbol", "start_date", "end_date"} or args.get("symbol") != symbol:
         raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
     start = _exact_iso_date(args.get("start_date"))
     end = _exact_iso_date(args.get("end_date"))
-    if start is None or end is None or start > end or end > requested:
+    if start is None or end is None or start > end or end != cutoff:
         raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-    assert isinstance(call_id, str)
-    return call_id, start, end
+    return _parse_stock_tool_result(entry.get("content"), symbol, start, end, cutoff)
 
 
 def _parse_stock_tool_result(
@@ -353,7 +421,7 @@ def _parse_stock_tool_result_strict(
             raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
         if observed_date > requested:
             raise ResearchUnavailable(LOOK_AHEAD_EVIDENCE_REASON)
-        if observed_date > end or observed_date == requested:
+        if observed_date > end:
             raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
         if observed and observed_date <= observed[-1]:
             raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
@@ -370,66 +438,128 @@ def _parse_stock_tool_result_strict(
     return max(observed)
 
 
-def _extract_evidence(
-    messages: Sequence[Any], symbol: str, requested: date, as_of: datetime
-) -> tuple[Evidence, ...]:
-    pending: dict[str, tuple[date, date]] = {}
-    consumed: set[str] = set()
-    seen_call_ids: set[str] = set()
-    seen_result_ids: set[str] = set()
-    latest: date | None = None
-    for message in messages:
-        if not isinstance(message, Mapping):
-            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-        message_type = message.get("type")
-        if message_type == "ai":
-            tool_calls = message.get("tool_calls")
-            if not isinstance(tool_calls, Sequence) or isinstance(
-                tool_calls, (str, bytes, bytearray)
-            ):
-                raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-            for call in tool_calls:
-                if not isinstance(call, Mapping):
-                    raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-                call_id = call.get("id")
-                if isinstance(call_id, str):
-                    if call_id in seen_call_ids or call_id in seen_result_ids:
-                        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-                    seen_call_ids.add(call_id)
-                if call.get("name") != "get_stock_data":
-                    continue
-                validated_id, start, end = _validated_stock_call(call, symbol, requested)
-                pending[validated_id] = (start, end)
-            continue
-        if message_type != "tool":
-            continue
-        call_id = message.get("tool_call_id")
-        if isinstance(call_id, str):
-            if call_id in seen_result_ids:
-                raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-            seen_result_ids.add(call_id)
-        if message.get("name") != "get_stock_data":
-            if isinstance(call_id, str) and (call_id in pending or call_id in consumed):
-                raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-            continue
-        if (
-            set(message) != {"type", "content", "name", "tool_call_id"}
-            or not _is_safe_id(call_id)
-            or call_id not in pending
-        ):
-            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-        assert isinstance(call_id, str)
-        start, end = pending.pop(call_id)
-        observed = _parse_stock_tool_result(
-            message.get("content"), symbol, start, end, requested
-        )
-        consumed.add(call_id)
-        if latest is None or observed > latest:
-            latest = observed
-    if pending:
+def _trace_args(
+    entry: Mapping[str, Any], required: set[str]
+) -> tuple[Mapping[str, Any], int]:
+    args = entry.get("args")
+    if not isinstance(args, Mapping) or set(args) not in (required, required | {"look_back_days"}):
         raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-    if latest is None:
+    lookback = args.get("look_back_days", 30)
+    if isinstance(lookback, bool) or not isinstance(lookback, int) or not 1 <= lookback <= 365:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    return args, lookback
+
+
+def _validated_indicator_trace(entry: Mapping[str, Any], symbol: str, cutoff: date) -> None:
+    args, lookback = _trace_args(entry, {"symbol", "indicator", "curr_date"})
+    indicator = args.get("indicator")
+    if (
+        args.get("symbol") != symbol
+        or args.get("curr_date") != cutoff.isoformat()
+        or not isinstance(indicator, str)
+        or indicator not in _SUPPORTED_INDICATORS
+    ):
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    content = entry.get("content")
+    if not isinstance(content, str) or len(content) > 5_000_000:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    sections = content.split("\n\n")
+    start = cutoff - timedelta(days=lookback)
+    expected_header = f"## {indicator} values from {start.isoformat()} to {cutoff.isoformat()}:"
+    if len(sections) < 3 or sections[0] != expected_header or not sections[-1].strip():
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    dates: list[date] = []
+    for line in sections[1].splitlines():
+        match = _INDICATOR_LINE.fullmatch(line)
+        if match is None or not match.group(2).strip():
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        observed = _exact_iso_date(match.group(1))
+        if observed is None or observed < start or observed > cutoff:
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        if dates and observed >= dates[-1]:
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        dates.append(observed)
+    if not dates or dates[0] != cutoff:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+
+
+def _validated_snapshot_trace(entry: Mapping[str, Any], symbol: str, cutoff: date) -> date:
+    args, _lookback = _trace_args(entry, {"symbol", "curr_date"})
+    if args.get("symbol") != symbol or args.get("curr_date") != cutoff.isoformat():
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    content = entry.get("content")
+    if not isinstance(content, str) or len(content) > 5_000_000:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    lines = content.splitlines()
+    if not lines or lines[0] != f"## Verified market data snapshot for {symbol.upper()}":
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    requested_line = f"- Requested analysis date: {cutoff.isoformat()}"
+    if lines.count(requested_line) != 1:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    latest_prefix = "- Latest trading row used: "
+    latest_values = [
+        line.removeprefix(latest_prefix)
+        for line in lines
+        if line.startswith(latest_prefix)
+    ]
+    if len(latest_values) != 1:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    latest = _exact_iso_date(latest_values[0])
+    claimed_dates = [_exact_iso_date(match) for match in _ISO_DATE_TOKEN.findall(content)]
+    if latest is None or latest > cutoff or any(
+        item is None or item > cutoff for item in claimed_dates
+    ):
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    recent_dates: list[date] = []
+    for line in lines:
+        match = _MARKDOWN_DATE_ROW.fullmatch(line)
+        if match is not None:
+            observed = _exact_iso_date(match.group(1))
+            if observed is None or observed > cutoff:
+                raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+            recent_dates.append(observed)
+    if (
+        not recent_dates
+        or recent_dates[0] != latest
+        or len(recent_dates) != len(set(recent_dates))
+        or any(
+            current >= previous
+            for previous, current in zip(recent_dates, recent_dates[1:], strict=False)
+        )
+    ):
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    return latest
+
+
+def _extract_evidence(
+    trace: Any, symbol: str, cutoff: date, as_of: datetime
+) -> tuple[Evidence, ...]:
+    if not isinstance(trace, Sequence) or isinstance(trace, (str, bytes, bytearray)) or not trace:
+        raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    seen_ids: set[str] = set()
+    source_dates: list[date] = []
+    stock_seen = False
+    for entry in trace:
+        if not isinstance(entry, Mapping) or set(entry) != {"name", "args", "id", "content"}:
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        trace_id = entry.get("id")
+        if not _is_safe_id(trace_id) or trace_id in seen_ids:
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+        assert isinstance(trace_id, str)
+        seen_ids.add(trace_id)
+        name = entry.get("name")
+        if name == "get_stock_data":
+            source_dates.append(_validated_stock_trace(entry, symbol, cutoff))
+            stock_seen = True
+        elif name == "get_indicators":
+            _validated_indicator_trace(entry, symbol, cutoff)
+        elif name == "get_verified_market_snapshot":
+            source_dates.append(_validated_snapshot_trace(entry, symbol, cutoff))
+        else:
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
+    if not stock_seen or not source_dates:
         raise ResearchUnavailable(NO_TRUSTWORTHY_EVIDENCE_REASON)
+    latest = max(source_dates)
     published_at = datetime.combine(
         latest + timedelta(days=1), datetime.min.time(), tzinfo=UTC
     )
@@ -495,6 +625,10 @@ def _public_configuration(value: Any) -> dict[str, Any]:
         public["upstream_commit"] != PINNED_TRADINGAGENTS_COMMIT
         or public["confidence_method"] != _CONFIDENCE_METHOD
         or public["evidence_availability_method"] != _EVIDENCE_AVAILABILITY_METHOD
+        or public["analysis_cutoff_method"] != _ANALYSIS_CUTOFF_METHOD
+        or public["tool_trace_policy"] != _TOOL_TRACE_POLICY
+        or public["llm_temporal_scope"] != _LLM_TEMPORAL_SCOPE
+        or public["selected_analysts"] != ["market"]
     ):
         raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
     return public
@@ -532,20 +666,29 @@ class TauricResearchProvider:
         normalized_as_of = as_of.astimezone(UTC)
         if not _is_safe_symbol(instrument.symbol):
             raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-        requested_date = normalized_as_of.date().isoformat()
         try:
-            raw = self._runner.propagate(instrument.symbol, requested_date)
+            analysis_cutoff = normalized_as_of.date() - timedelta(days=1)
+        except OverflowError:
+            raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON) from None
+        cutoff_text = analysis_cutoff.isoformat()
+        try:
+            raw = self._runner.propagate(instrument.symbol, cutoff_text)
         except ResearchDependencyUnavailable:
             raise ResearchDependencyUnavailable() from None
         except Exception:
             raise ResearchUnavailable(_UPSTREAM_FAILURE_REASON) from None
-        if not isinstance(raw, Mapping) or set(raw) != {"state", "model_id", "configuration"}:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "state",
+            "tool_trace",
+            "model_id",
+            "configuration",
+        }:
             raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
         model_id = raw["model_id"]
         if not _is_safe_id(model_id):
             raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
         assert isinstance(model_id, str)
-        state = _validate_state(raw["state"], instrument.symbol, requested_date)
+        state = _validate_state(raw["state"], instrument.symbol, cutoff_text)
         debate = state["investment_debate_state"]
         assert isinstance(debate, dict)
         thesis = debate["bull_history"]
@@ -554,12 +697,10 @@ class TauricResearchProvider:
         assert isinstance(bear_case, str)
         if not thesis and not bear_case:
             raise ResearchUnavailable(INVALID_RESEARCH_STATE_REASON)
-        messages = state["messages"]
-        assert isinstance(messages, list)
         evidence = _extract_evidence(
-            messages,
+            raw["tool_trace"],
             instrument.symbol,
-            normalized_as_of.date(),
+            analysis_cutoff,
             normalized_as_of,
         )
         confidence = Decimal("0.50")
@@ -639,6 +780,169 @@ def _serialize_agent_state(value: Any) -> dict[str, Any]:
     return result
 
 
+def _callback_args(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise RuntimeError(_TRACE_CAPTURE_FAILURE)
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or isinstance(item, bool) or not isinstance(item, (str, int)):
+            raise RuntimeError(_TRACE_CAPTURE_FAILURE)
+        result[key] = item
+    return result
+
+
+class _ToolTraceRecorder:
+    """Thread-safe callback ledger coupled to the pinned LangChain tool API."""
+
+    raise_error = True
+    run_inline = True
+    ignore_agent = False
+    ignore_chain = True
+    ignore_chat_model = True
+    ignore_custom_event = True
+    ignore_llm = True
+    ignore_retriever = True
+    ignore_retry = True
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._pending: dict[UUID, dict[str, Any]] = {}
+        self._completed: dict[int, dict[str, Any]] = {}
+        self._ids: set[str] = set()
+        self._failed = False
+        self._next_index = 0
+
+    def on_tool_start(
+        self,
+        serialized: dict[str, Any],
+        input_str: str,
+        *,
+        run_id: UUID,
+        inputs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        del input_str
+        name = serialized.get("name") if isinstance(serialized, Mapping) else None
+        tool_call_id = kwargs.get("tool_call_id")
+        if (
+            not isinstance(run_id, UUID)
+            or not isinstance(name, str)
+            or not _is_safe_id(name)
+            or not _is_safe_id(tool_call_id)
+        ):
+            raise RuntimeError(_TRACE_CAPTURE_FAILURE)
+        args = _callback_args(inputs)
+        assert isinstance(tool_call_id, str)
+        with self._lock:
+            if run_id in self._pending or tool_call_id in self._ids:
+                self._failed = True
+                raise RuntimeError(_TRACE_CAPTURE_FAILURE)
+            index = self._next_index
+            self._next_index += 1
+            self._ids.add(tool_call_id)
+            self._pending[run_id] = {
+                "index": index,
+                "name": name,
+                "args": args,
+                "id": tool_call_id,
+            }
+
+    def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs: Any) -> None:
+        del kwargs
+        with self._lock:
+            started = self._pending.pop(run_id, None)
+            if started is None:
+                self._failed = True
+                raise RuntimeError(_TRACE_CAPTURE_FAILURE)
+            content = getattr(output, "content", None)
+            name = getattr(output, "name", None)
+            tool_call_id = getattr(output, "tool_call_id", None)
+            status = getattr(output, "status", "success")
+            if (
+                not isinstance(content, str)
+                or name != started["name"]
+                or tool_call_id != started["id"]
+                or status not in (None, "success")
+            ):
+                self._failed = True
+                raise RuntimeError(_TRACE_CAPTURE_FAILURE)
+            index = started.pop("index")
+            assert isinstance(index, int)
+            self._completed[index] = {**started, "content": content}
+
+    def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
+        del error, kwargs
+        with self._lock:
+            self._pending.pop(run_id, None)
+            self._failed = True
+        raise RuntimeError(_TRACE_CAPTURE_FAILURE)
+
+    def on_agent_action(self, action: Any, **kwargs: Any) -> None:
+        del action, kwargs
+
+    def on_agent_finish(self, finish: Any, **kwargs: Any) -> None:
+        del finish, kwargs
+
+    def on_text(self, text: str, **kwargs: Any) -> None:
+        del text, kwargs
+
+    def export(self) -> list[dict[str, Any]]:
+        with self._lock:
+            if self._failed or self._pending or not self._completed:
+                raise RuntimeError(_TRACE_CAPTURE_FAILURE)
+            return [dict(self._completed[index]) for index in sorted(self._completed)]
+
+
+def _execute_instrumented_graph(
+    graph_class: Any, request: dict[str, Any]
+) -> dict[str, Any]:
+    """Run the exact pinned private callback seam or fail with a fixed reason."""
+
+    try:
+        if (
+            request.get("selected_analysts") != ["market"]
+            or not _is_safe_symbol(request.get("symbol"))
+            or _exact_iso_date(request.get("date")) is None
+            or not isinstance(request.get("config"), Mapping)
+        ):
+            raise RuntimeError(_TRACE_CAPTURE_FAILURE)
+        recorder = _ToolTraceRecorder()
+        graph = graph_class(selected_analysts=_MARKET_PROFILE, config=dict(request["config"]))
+        propagator = getattr(graph, "propagator", None)
+        get_graph_args = getattr(propagator, "get_graph_args", None)
+        if not callable(get_graph_args) or not callable(
+            getattr(graph, "resolve_instrument_context", None)
+        ):
+            raise RuntimeError(_TRACE_CAPTURE_FAILURE)
+        assert propagator is not None
+        propagator.get_graph_args = partial(get_graph_args, callbacks=[recorder])
+        graph.resolve_instrument_context = _deterministic_instrument_context
+        propagate = getattr(graph, "propagate", None)
+        if not callable(propagate):
+            raise RuntimeError(_TRACE_CAPTURE_FAILURE)
+        upstream = propagate(request["symbol"], request["date"], asset_type="stock")
+        if not isinstance(upstream, tuple) or len(upstream) != 2:
+            raise RuntimeError(_TRACE_CAPTURE_FAILURE)
+        return {
+            "state": _serialize_agent_state(upstream[0]),
+            "tool_trace": recorder.export(),
+        }
+    except RuntimeError:
+        raise RuntimeError(_TRACE_CAPTURE_FAILURE) from None
+    except Exception:
+        raise RuntimeError(_TRACE_CAPTURE_FAILURE) from None
+
+
+def _reset_pinned_dataflow_config(config_module: Any) -> None:
+    """Reset the pinned module's merge-on-update global before audited setup."""
+
+    if not hasattr(config_module, "_config") or not callable(
+        getattr(config_module, "set_config", None)
+    ):
+        raise RuntimeError(_TRACE_CAPTURE_FAILURE)
+    config_module._config = {}
+
+
 def _invoke_pinned_graph(request: dict[str, Any]) -> Mapping[str, Any]:
     """Child-process worker that imports and calls only the pinned public API."""
 
@@ -646,14 +950,9 @@ def _invoke_pinned_graph(request: dict[str, Any]) -> Mapping[str, Any]:
     graph_class = getattr(graph_module, "TradingAgentsGraph", None)
     if not callable(graph_class):
         raise ImportError("pinned TradingAgents API unavailable")
-    graph = graph_class(
-        selected_analysts=tuple(request["selected_analysts"]),
-        config=request["config"],
-    )
-    upstream = graph.propagate(request["symbol"], request["date"])
-    if not isinstance(upstream, tuple) or len(upstream) != 2:
-        raise RuntimeError("invalid pinned TradingAgents result")
-    return _serialize_agent_state(upstream[0])
+    config_module = importlib.import_module("tradingagents.dataflows.config")
+    _reset_pinned_dataflow_config(config_module)
+    return _execute_instrumented_graph(graph_class, request)
 
 
 def _worker_entry(
@@ -716,23 +1015,13 @@ def _audited_config(
         "max_debate_rounds": 1,
         "max_risk_discuss_rounds": 1,
         "max_recur_limit": 100,
-        "news_article_limit": 20,
-        "global_news_article_limit": 10,
-        "global_news_lookback_days": 7,
-        "global_news_queries": [
-            "Federal Reserve interest rates inflation",
-            "S&P 500 earnings GDP economic outlook",
-            "geopolitical risk trade war sanctions",
-            "ECB Bank of England BOJ central bank policy",
-            "oil commodities supply chain energy",
-        ],
+        "news_article_limit": 0,
+        "global_news_article_limit": 0,
+        "global_news_lookback_days": 0,
+        "global_news_queries": [],
         "data_vendors": {
             "core_stock_apis": "yfinance",
             "technical_indicators": "yfinance",
-            "fundamental_data": "yfinance",
-            "news_data": "yfinance",
-            "macro_data": "fred",
-            "prediction_markets": "polymarket",
         },
         "tool_vendors": {},
         "benchmark_ticker": None,
@@ -764,6 +1053,9 @@ def _provenance(config: Mapping[str, Any], selected_analysts: tuple[str, ...]) -
         "storage_scope": "isolated-per-run",
         "confidence_method": _CONFIDENCE_METHOD,
         "evidence_availability_method": _EVIDENCE_AVAILABILITY_METHOD,
+        "analysis_cutoff_method": _ANALYSIS_CUTOFF_METHOD,
+        "tool_trace_policy": _TOOL_TRACE_POLICY,
+        "llm_temporal_scope": _LLM_TEMPORAL_SCOPE,
     }
 
 
@@ -776,17 +1068,13 @@ class TauricUpstreamRunner:
         llm_provider: str,
         model_id: str,
         checkpoint_enabled: bool,
-        selected_analysts: tuple[str, ...] = ("market", "news", "fundamentals"),
+        selected_analysts: tuple[str, ...] = _MARKET_PROFILE,
         timeout_seconds: float = 300.0,
         worker: Worker = _invoke_pinned_graph,
+        worker_started: Any = None,
     ) -> None:
         normalized_provider = llm_provider.strip().lower() if isinstance(llm_provider, str) else ""
-        valid_analysts = (
-            isinstance(selected_analysts, tuple)
-            and bool(selected_analysts)
-            and len(set(selected_analysts)) == len(selected_analysts)
-            and set(selected_analysts).issubset(_SUPPORTED_ANALYSTS)
-        )
+        valid_analysts = selected_analysts == _MARKET_PROFILE
         valid_timeout = (
             not isinstance(timeout_seconds, bool)
             and isinstance(timeout_seconds, (int, float))
@@ -800,6 +1088,7 @@ class TauricUpstreamRunner:
             or not valid_analysts
             or not valid_timeout
             or not callable(worker)
+            or (worker_started is not None and not callable(getattr(worker_started, "wait", None)))
         ):
             raise ValueError("Tauric runner configuration is invalid")
         self._llm_provider = normalized_provider
@@ -808,6 +1097,7 @@ class TauricUpstreamRunner:
         self._selected_analysts = selected_analysts
         self._timeout_seconds = float(timeout_seconds)
         self._worker = worker
+        self._worker_started = worker_started
 
     def propagate(self, symbol: str, date: str) -> Mapping[str, Any]:
         requested = _exact_iso_date(date)
@@ -823,7 +1113,7 @@ class TauricUpstreamRunner:
             Path(config["results_dir"]).mkdir(parents=True, exist_ok=True)
             Path(config["data_cache_dir"]).mkdir(parents=True, exist_ok=True)
             Path(config["memory_log_path"]).parent.mkdir(parents=True, exist_ok=True)
-            state = self._run_process(
+            child_result = self._run_process(
                 {
                     "symbol": symbol,
                     "date": date,
@@ -831,8 +1121,11 @@ class TauricUpstreamRunner:
                     "config": config,
                 }
             )
+            if set(child_result) != {"state", "tool_trace"}:
+                raise ResearchUnavailable(_UPSTREAM_FAILURE_REASON)
             return {
-                "state": state,
+                "state": child_result["state"],
+                "tool_trace": child_result["tool_trace"],
                 "model_id": self._model_id,
                 "configuration": _provenance(config, self._selected_analysts),
             }
@@ -853,6 +1146,9 @@ class TauricUpstreamRunner:
                 send.close()
             except Exception:
                 raise ResearchUnavailable(_UPSTREAM_FAILURE_REASON) from None
+            if self._worker_started is not None and not self._worker_started.wait(timeout=30):
+                _terminate_process(process)
+                raise ResearchUnavailable(_UPSTREAM_FAILURE_REASON)
             if not receive.poll(self._timeout_seconds):
                 if process.is_alive():
                     _terminate_process(process)
