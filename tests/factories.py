@@ -163,7 +163,7 @@ def intent(
     time_in_force: str = "day",
     product: str = "cash",
     session: str = "regular",
-    snapshot_hash: str = "snapshot-hash",
+    snapshot_hash: str = "a" * 64,
     created_at: datetime = DEFAULT_INSTANT,
     expires_at: datetime = DEFAULT_INSTANT + timedelta(minutes=1),
 ) -> OrderIntent:

@@ -8,8 +8,9 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from market_sentinel.backtest.engine import BacktestEngine, CostModel, FillModel
-from market_sentinel.domain.enums import Horizon, Side, SignalDirection
-from market_sentinel.domain.models import Bar, Instrument, Signal
+from market_sentinel.domain.enums import Horizon, OrderType, Side, SignalDirection
+from market_sentinel.domain.models import Bar, Instrument, MarketSnapshot, OrderIntent, Signal
+from market_sentinel.execution.paper import PaperBroker
 from market_sentinel.strategies.base import (
     StrategyConfiguration,
     StrategyContext,
@@ -662,3 +663,188 @@ def test_engine_rejects_invalid_bar_boundaries(bad_bar: Bar) -> None:
             strategy=_NeverTrade(),
             initial_cash=Decimal("10"),
         )
+
+
+@dataclass
+class _PartialTradeStrategy(_ProtectiveExitStrategy):
+    metadata: StrategyMetadata = field(
+        default_factory=lambda: StrategyMetadata(
+            strategy_id="partial",
+            version="1.0.0",
+            allowed_horizons=(Horizon.SWING,),
+            allowed_directions=(SignalDirection.LONG,),
+            max_holding_bars=4,
+        )
+    )
+
+    def evaluate(self, context: StrategyContext) -> Signal | None:
+        value = super().evaluate(context)
+        return None if value is None else value.model_copy(
+            update={
+                "strategy_id": self.metadata.strategy_id,
+                "strategy_version": self.metadata.version,
+            }
+        )
+
+
+def test_backtest_carries_partial_entry_and_exit_across_event_liquidity() -> None:
+    """Dropping a pending residual would underfill entry or overstate a partial exit."""
+    bars = list(_bars("10", "10", "10", "10", "10", "10", "10", "10"))
+    volumes = ("1000", "0.02", "0.02", "0.01", "0", "0", "0.02", "0.03")
+    bars = [
+        bar.model_copy(update={"volume": Decimal(volume)})
+        for bar, volume in zip(bars, volumes, strict=True)
+    ]
+
+    result = BacktestEngine(max_volume_participation=Decimal("1")).run(
+        instrument=instrument(minimum_notional="0.01", quantity_step="0.01"),
+        bars=tuple(bars),
+        strategy=_PartialTradeStrategy(),
+        initial_cash=Decimal("10"),
+    )
+
+    assert [(fill.side, fill.quantity) for fill in result.fills] == [
+        (Side.BUY, Decimal("0.02")),
+        (Side.BUY, Decimal("0.02")),
+        (Side.BUY, Decimal("0.01")),
+        (Side.SELL, Decimal("0.02")),
+        (Side.SELL, Decimal("0.03")),
+    ]
+    assert len(result.completed_trades) == 1
+    assert result.completed_trades[0].quantity == Decimal("0.05")
+    assert result.completed_trades[0].entry_price == Decimal("10")
+    assert result.completed_trades[0].exit_price == Decimal("10")
+
+
+def test_zero_volume_keeps_pending_entry_for_a_later_liquid_event() -> None:
+    """A zero-volume bar must neither fabricate a fill nor discard the remaining order."""
+    bars = list(_bars("10", "10", "10"))
+    bars[1] = bars[1].model_copy(update={"volume": Decimal("0")})
+    bars[2] = bars[2].model_copy(update={"volume": Decimal("0.05")})
+
+    result = BacktestEngine().run(
+        instrument=instrument(minimum_notional="0.01", quantity_step="0.01"),
+        bars=tuple(bars),
+        strategy=_BuyThenFlat(),
+        initial_cash=Decimal("10"),
+    )
+
+    assert len(result.fills) == 1
+    assert result.fills[0].quantity == Decimal("0.05")
+    assert result.fills[0].filled_at == bars[2].at
+
+
+def test_protective_trigger_cancels_unfilled_entry_before_partial_position_exit() -> None:
+    """A stop on a partial position must not add more entry exposure on its trigger bar."""
+    bars = list(_bars("10", "10", "10", "8.5"))
+    bars[1] = bars[1].model_copy(update={"volume": Decimal("0.02")})
+    bars[2] = bars[2].model_copy(
+        update={"low": Decimal("8"), "volume": Decimal("1")}
+    )
+    bars[3] = bars[3].model_copy(update={"volume": Decimal("0.02")})
+
+    result = BacktestEngine().run(
+        instrument=instrument(minimum_notional="0.01", quantity_step="0.01"),
+        bars=tuple(bars),
+        strategy=_ProtectiveExitStrategy(),
+        initial_cash=Decimal("10"),
+    )
+
+    assert [(fill.side, fill.quantity) for fill in result.fills] == [
+        (Side.BUY, Decimal("0.02")),
+        (Side.SELL, Decimal("0.02")),
+    ]
+    assert len(result.completed_trades) == 1
+    assert result.completed_trades[0].quantity == Decimal("0.02")
+
+
+def test_paper_and_backtest_share_identical_partial_fill_cost_behavior() -> None:
+    """Equal order, event, costs, and participation must produce equal execution facts."""
+    bars = list(_bars("10", "9.9"))
+    bars[1] = bars[1].model_copy(update={"volume": Decimal("0.04")})
+    venue = instrument(
+        minimum_notional="0.01",
+        quantity_step="0.01",
+        price_tick="0.0001",
+    )
+    costs = CostModel(
+        fee_bps=Decimal("10"),
+        spread_bps=Decimal("20"),
+        slippage_bps=Decimal("10"),
+    )
+    backtest = BacktestEngine(
+        costs=costs,
+        max_volume_participation=Decimal("0.5"),
+    ).run(
+        instrument=venue,
+        bars=tuple(bars),
+        strategy=_BuyThenFlat(),
+        initial_cash=Decimal("10"),
+    )
+    initial = MarketSnapshot(
+        instrument_id="AAPL@alpaca",
+        observed_at=bars[0].at,
+        source_at=bars[0].at,
+        bars=(bars[0],),
+        provider="backtest",
+        max_age_seconds=0,
+    )
+    paper = PaperBroker(
+        fill_model=FillModel(costs=costs),
+        starting_cash=Decimal("10"),
+        max_volume_participation=Decimal("0.5"),
+    )
+    paper.submit(
+        OrderIntent(
+            intent_id="parity-intent",
+            instrument_id="AAPL@alpaca",
+            side=Side.BUY,
+            quantity=Decimal("0.05"),
+            notional=None,
+            order_type=OrderType.LIMIT,
+            limit_price=Decimal("10"),
+            stop_loss=Decimal("9"),
+            take_profit=Decimal("15"),
+            time_in_force="day",
+            product="cash",
+            session="regular",
+            snapshot_hash="a" * 64,
+            created_at=bars[0].at,
+            expires_at=bars[0].at + timedelta(minutes=10),
+        ),
+        initial,
+    )
+    paper_event = initial.model_copy(
+        update={
+            "observed_at": bars[1].at,
+            "source_at": bars[1].at,
+            "bars": tuple(bars),
+        }
+    )
+    [paper_fill] = paper.on_snapshot(paper_event, venue)
+    [backtest_fill] = backtest.fills
+
+    assert (paper_fill.quantity, paper_fill.price, paper_fill.fee) == (
+        backtest_fill.quantity,
+        backtest_fill.price,
+        backtest_fill.fee,
+    )
+
+
+def test_robustness_rerun_preserves_volume_participation() -> None:
+    """The cost stress must not silently restore unlimited event liquidity."""
+    bars = list(_bars("10", "10"))
+    bars[1] = bars[1].model_copy(update={"volume": Decimal("0.02")})
+
+    result = BacktestEngine(
+        costs=CostModel(fee_bps=Decimal("1")),
+        max_volume_participation=Decimal("0.5"),
+    ).run_robustness(
+        instrument=instrument(minimum_notional="0.01", quantity_step="0.01"),
+        bars=tuple(bars),
+        strategy=_BuyThenFlat(),
+        initial_cash=Decimal("10"),
+    )
+
+    assert result.base.fills[0].quantity == Decimal("0.01")
+    assert result.stressed.fills[0].quantity == Decimal("0.01")

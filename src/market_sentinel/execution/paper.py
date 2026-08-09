@@ -8,13 +8,13 @@ import re
 import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from threading import RLock
 from types import MappingProxyType
 from typing import cast
 
-from market_sentinel.backtest.engine import FillModel
+from market_sentinel.backtest.engine import CostModel, FillModel
 from market_sentinel.domain.enums import AssetClass, OrderStatus, OrderType, Side
 from market_sentinel.domain.models import (
     Bar,
@@ -23,12 +23,17 @@ from market_sentinel.domain.models import (
     Instrument,
     MarketSnapshot,
     OrderIntent,
+    PortfolioSnapshot,
     Position,
 )
 from market_sentinel.execution.base import AuditRecorder, BrokerCapabilities
 from market_sentinel.execution.state_machine import OrderStateMachine, OrderTransitionEvent
 from market_sentinel.operations.audit import AuditEvent
-from market_sentinel.portfolio.ledger import PortfolioLedger
+from market_sentinel.portfolio.ledger import (
+    PortfolioLedger,
+    PortfolioLedgerPositionState,
+    PortfolioLedgerState,
+)
 from market_sentinel.storage.events import EventRecord
 
 
@@ -72,6 +77,15 @@ class _AuditSpec:
     payload: Mapping[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class _ReplayConfiguration:
+    session_id: str
+    starting_cash: Decimal
+    currency: str
+    costs: CostModel
+    max_volume_participation: Decimal
+
+
 @dataclass(slots=True)
 class _PaperState:
     orders: dict[str, _PaperOrderRecord]
@@ -82,6 +96,7 @@ class _PaperState:
     fill_sequence: int
     ledger: PortfolioLedger
     market_prices: dict[str, Decimal]
+    instruments: dict[str, Instrument]
     latest_at: datetime | None
     last_event_key: tuple[datetime, datetime, str] | None
 
@@ -95,12 +110,17 @@ class _PaperState:
             fill_sequence=self.fill_sequence,
             ledger=copy.deepcopy(self.ledger),
             market_prices=dict(self.market_prices),
+            instruments=dict(self.instruments),
             latest_at=self.latest_at,
             last_event_key=self.last_event_key,
         )
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")
+_VENUE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+_CURRENCY = re.compile(r"^[A-Z][A-Z0-9]{2,11}$")
+_TIMEZONE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_+./-]{0,127}$")
+_SNAPSHOT_HASH = re.compile(r"^[0-9a-f]{64}$")
 _REASON_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _CLOSED = frozenset(
     {
@@ -155,8 +175,8 @@ class PaperBroker:
         )
         if participation > Decimal("1"):
             raise ValueError("max_volume_participation must be at most 1")
-        if not isinstance(currency, str) or not currency or currency != currency.strip():
-            raise ValueError("currency must be nonempty and trimmed")
+        if not isinstance(currency, str) or _CURRENCY.fullmatch(currency) is None:
+            raise ValueError("currency must be a safe uppercase identifier")
         if type(durable) is not bool:
             raise ValueError("durable must be an exact bool")
         if durable and audit_log is None:
@@ -192,6 +212,7 @@ class PaperBroker:
             fill_sequence=0,
             ledger=PortfolioLedger(starting_cash=initial_cash, currency=currency),
             market_prices={},
+            instruments={},
             latest_at=None,
             last_event_key=None,
         )
@@ -228,12 +249,22 @@ class PaperBroker:
         with self._lock:
             return self._state.ledger.cash
 
+    def portfolio_snapshot(self) -> PortfolioSnapshot:
+        """Return the exact current marked portfolio at the global watermark."""
+        with self._lock:
+            if self._state.latest_at is None:
+                raise ValueError("paper portfolio has no availability watermark")
+            return self._state.ledger.snapshot(self._state.latest_at)
+
     def submit(self, intent: OrderIntent, snapshot: MarketSnapshot) -> BrokerOrder:
         """Acknowledge one canonical intent without filling its current snapshot."""
         with self._lock:
-            _validate_intent(intent)
+            if not isinstance(intent, OrderIntent):
+                raise ValueError("intent must be an OrderIntent")
             _validate_snapshot(snapshot, expected_instrument_id=intent.instrument_id)
+            _validate_intent(intent, snapshot=snapshot)
             submitted_at = snapshot.observed_at.astimezone(UTC)
+            _validate_watermark(self._state, submitted_at)
             if intent.created_at.astimezone(UTC) > submitted_at:
                 raise ValueError("intent creation must not be after submission snapshot")
             if intent.expires_at.astimezone(UTC) <= submitted_at:
@@ -335,7 +366,13 @@ class PaperBroker:
         snapshot: MarketSnapshot,
         instrument: Instrument,
     ) -> tuple[Fill, ...]:
-        return self.on_snapshots(((snapshot, instrument),))
+        with self._lock:
+            _validate_watermark(self._state, snapshot.observed_at.astimezone(UTC))
+            if len(_active_instrument_ids(self._state)) > 1:
+                raise ValueError(
+                    "multiple active instruments require one atomic on_snapshots batch"
+                )
+            return self.on_snapshots(((snapshot, instrument),))
 
     def on_snapshots(
         self,
@@ -349,6 +386,7 @@ class PaperBroker:
                 tuple[tuple[datetime, datetime, str], MarketSnapshot, Instrument, bool]
             ] = []
             seen_instruments: set[str] = set()
+            active_instruments = _active_instrument_ids(self._state)
             for item in events:
                 if not isinstance(item, tuple) or len(item) != 2:
                     raise ValueError("snapshot batch entries must contain snapshot and instrument")
@@ -372,10 +410,19 @@ class PaperBroker:
                     ):
                         raise ValueError("snapshot revision or backward event is not allowed")
                 _validate_snapshot(snapshot, expected_instrument_id=instrument_id)
+                _validate_watermark(
+                    self._state,
+                    snapshot.observed_at.astimezone(UTC),
+                )
                 if instrument.asset_class not in _PAPER_CAPABILITIES.supported_asset_classes:
                     raise ValueError("instrument asset class is unsupported by paper execution")
                 key = _event_key(snapshot)
                 validated.append((key, snapshot, instrument, duplicate))
+
+            if len(active_instruments) > 1 and seen_instruments != active_instruments:
+                raise ValueError(
+                    "snapshot batch must include all active instruments"
+                )
 
             validated.sort(key=lambda item: item[0])
             new_keys = [key for key, _, _, duplicate in validated if not duplicate]
@@ -416,6 +463,10 @@ class PaperBroker:
                     quantity_step=instrument.quantity_step,
                 )
                 staged.market_prices[snapshot.instrument_id] = bar.close
+                previous_instrument = staged.instruments.get(snapshot.instrument_id)
+                if previous_instrument is not None and previous_instrument != instrument:
+                    raise ValueError("instrument metadata changed within the paper session")
+                staged.instruments[snapshot.instrument_id] = instrument
                 for order_id in sorted(staged.orders):
                     record = staged.orders[order_id]
                     if record.order.instrument_id != snapshot.instrument_id:
@@ -433,7 +484,10 @@ class PaperBroker:
                     if fill is not None:
                         produced.append(fill)
                 staged.snapshots[snapshot.instrument_id] = snapshot
-                staged.latest_at = snapshot.observed_at.astimezone(UTC)
+                staged.latest_at = max(
+                    snapshot.observed_at.astimezone(UTC),
+                    staged.latest_at or snapshot.observed_at.astimezone(UTC),
+                )
                 staged.last_event_key = key
 
             if new_keys and staged.market_prices and staged.latest_at is not None:
@@ -503,6 +557,182 @@ class PaperBroker:
                 raise ValueError("only UNKNOWN orders can be reconciled")
         return self._resolve(order_id, broker_status, at=at)
 
+    def reconcile_unknown_fills(
+        self,
+        authoritative_order: BrokerOrder,
+        new_fills: tuple[Fill, ...],
+        *,
+        instrument: Instrument,
+    ) -> BrokerOrder:
+        """Atomically apply authoritative fill evidence for one UNKNOWN order."""
+        with self._lock:
+            if not isinstance(authoritative_order, BrokerOrder):
+                raise ValueError("authoritative fill order is invalid")
+            staged = self._state.clone()
+            record = staged.orders.get(authoritative_order.order_id)
+            if record is None or record.order.status is not OrderStatus.UNKNOWN:
+                raise ValueError("authoritative fill requires one UNKNOWN paper order")
+            current = record.order
+            at = _aware_utc(authoritative_order.updated_at, "authoritative update")
+            _validate_watermark(self._state, at)
+            instrument_id = _instrument_id(instrument)
+            if instrument.quote_currency != self._currency:
+                raise ValueError("authoritative fill instrument currency is invalid")
+            if (
+                instrument_id != current.instrument_id
+                or authoritative_order.client_order_id != current.client_order_id
+                or authoritative_order.broker != self.broker_name
+                or authoritative_order.instrument_id != current.instrument_id
+                or authoritative_order.submitted_at != current.submitted_at
+                or authoritative_order.requested_quantity != current.requested_quantity
+                or authoritative_order.status
+                not in {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED}
+                or authoritative_order.filled_quantity <= current.filled_quantity
+                or authoritative_order.average_fill_price is None
+                or not isinstance(new_fills, tuple)
+                or not new_fills
+            ):
+                raise ValueError("authoritative fill order identity or status is invalid")
+            prior_instrument = staged.instruments.get(instrument_id)
+            if prior_instrument is not None and prior_instrument != instrument:
+                raise ValueError("authoritative fill instrument metadata changed")
+
+            existing_fill_ids = {fill.fill_id for fill in staged.fills}
+            delta = authoritative_order.filled_quantity - current.filled_quantity
+            prior_at = max(
+                (
+                    fill.filled_at
+                    for fill in staged.fills
+                    if fill.order_id == current.order_id
+                ),
+                default=current.submitted_at,
+            )
+            prior_key = (prior_at, "")
+            fill_notional = Decimal("0")
+            fill_fees = Decimal("0")
+            fill_quantity = Decimal("0")
+            seen_fill_ids: set[str] = set()
+            for fill in new_fills:
+                if not isinstance(fill, Fill):
+                    raise ValueError("authoritative fill evidence is invalid")
+                filled_at = _aware_utc(fill.filled_at, "authoritative fill timestamp")
+                key = (filled_at, fill.fill_id)
+                if (
+                    not isinstance(fill.fill_id, str)
+                    or _IDENTIFIER.fullmatch(fill.fill_id) is None
+                    or fill.fill_id in existing_fill_ids
+                    or fill.fill_id in seen_fill_ids
+                    or fill.order_id != current.order_id
+                    or fill.instrument_id != current.instrument_id
+                    or fill.side is not record.intent.side
+                    or filled_at < current.submitted_at
+                    or filled_at > at
+                    or key <= prior_key
+                ):
+                    raise ValueError("authoritative fill identity or chronology is invalid")
+                _positive_decimal(fill.quantity, "authoritative fill quantity")
+                _positive_decimal(fill.price, "authoritative fill price")
+                _nonnegative_decimal(fill.fee, "authoritative fill fee")
+                if not _respects_order_prices(record.intent, fill.price):
+                    raise ValueError("authoritative fill price violates order protection")
+                if record.intent.side is Side.BUY:
+                    if fill.quantity * fill.price + fill.fee > staged.ledger.cash:
+                        raise ValueError("authoritative fill exceeds paper cash")
+                else:
+                    held = next(
+                        (
+                            position.quantity
+                            for position in _state_positions(staged)
+                            if position.instrument_id == current.instrument_id
+                        ),
+                        Decimal("0"),
+                    )
+                    if fill.quantity > held:
+                        raise ValueError("authoritative fill exceeds paper position")
+                staged.ledger.apply_fill(fill)
+                seen_fill_ids.add(fill.fill_id)
+                fill_quantity += fill.quantity
+                fill_notional += fill.quantity * fill.price
+                fill_fees += fill.fee
+                prior_key = key
+            if fill_quantity != delta:
+                raise ValueError("authoritative fill quantity does not match broker delta")
+            total_notional = record.cumulative_filled_notional + fill_notional
+            expected_average = total_notional / authoritative_order.filled_quantity
+            if authoritative_order.average_fill_price != expected_average:
+                raise ValueError("authoritative fill weighted average is inconsistent")
+            if (
+                current.requested_quantity is not None
+                and authoritative_order.filled_quantity > current.requested_quantity
+            ):
+                raise ValueError("authoritative fill would overfill paper order")
+            remaining_notional = record.remaining_notional
+            if remaining_notional is not None:
+                remaining_notional -= fill_notional
+                if remaining_notional < Decimal("0"):
+                    raise ValueError("authoritative fill exceeds requested notional")
+            complete = (
+                authoritative_order.filled_quantity == current.requested_quantity
+                if current.requested_quantity is not None
+                else remaining_notional == Decimal("0")
+            )
+            if complete is not (authoritative_order.status is OrderStatus.FILLED):
+                raise ValueError("authoritative fill status is inconsistent with remaining size")
+
+            transition = OrderTransitionEvent(
+                prior_status=OrderStatus.UNKNOWN,
+                new_status=authoritative_order.status,
+                client_intent_id=current.client_order_id,
+                broker_order_id=current.order_id,
+                occurred_at=at,
+            )
+            specs: list[_AuditSpec] = [_transition_spec(transition)]
+            cumulative_quantity = current.filled_quantity
+            cumulative_notional = record.cumulative_filled_notional
+            cumulative_fees = record.cumulative_fees
+            for fill in new_fills:
+                cumulative_quantity += fill.quantity
+                cumulative_notional += fill.quantity * fill.price
+                cumulative_fees += fill.fee
+                specs.append(
+                    _activity_spec(
+                        kind="paper.order.fill",
+                        order=current,
+                        at=at,
+                        new_status=authoritative_order.status,
+                        payload={
+                            "fill_id": fill.fill_id,
+                            "quantity": _decimal_text(fill.quantity),
+                            "price": _decimal_text(fill.price),
+                            "fee": _decimal_text(fill.fee),
+                            "instrument": _instrument_payload(instrument),
+                            "source": "AUTHORITATIVE_RECONCILIATION",
+                            "cumulative_filled_quantity": _decimal_text(
+                                cumulative_quantity
+                            ),
+                            "cumulative_filled_notional": _decimal_text(
+                                cumulative_notional
+                            ),
+                            "cumulative_fees": _decimal_text(cumulative_fees),
+                        },
+                    )
+                )
+            staged.orders[current.order_id] = replace(
+                record,
+                order=authoritative_order,
+                remaining_notional=remaining_notional,
+                cumulative_filled_notional=total_notional,
+                cumulative_fees=record.cumulative_fees + fill_fees,
+            )
+            staged.fills.extend(new_fills)
+            staged.fill_sequence += len(new_fills)
+            staged.market_prices[instrument_id] = new_fills[-1].price
+            staged.instruments[instrument_id] = instrument
+            staged.latest_at = at
+            staged.ledger.mark(staged.market_prices, at)
+            self._commit(staged, specs, at=at)
+            return authoritative_order
+
     def _resolve(
         self,
         order_id: str,
@@ -516,25 +746,24 @@ class PaperBroker:
             record = staged.orders.get(order_id)
             if record is None:
                 raise KeyError("paper order not found")
-            updated, transition = _stage_transition(record.order, status, at)
+            resolved_at = _aware_utc(at, "resolution timestamp")
+            _validate_watermark(self._state, resolved_at)
+            updated, transition = _stage_transition(record.order, status, resolved_at)
             specs: list[_AuditSpec] = []
             if activity is not None:
                 specs.append(
                     _activity_spec(
                         kind=activity[0],
                         order=record.order,
-                        at=at,
+                        at=resolved_at,
                         payload=activity[1],
                         new_status=status,
                     )
                 )
             specs.append(_transition_spec(transition))
             staged.orders[order_id] = replace(record, order=updated)
-            staged.latest_at = max(
-                _aware_utc(at, "resolution timestamp"),
-                staged.latest_at or _aware_utc(at, "resolution timestamp"),
-            )
-            self._commit(staged, specs, at=at)
+            staged.latest_at = resolved_at
+            self._commit(staged, specs, at=resolved_at)
             return updated
 
     def _process_order(
@@ -711,6 +940,7 @@ class PaperBroker:
                         "quantity": _decimal_text(candidate.quantity),
                         "price": _decimal_text(candidate.price),
                         "fee": _decimal_text(candidate.fee),
+                        "instrument": _instrument_payload(instrument),
                         "cumulative_filled_quantity": _decimal_text(new_filled),
                         "remaining_quantity": _decimal_text(
                             order.requested_quantity - new_filled
@@ -759,7 +989,16 @@ class PaperBroker:
                 occurred_at=occurred_at,
                 prior_status=None,
                 new_status=None,
-                payload=MappingProxyType(_state_payload(staged)),
+                payload=MappingProxyType(
+                    _state_payload(
+                        staged,
+                        session_id=self._session_id,
+                        starting_cash=self._starting_cash,
+                        currency=self._currency,
+                        costs=self._fill_model.costs,
+                        max_volume_participation=self._max_volume_participation,
+                    )
+                ),
             )
         )
         first_sequence = self._state.event_sequence + 1
@@ -799,40 +1038,136 @@ class PaperBroker:
         records: Iterable[EventRecord],
         *,
         audit_log: AuditRecorder,
-        starting_cash: Decimal,
-        session_id: str,
-        currency: str = "USD",
+        starting_cash: Decimal | None = None,
+        session_id: str | None = None,
+        currency: str | None = None,
         fill_model: FillModel | None = None,
-        max_volume_participation: Decimal = Decimal("1"),
+        max_volume_participation: Decimal | None = None,
     ) -> PaperBroker:
         """Restore the last atomically committed state for one durable session."""
-        rows = tuple(records)
-        if not rows or any(row.aggregate_id != session_id for row in rows):
-            raise ValueError("rehydration requires one nonempty matching session stream")
-        state_rows = [row for row in rows if row.kind == "paper.state.committed"]
-        if not state_rows:
-            raise ValueError("rehydration stream lacks a committed state")
-        latest_state = max(state_rows, key=lambda row: row.sequence)
-        broker = cls(
-            fill_model=fill_model,
-            starting_cash=starting_cash,
-            currency=currency,
-            max_volume_participation=max_volume_participation,
-            audit_log=audit_log,
-            durable=True,
-            session_id=session_id,
-        )
-        broker._state = _state_from_payload(
-            latest_state.payload,
-            starting_cash=starting_cash,
-            currency=currency,
-        )
-        broker._audit_events = [
-            _paper_event_from_record(row)
-            for row in sorted(rows, key=lambda item: item.sequence)
-            if row.kind != "paper.state.committed"
-        ]
-        return broker
+        try:
+            rows = tuple(records)
+            if not rows:
+                raise ValueError
+            derived_session = rows[0].aggregate_id
+            if (
+                not isinstance(derived_session, str)
+                or _IDENTIFIER.fullmatch(derived_session) is None
+                or (session_id is not None and session_id != derived_session)
+            ):
+                raise ValueError
+            prior_database_sequence = 0
+            prior_occurred_at: datetime | None = None
+            committed: list[tuple[_ReplayConfiguration, _PaperState]] = []
+            fill_instruments: dict[str, Instrument] = {}
+            pending_activity: list[EventRecord] = []
+            for local_sequence, row in enumerate(rows, start=1):
+                if (
+                    not isinstance(row, EventRecord)
+                    or type(row.sequence) is not int
+                    or row.sequence <= prior_database_sequence
+                    or row.aggregate_id != derived_session
+                    or row.event_id
+                    != f"{derived_session}:event:{local_sequence:020d}"
+                    or not isinstance(row.kind, str)
+                    or _IDENTIFIER.fullmatch(row.kind) is None
+                ):
+                    raise ValueError
+                occurred_at = _aware_utc(row.occurred_at, "replay event timestamp")
+                if prior_occurred_at is not None and occurred_at < prior_occurred_at:
+                    raise ValueError
+                if not isinstance(row.payload, Mapping):
+                    raise ValueError
+                prior_database_sequence = row.sequence
+                prior_occurred_at = occurred_at
+                if row.kind == "paper.state.committed":
+                    state_payload = dict(row.payload)
+                    if (
+                        state_payload.pop("client_intent_id", None) != derived_session
+                        or state_payload.pop("broker_order_id", None) != derived_session
+                    ):
+                        raise ValueError
+                    configuration = _configuration_from_payload(state_payload)
+                    state = _state_from_payload(
+                        state_payload,
+                        configuration=configuration,
+                    )
+                    if (
+                        configuration.session_id != derived_session
+                        or state.event_sequence != local_sequence
+                        or any(
+                            state.instruments.get(instrument_id) != instrument
+                            for instrument_id, instrument in fill_instruments.items()
+                        )
+                    ):
+                        raise ValueError
+                    _validate_replay_group(
+                        tuple(pending_activity),
+                        state=state,
+                        previous_state=committed[-1][1] if committed else None,
+                        session_id=derived_session,
+                    )
+                    pending_activity.clear()
+                    committed.append((configuration, state))
+                else:
+                    client_id = row.payload.get("client_intent_id")
+                    broker_id = row.payload.get("broker_order_id")
+                    if (
+                        not isinstance(client_id, str)
+                        or _IDENTIFIER.fullmatch(client_id) is None
+                        or not isinstance(broker_id, str)
+                        or _IDENTIFIER.fullmatch(broker_id) is None
+                    ):
+                        raise ValueError
+                    if row.kind == "paper.order.fill":
+                        instrument = _instrument_from_payload(
+                            _strict_mapping(row.payload.get("instrument"))
+                        )
+                        instrument_id = _instrument_id(instrument)
+                        previous_instrument = fill_instruments.get(instrument_id)
+                        if (
+                            previous_instrument is not None
+                            and previous_instrument != instrument
+                        ):
+                            raise ValueError
+                        fill_instruments[instrument_id] = instrument
+                    pending_activity.append(row)
+            if not committed or rows[-1].kind != "paper.state.committed":
+                raise ValueError
+            configuration, latest_state = committed[-1]
+            if any(item != configuration for item, _ in committed):
+                raise ValueError
+            if latest_state.event_sequence != len(rows):
+                raise ValueError
+            if starting_cash is not None and starting_cash != configuration.starting_cash:
+                raise ValueError
+            if currency is not None and currency != configuration.currency:
+                raise ValueError
+            if fill_model is not None and fill_model.costs != configuration.costs:
+                raise ValueError
+            if (
+                max_volume_participation is not None
+                and max_volume_participation != configuration.max_volume_participation
+            ):
+                raise ValueError
+            broker = cls(
+                fill_model=FillModel(costs=configuration.costs),
+                starting_cash=configuration.starting_cash,
+                currency=configuration.currency,
+                max_volume_participation=configuration.max_volume_participation,
+                audit_log=audit_log,
+                durable=True,
+                session_id=configuration.session_id,
+            )
+            broker._state = latest_state
+            broker._audit_events = [
+                _paper_event_from_record(row)
+                for row in rows
+                if row.kind != "paper.state.committed"
+            ]
+            return broker
+        except (AttributeError, KeyError, TypeError, ValueError, ArithmeticError) as error:
+            raise ValueError("invalid durable paper stream") from error
 
 
 def _stage_transition(
@@ -895,7 +1230,7 @@ def _audit_payload(event: PaperAuditEvent) -> Mapping[str, object]:
     return payload
 
 
-def _validate_intent(intent: object) -> None:
+def _validate_intent(intent: object, *, snapshot: MarketSnapshot) -> None:
     if not isinstance(intent, OrderIntent):
         raise ValueError("intent must be an OrderIntent")
     for identifier, name in (
@@ -928,6 +1263,20 @@ def _validate_intent(intent: object) -> None:
     }[intent.order_type]
     if (intent.limit_price is not None, intent.trigger_price is not None) != expected:
         raise ValueError("order type requires its exact limit/trigger fields")
+    if intent.stop_loss is None or intent.take_profit is None:
+        raise ValueError("paper entries require stop_loss and take_profit")
+    if intent.time_in_force != "day":
+        raise ValueError("paper time_in_force must be day")
+    if intent.product != "cash":
+        raise ValueError("paper product must be cash")
+    if intent.session != "regular":
+        raise ValueError("paper session must be regular")
+    if (
+        not isinstance(intent.snapshot_hash, str)
+        or _SNAPSHOT_HASH.fullmatch(intent.snapshot_hash) is None
+    ):
+        raise ValueError("snapshot_hash must be a lowercase sha256 digest")
+    _validate_protective_prices(intent, snapshot)
     created_at = _aware_utc(intent.created_at, "intent created_at")
     expires_at = _aware_utc(intent.expires_at, "intent expires_at")
     if expires_at <= created_at:
@@ -939,6 +1288,13 @@ def _validate_snapshot(snapshot: object, *, expected_instrument_id: str) -> None
         raise ValueError("snapshot must be a MarketSnapshot")
     if snapshot.instrument_id != expected_instrument_id:
         raise ValueError("snapshot instrument identity must match the order")
+    if (
+        not isinstance(snapshot.provider, str)
+        or _IDENTIFIER.fullmatch(snapshot.provider) is None
+    ):
+        raise ValueError("snapshot provider must be a safe identifier")
+    if type(snapshot.max_age_seconds) is not int or snapshot.max_age_seconds < 0:
+        raise ValueError("snapshot max_age_seconds must be a nonnegative integer")
     observed_at = _aware_utc(snapshot.observed_at, "snapshot observed_at")
     source_at = _aware_utc(snapshot.source_at, "snapshot source_at")
     if source_at > observed_at:
@@ -964,6 +1320,35 @@ def _validate_snapshot(snapshot: object, *, expected_instrument_id: str) -> None
         previous_at = at
     if snapshot.bars[-1].at.astimezone(UTC) != source_at:
         raise ValueError("snapshot source timestamp must equal its latest bar")
+
+
+def _validate_protective_prices(
+    intent: OrderIntent,
+    snapshot: MarketSnapshot,
+) -> None:
+    assert intent.stop_loss is not None and intent.take_profit is not None
+    references: tuple[Decimal, ...]
+    if intent.order_type is OrderType.MARKET:
+        references = (snapshot.bars[-1].close,)
+    elif intent.order_type is OrderType.LIMIT:
+        references = (cast(Decimal, intent.limit_price),)
+    elif intent.order_type is OrderType.STOP:
+        references = (cast(Decimal, intent.trigger_price),)
+    else:
+        references = (
+            cast(Decimal, intent.trigger_price),
+            cast(Decimal, intent.limit_price),
+        )
+    if intent.side is Side.BUY and not (
+        intent.stop_loss < min(references)
+        and max(references) < intent.take_profit
+    ):
+        raise ValueError("buy protection must bracket every executable entry reference")
+    if intent.side is Side.SELL and not (
+        intent.stop_loss > max(references)
+        and min(references) > intent.take_profit
+    ):
+        raise ValueError("sell protection must bracket every executable entry reference")
 
 
 def _reference_price(
@@ -1036,6 +1421,19 @@ def _state_positions(state: _PaperState) -> tuple[Position, ...]:
     return state.ledger.snapshot(state.latest_at).positions
 
 
+def _active_instrument_ids(state: _PaperState) -> set[str]:
+    return {
+        record.order.instrument_id
+        for record in state.orders.values()
+        if record.order.status not in _CLOSED
+    }
+
+
+def _validate_watermark(state: _PaperState, at: datetime) -> None:
+    if state.latest_at is not None and at < state.latest_at:
+        raise ValueError("global operation chronology regression is not allowed")
+
+
 def _event_key(snapshot: MarketSnapshot) -> tuple[datetime, datetime, str]:
     return (
         snapshot.observed_at.astimezone(UTC),
@@ -1049,6 +1447,27 @@ def _instrument_id(instrument: object) -> str:
         raise ValueError("instrument must be an Instrument")
     if not isinstance(instrument.asset_class, AssetClass):
         raise ValueError("instrument asset class must be canonical")
+    if (
+        not isinstance(instrument.symbol, str)
+        or _VENUE_IDENTIFIER.fullmatch(instrument.symbol) is None
+        or not isinstance(instrument.venue, str)
+        or _VENUE_IDENTIFIER.fullmatch(instrument.venue) is None
+        or not isinstance(instrument.quote_currency, str)
+        or _CURRENCY.fullmatch(instrument.quote_currency) is None
+        or not isinstance(instrument.timezone, str)
+        or _TIMEZONE.fullmatch(instrument.timezone) is None
+        or (
+            instrument.session_calendar is not None
+            and (
+                not isinstance(instrument.session_calendar, str)
+                or _IDENTIFIER.fullmatch(instrument.session_calendar) is None
+            )
+        )
+    ):
+        raise ValueError("instrument metadata must contain safe bounded identifiers")
+    _positive_decimal(instrument.price_tick, "instrument price tick")
+    _positive_decimal(instrument.quantity_step, "instrument quantity step")
+    _positive_decimal(instrument.minimum_notional, "instrument minimum notional")
     return f"{instrument.symbol}@{instrument.venue}"
 
 
@@ -1106,7 +1525,45 @@ def _intent_payload(intent: OrderIntent) -> Mapping[str, object]:
 
 
 def _intent_from_payload(payload: Mapping[str, object]) -> OrderIntent:
-    return OrderIntent.model_validate(dict(payload))
+    _require_exact_keys(
+        payload,
+        {
+            "intent_id",
+            "instrument_id",
+            "side",
+            "quantity",
+            "notional",
+            "order_type",
+            "limit_price",
+            "trigger_price",
+            "stop_loss",
+            "take_profit",
+            "time_in_force",
+            "product",
+            "session",
+            "snapshot_hash",
+            "created_at",
+            "expires_at",
+        },
+    )
+    return OrderIntent(
+        intent_id=_strict_identifier(payload["intent_id"]),
+        instrument_id=_strict_identifier(payload["instrument_id"]),
+        side=Side(_strict_string(payload["side"])),
+        quantity=_parse_optional_decimal(payload["quantity"], positive=True),
+        notional=_parse_optional_decimal(payload["notional"], positive=True),
+        order_type=OrderType(_strict_string(payload["order_type"])),
+        limit_price=_parse_optional_decimal(payload["limit_price"], positive=True),
+        trigger_price=_parse_optional_decimal(payload["trigger_price"], positive=True),
+        stop_loss=_parse_optional_decimal(payload["stop_loss"], positive=True),
+        take_profit=_parse_optional_decimal(payload["take_profit"], positive=True),
+        time_in_force=_strict_string(payload["time_in_force"]),
+        product=_strict_string(payload["product"]),
+        session=_strict_string(payload["session"]),
+        snapshot_hash=_strict_string(payload["snapshot_hash"]),
+        created_at=_parse_datetime(payload["created_at"]),
+        expires_at=_parse_datetime(payload["expires_at"]),
+    )
 
 
 def _order_payload(order: BrokerOrder) -> Mapping[str, object]:
@@ -1124,6 +1581,43 @@ def _order_payload(order: BrokerOrder) -> Mapping[str, object]:
     }
 
 
+def _order_from_payload(payload: Mapping[str, object]) -> BrokerOrder:
+    _require_exact_keys(
+        payload,
+        {
+            "order_id",
+            "client_order_id",
+            "broker",
+            "instrument_id",
+            "status",
+            "requested_quantity",
+            "filled_quantity",
+            "average_fill_price",
+            "submitted_at",
+            "updated_at",
+        },
+    )
+    filled_quantity = _parse_decimal(payload["filled_quantity"], nonnegative=True)
+    return BrokerOrder(
+        order_id=_strict_identifier(payload["order_id"]),
+        client_order_id=_strict_identifier(payload["client_order_id"]),
+        broker=_strict_string(payload["broker"]),
+        instrument_id=_strict_identifier(payload["instrument_id"]),
+        status=OrderStatus(_strict_string(payload["status"])),
+        requested_quantity=_parse_optional_decimal(
+            payload["requested_quantity"],
+            positive=True,
+        ),
+        filled_quantity=filled_quantity,
+        average_fill_price=_parse_optional_decimal(
+            payload["average_fill_price"],
+            positive=True,
+        ),
+        submitted_at=_parse_datetime(payload["submitted_at"]),
+        updated_at=_parse_datetime(payload["updated_at"]),
+    )
+
+
 def _fill_payload(fill: Fill) -> Mapping[str, object]:
     return {
         "fill_id": fill.fill_id,
@@ -1135,6 +1629,32 @@ def _fill_payload(fill: Fill) -> Mapping[str, object]:
         "fee": _decimal_text(fill.fee),
         "filled_at": _datetime_text(fill.filled_at),
     }
+
+
+def _fill_from_payload(payload: Mapping[str, object]) -> Fill:
+    _require_exact_keys(
+        payload,
+        {
+            "fill_id",
+            "order_id",
+            "instrument_id",
+            "side",
+            "quantity",
+            "price",
+            "fee",
+            "filled_at",
+        },
+    )
+    return Fill(
+        fill_id=_strict_identifier(payload["fill_id"]),
+        order_id=_strict_identifier(payload["order_id"]),
+        instrument_id=_strict_identifier(payload["instrument_id"]),
+        side=Side(_strict_string(payload["side"])),
+        quantity=_parse_decimal(payload["quantity"], positive=True),
+        price=_parse_decimal(payload["price"], positive=True),
+        fee=_parse_decimal(payload["fee"], nonnegative=True),
+        filled_at=_parse_datetime(payload["filled_at"]),
+    )
 
 
 def _bar_payload(bar: Bar) -> Mapping[str, object]:
@@ -1159,9 +1679,312 @@ def _snapshot_payload(snapshot: MarketSnapshot) -> Mapping[str, object]:
     }
 
 
-def _state_payload(state: _PaperState) -> dict[str, object]:
+def _bar_from_payload(payload: Mapping[str, object]) -> Bar:
+    _require_exact_keys(payload, {"at", "open", "high", "low", "close", "volume"})
+    return Bar(
+        at=_parse_datetime(payload["at"]),
+        open=_parse_decimal(payload["open"], positive=True),
+        high=_parse_decimal(payload["high"], positive=True),
+        low=_parse_decimal(payload["low"], positive=True),
+        close=_parse_decimal(payload["close"], positive=True),
+        volume=_parse_decimal(payload["volume"], nonnegative=True),
+    )
+
+
+def _snapshot_from_payload(payload: Mapping[str, object]) -> MarketSnapshot:
+    _require_exact_keys(
+        payload,
+        {
+            "instrument_id",
+            "observed_at",
+            "source_at",
+            "bars",
+            "provider",
+            "max_age_seconds",
+        },
+    )
+    bars = tuple(
+        _bar_from_payload(_strict_mapping(item))
+        for item in _strict_sequence(payload["bars"])
+    )
+    max_age = _strict_nonnegative_int(payload["max_age_seconds"])
+    snapshot = MarketSnapshot(
+        instrument_id=_strict_identifier(payload["instrument_id"]),
+        observed_at=_parse_datetime(payload["observed_at"]),
+        source_at=_parse_datetime(payload["source_at"]),
+        bars=bars,
+        provider=_strict_identifier(payload["provider"]),
+        max_age_seconds=max_age,
+    )
+    _validate_snapshot(snapshot, expected_instrument_id=snapshot.instrument_id)
+    return snapshot
+
+
+def _instrument_payload(instrument: Instrument) -> Mapping[str, object]:
+    return {
+        "symbol": instrument.symbol,
+        "venue": instrument.venue,
+        "asset_class": instrument.asset_class.value,
+        "quote_currency": instrument.quote_currency,
+        "timezone": instrument.timezone,
+        "price_tick": _decimal_text(instrument.price_tick),
+        "quantity_step": _decimal_text(instrument.quantity_step),
+        "minimum_notional": _decimal_text(instrument.minimum_notional),
+        "session_calendar": instrument.session_calendar,
+    }
+
+
+def _instrument_from_payload(payload: Mapping[str, object]) -> Instrument:
+    _require_exact_keys(
+        payload,
+        {
+            "symbol",
+            "venue",
+            "asset_class",
+            "quote_currency",
+            "timezone",
+            "price_tick",
+            "quantity_step",
+            "minimum_notional",
+            "session_calendar",
+        },
+    )
+    session_calendar_value = payload["session_calendar"]
+    if session_calendar_value is not None:
+        session_calendar = _strict_identifier(session_calendar_value)
+    else:
+        session_calendar = None
+    instrument = Instrument(
+        symbol=_strict_string(payload["symbol"]),
+        venue=_strict_string(payload["venue"]),
+        asset_class=AssetClass(_strict_string(payload["asset_class"])),
+        quote_currency=_strict_string(payload["quote_currency"]),
+        timezone=_strict_string(payload["timezone"]),
+        price_tick=_parse_decimal(payload["price_tick"], positive=True),
+        quantity_step=_parse_decimal(payload["quantity_step"], positive=True),
+        minimum_notional=_parse_decimal(payload["minimum_notional"], positive=True),
+        session_calendar=session_calendar,
+    )
+    _instrument_id(instrument)
+    return instrument
+
+
+def _cost_payload(costs: CostModel) -> Mapping[str, object]:
+    latency_microseconds = (
+        costs.latency.days * 86_400_000_000
+        + costs.latency.seconds * 1_000_000
+        + costs.latency.microseconds
+    )
+    return {
+        "fee_bps": _decimal_text(costs.fee_bps),
+        "spread_bps": _decimal_text(costs.spread_bps),
+        "slippage_bps": _decimal_text(costs.slippage_bps),
+        "latency_microseconds": latency_microseconds,
+    }
+
+
+def _capabilities_payload() -> Mapping[str, object]:
     return {
         "schema_version": 1,
+        "broker": _PAPER_CAPABILITIES.broker,
+        "supported_asset_classes": sorted(
+            item.value for item in _PAPER_CAPABILITIES.supported_asset_classes
+        ),
+        "supported_order_types": sorted(
+            item.value for item in _PAPER_CAPABILITIES.supported_order_types
+        ),
+        "supports_fractional_quantity": _PAPER_CAPABILITIES.supports_fractional_quantity,
+        "supports_notional_orders": _PAPER_CAPABILITIES.supports_notional_orders,
+        "supports_partial_fills": _PAPER_CAPABILITIES.supports_partial_fills,
+        "supports_shorting": _PAPER_CAPABILITIES.supports_shorting,
+        "supports_leverage": _PAPER_CAPABILITIES.supports_leverage,
+        "supports_derivatives": _PAPER_CAPABILITIES.supports_derivatives,
+        "supports_cancel": _PAPER_CAPABILITIES.supports_cancel,
+        "is_paper": _PAPER_CAPABILITIES.is_paper,
+    }
+
+
+def _ledger_state_payload(ledger: PortfolioLedger) -> Mapping[str, object]:
+    state = ledger.export_state()
+    return {
+        "schema_version": 1,
+        "starting_cash": _decimal_text(state.starting_cash),
+        "currency": state.currency,
+        "cash": _decimal_text(state.cash),
+        "positions": [
+            {
+                "instrument_id": position.instrument_id,
+                "quantity": _decimal_text(position.quantity),
+                "average_price": _decimal_text(position.average_price),
+            }
+            for position in state.positions
+        ],
+        "market_prices": [
+            {"instrument_id": instrument_id, "price": _decimal_text(price)}
+            for instrument_id, price in state.market_prices
+        ],
+        "fill_ids": list(state.fill_ids),
+        "gross_realized_pnl": _decimal_text(state.gross_realized_pnl),
+        "fees": _decimal_text(state.fees),
+        "equity": _decimal_text(state.equity),
+        "peak_equity": _decimal_text(state.peak_equity),
+        "drawdown": _decimal_text(state.drawdown),
+    }
+
+
+def _configuration_from_payload(payload: Mapping[str, object]) -> _ReplayConfiguration:
+    if payload.get("schema_version") != 2:
+        raise ValueError
+    session_id = _strict_identifier(payload["session_id"])
+    configuration = _strict_mapping(payload["configuration"])
+    _require_exact_keys(
+        configuration,
+        {
+            "starting_cash",
+            "currency",
+            "cost_model",
+            "max_volume_participation",
+        },
+    )
+    cost_payload = _strict_mapping(configuration["cost_model"])
+    _require_exact_keys(
+        cost_payload,
+        {"fee_bps", "spread_bps", "slippage_bps", "latency_microseconds"},
+    )
+    latency = timedelta(
+        microseconds=_strict_nonnegative_int(cost_payload["latency_microseconds"])
+    )
+    costs = CostModel(
+        fee_bps=_parse_decimal(cost_payload["fee_bps"], nonnegative=True),
+        spread_bps=_parse_decimal(cost_payload["spread_bps"], nonnegative=True),
+        slippage_bps=_parse_decimal(cost_payload["slippage_bps"], nonnegative=True),
+        latency=latency,
+    )
+    starting_cash = _parse_decimal(configuration["starting_cash"], positive=True)
+    currency = _strict_string(configuration["currency"])
+    participation = _parse_decimal(
+        configuration["max_volume_participation"],
+        positive=True,
+    )
+    if _CURRENCY.fullmatch(currency) is None or participation > Decimal("1"):
+        raise ValueError
+    _validate_capabilities_payload(_strict_mapping(payload["capabilities"]))
+    return _ReplayConfiguration(
+        session_id=session_id,
+        starting_cash=starting_cash,
+        currency=currency,
+        costs=costs,
+        max_volume_participation=participation,
+    )
+
+
+def _validate_capabilities_payload(payload: Mapping[str, object]) -> None:
+    expected = _capabilities_payload()
+    _require_exact_keys(payload, set(expected))
+    if _strict_nonnegative_int(payload["schema_version"]) != 1:
+        raise ValueError
+    for name in (
+        "supports_fractional_quantity",
+        "supports_notional_orders",
+        "supports_partial_fills",
+        "supports_shorting",
+        "supports_leverage",
+        "supports_derivatives",
+        "supports_cancel",
+        "is_paper",
+    ):
+        if type(payload[name]) is not bool or payload[name] is not expected[name]:
+            raise ValueError
+    if (
+        _strict_string(payload["broker"]) != expected["broker"]
+        or tuple(_strict_sequence(payload["supported_asset_classes"]))
+        != tuple(cast(list[str], expected["supported_asset_classes"]))
+        or tuple(_strict_sequence(payload["supported_order_types"]))
+        != tuple(cast(list[str], expected["supported_order_types"]))
+    ):
+        raise ValueError
+
+
+def _ledger_state_from_payload(payload: Mapping[str, object]) -> PortfolioLedgerState:
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "starting_cash",
+            "currency",
+            "cash",
+            "positions",
+            "market_prices",
+            "fill_ids",
+            "gross_realized_pnl",
+            "fees",
+            "equity",
+            "peak_equity",
+            "drawdown",
+        },
+    )
+    if _strict_nonnegative_int(payload["schema_version"]) != 1:
+        raise ValueError
+    positions = tuple(
+        _ledger_position_from_payload(_strict_mapping(item))
+        for item in _strict_sequence(payload["positions"])
+    )
+    prices: list[tuple[str, Decimal]] = []
+    for item in _strict_sequence(payload["market_prices"]):
+        raw = _strict_mapping(item)
+        _require_exact_keys(raw, {"instrument_id", "price"})
+        prices.append(
+            (
+                _strict_identifier(raw["instrument_id"]),
+                _parse_decimal(raw["price"], positive=True),
+            )
+        )
+    fill_ids = tuple(_strict_identifier(item) for item in _strict_sequence(payload["fill_ids"]))
+    return PortfolioLedgerState(
+        starting_cash=_parse_decimal(payload["starting_cash"], positive=True),
+        currency=_strict_string(payload["currency"]),
+        cash=_parse_decimal(payload["cash"]),
+        positions=positions,
+        market_prices=tuple(prices),
+        fill_ids=fill_ids,
+        gross_realized_pnl=_parse_decimal(payload["gross_realized_pnl"]),
+        fees=_parse_decimal(payload["fees"], nonnegative=True),
+        equity=_parse_decimal(payload["equity"]),
+        peak_equity=_parse_decimal(payload["peak_equity"]),
+        drawdown=_parse_decimal(payload["drawdown"], nonnegative=True),
+    )
+
+
+def _ledger_position_from_payload(
+    payload: Mapping[str, object],
+) -> PortfolioLedgerPositionState:
+    _require_exact_keys(payload, {"instrument_id", "quantity", "average_price"})
+    return PortfolioLedgerPositionState(
+        instrument_id=_strict_identifier(payload["instrument_id"]),
+        quantity=_parse_decimal(payload["quantity"], positive=True),
+        average_price=_parse_decimal(payload["average_price"], positive=True),
+    )
+
+
+def _state_payload(
+    state: _PaperState,
+    *,
+    session_id: str,
+    starting_cash: Decimal,
+    currency: str,
+    costs: CostModel,
+    max_volume_participation: Decimal,
+) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "session_id": session_id,
+        "configuration": {
+            "starting_cash": _decimal_text(starting_cash),
+            "currency": currency,
+            "cost_model": _cost_payload(costs),
+            "max_volume_participation": _decimal_text(max_volume_participation),
+        },
+        "capabilities": _capabilities_payload(),
         "event_sequence": state.event_sequence,
         "fill_sequence": state.fill_sequence,
         "latest_at": _datetime_text(state.latest_at) if state.latest_at is not None else None,
@@ -1196,76 +2019,612 @@ def _state_payload(state: _PaperState) -> dict[str, object]:
         "market_prices": {
             key: _decimal_text(value) for key, value in sorted(state.market_prices.items())
         },
+        "instruments": [
+            _instrument_payload(instrument)
+            for _, instrument in sorted(state.instruments.items())
+        ],
+        "ledger": _ledger_state_payload(state.ledger),
     }
 
 
 def _state_from_payload(
     payload: Mapping[str, object],
     *,
-    starting_cash: Decimal,
-    currency: str,
+    configuration: _ReplayConfiguration,
 ) -> _PaperState:
-    if payload.get("schema_version") != 1:
-        raise ValueError("unsupported paper state schema")
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "session_id",
+            "configuration",
+            "capabilities",
+            "event_sequence",
+            "fill_sequence",
+            "latest_at",
+            "last_event_key",
+            "orders",
+            "snapshots",
+            "fills",
+            "market_prices",
+            "instruments",
+            "ledger",
+        },
+    )
+    if _configuration_from_payload(payload) != configuration:
+        raise ValueError
+    event_sequence = _strict_nonnegative_int(payload["event_sequence"])
+    fill_sequence = _strict_nonnegative_int(payload["fill_sequence"])
+
+    snapshots: dict[str, MarketSnapshot] = {}
+    for raw_snapshot in _strict_sequence(payload["snapshots"]):
+        snapshot = _snapshot_from_payload(_strict_mapping(raw_snapshot))
+        if snapshot.instrument_id in snapshots:
+            raise ValueError
+        snapshots[snapshot.instrument_id] = snapshot
+
     orders: dict[str, _PaperOrderRecord] = {}
     client_orders: dict[str, str] = {}
-    raw_orders = cast(Iterable[Mapping[str, object]], payload["orders"])
-    for raw in raw_orders:
-        intent = _intent_from_payload(cast(Mapping[str, object], raw["intent"]))
-        order = BrokerOrder.model_validate(dict(cast(Mapping[str, object], raw["order"])))
+    for raw_value in _strict_sequence(payload["orders"]):
+        raw = _strict_mapping(raw_value)
+        _require_exact_keys(
+            raw,
+            {
+                "intent",
+                "order",
+                "submitted_source_at",
+                "remaining_notional",
+                "cumulative_filled_notional",
+                "cumulative_fees",
+                "stop_triggered",
+            },
+        )
+        intent = _intent_from_payload(_strict_mapping(raw["intent"]))
+        order_snapshot = snapshots.get(intent.instrument_id)
+        if order_snapshot is None:
+            raise ValueError
+        order = _order_from_payload(_strict_mapping(raw["order"]))
+        submitted_source_at = _parse_datetime(raw["submitted_source_at"])
+        submission_bars = tuple(
+            bar for bar in order_snapshot.bars if bar.at <= submitted_source_at
+        )
+        if not submission_bars or submission_bars[-1].at != submitted_source_at:
+            raise ValueError
+        _validate_intent(
+            intent,
+            snapshot=order_snapshot.model_copy(update={"bars": submission_bars}),
+        )
+        if (
+            order.order_id in orders
+            or intent.intent_id in client_orders
+            or order.order_id != _paper_order_id(configuration.session_id, intent.intent_id)
+            or order.client_order_id != intent.intent_id
+            or order.broker != _PAPER_CAPABILITIES.broker
+            or order.instrument_id != intent.instrument_id
+            or order.requested_quantity != intent.quantity
+            or order.updated_at < order.submitted_at
+        ):
+            raise ValueError
+        remaining_notional = _parse_optional_decimal(
+            raw["remaining_notional"],
+            nonnegative=True,
+        )
+        cumulative_notional = _parse_decimal(
+            raw["cumulative_filled_notional"],
+            nonnegative=True,
+        )
+        cumulative_fees = _parse_decimal(raw["cumulative_fees"], nonnegative=True)
+        stop_triggered = raw["stop_triggered"]
+        if type(stop_triggered) is not bool:
+            raise ValueError
+        if (intent.notional is None) is not (remaining_notional is None):
+            raise ValueError
         record = _PaperOrderRecord(
             intent=intent,
             order=order,
-            submitted_source_at=datetime.fromisoformat(cast(str, raw["submitted_source_at"])),
-            remaining_notional=_decimal_or_none(raw.get("remaining_notional")),
-            cumulative_filled_notional=Decimal(
-                cast(str, raw["cumulative_filled_notional"])
-            ),
-            cumulative_fees=Decimal(cast(str, raw["cumulative_fees"])),
-            stop_triggered=cast(bool, raw["stop_triggered"]),
+            submitted_source_at=submitted_source_at,
+            remaining_notional=remaining_notional,
+            cumulative_filled_notional=cumulative_notional,
+            cumulative_fees=cumulative_fees,
+            stop_triggered=stop_triggered,
         )
         orders[order.order_id] = record
         client_orders[intent.intent_id] = order.order_id
-    snapshots: dict[str, MarketSnapshot] = {}
-    for raw_snapshot in cast(Iterable[Mapping[str, object]], payload["snapshots"]):
-        snapshot = MarketSnapshot.model_validate(dict(raw_snapshot))
-        snapshots[snapshot.instrument_id] = snapshot
-    fills = [
-        Fill.model_validate(dict(raw_fill))
-        for raw_fill in cast(Iterable[Mapping[str, object]], payload["fills"])
-    ]
-    ledger = PortfolioLedger(starting_cash=starting_cash, currency=currency)
-    for fill in fills:
-        ledger.apply_fill(fill)
+
+    fills: list[Fill] = []
+    fill_ids: set[str] = set()
+    for raw_fill in _strict_sequence(payload["fills"]):
+        fill = _fill_from_payload(_strict_mapping(raw_fill))
+        if fill.fill_id in fill_ids:
+            raise ValueError
+        fills.append(fill)
+        fill_ids.add(fill.fill_id)
+    if fill_sequence != len(fills):
+        raise ValueError
+
     prices = {
-        key: Decimal(cast(str, value))
-        for key, value in cast(Mapping[str, object], payload["market_prices"]).items()
+        _strict_identifier(key): _parse_decimal(value, positive=True)
+        for key, value in _strict_mapping(payload["market_prices"]).items()
     }
-    latest_raw = payload.get("latest_at")
-    latest_at = datetime.fromisoformat(cast(str, latest_raw)) if latest_raw is not None else None
-    if prices and latest_at is not None:
-        ledger.mark(prices, latest_at)
-    key_raw = payload.get("last_event_key")
+    instruments: dict[str, Instrument] = {}
+    for raw_instrument in _strict_sequence(payload["instruments"]):
+        instrument = _instrument_from_payload(_strict_mapping(raw_instrument))
+        instrument_id = _instrument_id(instrument)
+        if instrument_id in instruments:
+            raise ValueError
+        instruments[instrument_id] = instrument
+
+    ledger_state = _ledger_state_from_payload(_strict_mapping(payload["ledger"]))
+    if (
+        ledger_state.starting_cash != configuration.starting_cash
+        or ledger_state.currency != configuration.currency
+        or dict(ledger_state.market_prices) != prices
+        or set(ledger_state.fill_ids) != fill_ids
+    ):
+        raise ValueError
+    ledger = PortfolioLedger.from_state(ledger_state)
+
+    latest_raw = payload["latest_at"]
+    latest_at = _parse_datetime(latest_raw) if latest_raw is not None else None
+    key_raw = payload["last_event_key"]
     last_event_key = None
     if key_raw is not None:
-        key_values = tuple(cast(Iterable[object], key_raw))
+        key_values = _strict_sequence(key_raw)
+        if len(key_values) != 3:
+            raise ValueError
         last_event_key = (
-            datetime.fromisoformat(cast(str, key_values[0])),
-            datetime.fromisoformat(cast(str, key_values[1])),
-            cast(str, key_values[2]),
+            _parse_datetime(key_values[0]),
+            _parse_datetime(key_values[1]),
+            _strict_identifier(key_values[2]),
         )
+
+    _validate_replayed_relationships(
+        orders=orders,
+        fills=fills,
+        snapshots=snapshots,
+        instruments=instruments,
+        ledger_state=ledger_state,
+        latest_at=latest_at,
+    )
     return _PaperState(
         orders=orders,
         client_orders=client_orders,
         snapshots=snapshots,
         fills=fills,
-        event_sequence=cast(int, payload["event_sequence"]),
-        fill_sequence=cast(int, payload["fill_sequence"]),
+        event_sequence=event_sequence,
+        fill_sequence=fill_sequence,
         ledger=ledger,
         market_prices=prices,
+        instruments=instruments,
         latest_at=latest_at,
         last_event_key=last_event_key,
     )
+
+
+def _validate_replayed_relationships(
+    *,
+    orders: Mapping[str, _PaperOrderRecord],
+    fills: list[Fill],
+    snapshots: Mapping[str, MarketSnapshot],
+    instruments: Mapping[str, Instrument],
+    ledger_state: PortfolioLedgerState,
+    latest_at: datetime | None,
+) -> None:
+    if latest_at is None:
+        raise ValueError
+    fills_by_order: dict[str, list[Fill]] = {order_id: [] for order_id in orders}
+    for fill in fills:
+        record = orders.get(fill.order_id)
+        if (
+            record is None
+            or fill.instrument_id != record.order.instrument_id
+            or fill.side is not record.intent.side
+            or fill.filled_at < record.order.submitted_at
+            or fill.filled_at > latest_at
+            or fill.instrument_id not in instruments
+        ):
+            raise ValueError
+        fills_by_order[fill.order_id].append(fill)
+    for order_id, record in orders.items():
+        order_fills = fills_by_order[order_id]
+        filled_quantity = sum((fill.quantity for fill in order_fills), Decimal("0"))
+        filled_notional = sum(
+            (fill.quantity * fill.price for fill in order_fills),
+            Decimal("0"),
+        )
+        fees = sum((fill.fee for fill in order_fills), Decimal("0"))
+        average = (
+            filled_notional / filled_quantity
+            if filled_quantity > Decimal("0")
+            else None
+        )
+        if (
+            record.order.filled_quantity != filled_quantity
+            or record.order.average_fill_price != average
+            or record.cumulative_filled_notional != filled_notional
+            or record.cumulative_fees != fees
+            or record.order.updated_at > latest_at
+            or record.submitted_source_at
+            > snapshots[record.order.instrument_id].source_at
+        ):
+            raise ValueError
+        if record.intent.quantity is not None:
+            remaining = record.intent.quantity - filled_quantity
+            if remaining < Decimal("0") or record.remaining_notional is not None:
+                raise ValueError
+        else:
+            assert record.intent.notional is not None
+            remaining = record.intent.notional - filled_notional
+            if remaining < Decimal("0") or record.remaining_notional != remaining:
+                raise ValueError
+        is_complete = remaining == Decimal("0")
+        if (
+            (record.order.status is OrderStatus.FILLED) is not is_complete
+            or (
+                record.order.status is OrderStatus.PARTIALLY_FILLED
+                and filled_quantity == Decimal("0")
+            )
+        ):
+            raise ValueError
+
+    reconstructed = PortfolioLedger(
+        starting_cash=ledger_state.starting_cash,
+        currency=ledger_state.currency,
+    )
+    for fill in fills:
+        reconstructed.apply_fill(fill)
+    reconstructed_state = reconstructed.export_state()
+    if (
+        reconstructed_state.cash != ledger_state.cash
+        or reconstructed_state.positions != ledger_state.positions
+        or reconstructed_state.fill_ids != ledger_state.fill_ids
+        or reconstructed_state.gross_realized_pnl != ledger_state.gross_realized_pnl
+        or reconstructed_state.fees != ledger_state.fees
+    ):
+        raise ValueError
+
+
+def _require_exact_keys(payload: Mapping[str, object], expected: set[str]) -> None:
+    if set(payload) != expected:
+        raise ValueError
+
+
+def _strict_mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise ValueError
+    return cast(Mapping[str, object], value)
+
+
+def _strict_sequence(value: object) -> tuple[object, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError
+    return tuple(value)
+
+
+def _strict_string(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > 256:
+        raise ValueError
+    return value
+
+
+def _strict_identifier(value: object) -> str:
+    result = _strict_string(value)
+    if _IDENTIFIER.fullmatch(result) is None:
+        raise ValueError
+    return result
+
+
+def _strict_nonnegative_int(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError
+    return value
+
+
+def _parse_decimal(
+    value: object,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> Decimal:
+    if (
+        positive and nonnegative
+        or not isinstance(value, str)
+        or not value
+        or len(value) > 128
+        or re.fullmatch(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", value) is None
+    ):
+        raise ValueError
+    result = Decimal(value)
+    if (
+        not result.is_finite()
+        or (positive and result <= Decimal("0"))
+        or (nonnegative and result < Decimal("0"))
+    ):
+        raise ValueError
+    return result
+
+
+def _parse_optional_decimal(
+    value: object,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> Decimal | None:
+    if value is None:
+        return None
+    return _parse_decimal(value, positive=positive, nonnegative=nonnegative)
+
+
+def _parse_datetime(value: object) -> datetime:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        raise ValueError
+    result = datetime.fromisoformat(value)
+    if result.tzinfo is None or result.utcoffset() is None:
+        raise ValueError
+    normalized = result.astimezone(UTC)
+    if _datetime_text(normalized) != value:
+        raise ValueError
+    return normalized
+
+
+def _validate_replay_group(
+    records: tuple[EventRecord, ...],
+    *,
+    state: _PaperState,
+    previous_state: _PaperState | None,
+    session_id: str,
+) -> None:
+    if not records and previous_state is None:
+        raise ValueError
+    statuses = (
+        {}
+        if previous_state is None
+        else {
+            order_id: record.order.status
+            for order_id, record in previous_state.orders.items()
+        }
+    )
+    if previous_state is not None:
+        if (
+            not set(previous_state.orders).issubset(state.orders)
+            or state.fills[: len(previous_state.fills)] != previous_state.fills
+            or any(
+                state.instruments.get(instrument_id) != instrument
+                for instrument_id, instrument in previous_state.instruments.items()
+            )
+        ):
+            raise ValueError
+        for order_id, previous in previous_state.orders.items():
+            current = state.orders[order_id]
+            if (
+                current.intent != previous.intent
+                or current.order.order_id != previous.order.order_id
+                or current.order.client_order_id != previous.order.client_order_id
+                or current.order.instrument_id != previous.order.instrument_id
+                or current.order.submitted_at != previous.order.submitted_at
+                or current.order.requested_quantity != previous.order.requested_quantity
+                or current.order.filled_quantity < previous.order.filled_quantity
+            ):
+                raise ValueError
+
+    authoritative_edges = {
+        (
+            _strict_identifier(record.payload.get("broker_order_id")),
+            OrderStatus(_strict_string(record.payload.get("prior_status"))),
+            OrderStatus(_strict_string(record.payload.get("new_status"))),
+        )
+        for record in records
+        if record.kind == "paper.order.fill"
+        and record.payload.get("source") == "AUTHORITATIVE_RECONCILIATION"
+    }
+    last_transition: dict[str, tuple[OrderStatus, OrderStatus]] = {}
+    fills_by_id = {fill.fill_id: fill for fill in state.fills}
+    for row in records:
+        payload = _strict_mapping(row.payload)
+        client_id = _strict_identifier(payload.get("client_intent_id"))
+        broker_id = _strict_identifier(payload.get("broker_order_id"))
+        if row.kind == "paper.snapshot.duplicate":
+            _require_exact_keys(
+                payload,
+                {"client_intent_id", "broker_order_id", "outcome"},
+            )
+            if (
+                client_id != broker_id
+                or client_id not in state.snapshots
+                or payload["outcome"] != "IGNORED"
+            ):
+                raise ValueError
+            continue
+
+        current_record = state.orders.get(broker_id)
+        if (
+            current_record is None
+            or current_record.order.client_order_id != client_id
+            or broker_id != _paper_order_id(session_id, client_id)
+        ):
+            raise ValueError
+
+        if row.kind == "paper.order.submitted":
+            _require_exact_keys(
+                payload,
+                {
+                    "client_intent_id",
+                    "broker_order_id",
+                    "instrument_id",
+                    "side",
+                    "order_type",
+                    "intent",
+                    "new_status",
+                },
+            )
+            intent = _intent_from_payload(_strict_mapping(payload["intent"]))
+            if (
+                broker_id in statuses
+                or intent != current_record.intent
+                or payload["instrument_id"] != intent.instrument_id
+                or payload["side"] != intent.side.value
+                or payload["order_type"] != intent.order_type.value
+                or payload["new_status"] != OrderStatus.PROPOSED.value
+            ):
+                raise ValueError
+            statuses[broker_id] = OrderStatus.PROPOSED
+            continue
+
+        prior = OrderStatus(_strict_string(payload.get("prior_status")))
+        new = OrderStatus(_strict_string(payload.get("new_status")))
+        if row.kind == "paper.order.transition":
+            _require_exact_keys(
+                payload,
+                {"client_intent_id", "broker_order_id", "prior_status", "new_status"},
+            )
+            if statuses.get(broker_id) is not prior:
+                raise ValueError
+            if (broker_id, prior, new) not in authoritative_edges:
+                OrderStateMachine.transition(
+                    prior,
+                    new,
+                    at=row.occurred_at,
+                    emit=lambda _event: None,
+                    client_intent_id=client_id,
+                    broker_order_id=broker_id,
+                )
+            elif prior is not OrderStatus.UNKNOWN or new not in {
+                OrderStatus.PARTIALLY_FILLED,
+                OrderStatus.FILLED,
+            }:
+                raise ValueError
+            statuses[broker_id] = new
+            last_transition[broker_id] = (prior, new)
+            continue
+
+        if row.kind in {"paper.order.duplicate", "paper.order.duplicate_conflict"}:
+            _require_exact_keys(
+                payload,
+                {
+                    "client_intent_id",
+                    "broker_order_id",
+                    "outcome",
+                    "prior_status",
+                    "new_status",
+                },
+            )
+            expected = (
+                "IDEMPOTENT_REPLAY"
+                if row.kind == "paper.order.duplicate"
+                else "CONFLICT"
+            )
+            if (
+                prior is not new
+                or statuses.get(broker_id) is not prior
+                or payload["outcome"] != expected
+            ):
+                raise ValueError
+            continue
+
+        if row.kind == "paper.order.rejected":
+            _require_exact_keys(
+                payload,
+                {
+                    "client_intent_id",
+                    "broker_order_id",
+                    "reason_code",
+                    "prior_status",
+                    "new_status",
+                },
+            )
+            reason = payload["reason_code"]
+            if (
+                not isinstance(reason, str)
+                or _REASON_CODE.fullmatch(reason) is None
+                or statuses.get(broker_id) is not prior
+                or new is not OrderStatus.REJECTED
+            ):
+                raise ValueError
+            continue
+
+        if row.kind == "paper.order.stop_triggered":
+            _require_exact_keys(
+                payload,
+                {
+                    "client_intent_id",
+                    "broker_order_id",
+                    "trigger_price",
+                    "prior_status",
+                    "new_status",
+                },
+            )
+            if (
+                prior is not new
+                or statuses.get(broker_id) is not prior
+                or _parse_decimal(payload["trigger_price"], positive=True)
+                != current_record.intent.trigger_price
+            ):
+                raise ValueError
+            continue
+
+        if row.kind != "paper.order.fill":
+            raise ValueError
+        authoritative = "source" in payload
+        common_fill_keys = {
+            "client_intent_id",
+            "broker_order_id",
+            "fill_id",
+            "quantity",
+            "price",
+            "fee",
+            "instrument",
+            "cumulative_filled_quantity",
+            "cumulative_filled_notional",
+            "cumulative_fees",
+            "prior_status",
+            "new_status",
+        }
+        _require_exact_keys(
+            payload,
+            common_fill_keys
+            | (
+                {"source"}
+                if authoritative
+                else {"remaining_quantity", "requested_notional", "remaining_notional"}
+            ),
+        )
+        fill_id = _strict_identifier(payload["fill_id"])
+        fill = fills_by_id.get(fill_id)
+        instrument = _instrument_from_payload(_strict_mapping(payload["instrument"]))
+        if (
+            fill is None
+            or fill.order_id != broker_id
+            or fill.quantity != _parse_decimal(payload["quantity"], positive=True)
+            or fill.price != _parse_decimal(payload["price"], positive=True)
+            or fill.fee != _parse_decimal(payload["fee"], nonnegative=True)
+            or state.instruments.get(fill.instrument_id) != instrument
+            or statuses.get(broker_id) is not new
+            or (
+                authoritative
+                and (
+                    payload["source"] != "AUTHORITATIVE_RECONCILIATION"
+                    or prior is not OrderStatus.UNKNOWN
+                )
+            )
+            or (
+                not authoritative
+                and last_transition.get(broker_id) != (prior, new)
+            )
+        ):
+            raise ValueError
+        _parse_decimal(payload["cumulative_filled_quantity"], positive=True)
+        _parse_decimal(payload["cumulative_filled_notional"], positive=True)
+        _parse_decimal(payload["cumulative_fees"], nonnegative=True)
+        if not authoritative:
+            _parse_decimal(payload["remaining_quantity"], nonnegative=True)
+            _parse_optional_decimal(payload["requested_notional"], positive=True)
+            _parse_optional_decimal(payload["remaining_notional"], nonnegative=True)
+
+    if set(statuses) != set(state.orders) or any(
+        statuses[order_id] is not record.order.status
+        for order_id, record in state.orders.items()
+    ):
+        raise ValueError
 
 
 def _paper_event_from_record(row: EventRecord) -> PaperAuditEvent:

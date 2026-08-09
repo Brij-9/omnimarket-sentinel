@@ -246,6 +246,8 @@ class _PendingOrder:
     limit_price: Decimal | None = None
     approved_notional: Decimal | None = None
     approved_stop_risk: Decimal | None = None
+    filled_notional: Decimal = Decimal("0")
+    filled_stop_risk: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,7 +256,13 @@ class _OpenTrade:
     stop_loss: Decimal
     take_profit: Decimal
     opened_index: int
-    entry_fill: Fill
+    opened_at: datetime
+    entry_quantity: Decimal
+    entry_notional: Decimal
+    entry_fees: Decimal
+    exit_quantity: Decimal = Decimal("0")
+    exit_notional: Decimal = Decimal("0")
+    exit_fees: Decimal = Decimal("0")
 
 
 class BacktestEngine:
@@ -266,11 +274,18 @@ class BacktestEngine:
         costs: CostModel | None = None,
         fill_model: FillModel | None = None,
         risk_policy: RiskPolicy | None = None,
+        max_volume_participation: Decimal = Decimal("1"),
     ) -> None:
         if costs is not None and fill_model is not None:
             raise ValueError("provide costs or fill_model, not both")
         self.fill_model = FillModel(costs=costs) if fill_model is None else fill_model
         self.risk_policy = RiskPolicy.safe_defaults() if risk_policy is None else risk_policy
+        if (
+            not _finite_positive(max_volume_participation)
+            or max_volume_participation > Decimal("1")
+        ):
+            raise ValueError("max_volume_participation must be a Decimal in (0, 1]")
+        self.max_volume_participation = max_volume_participation
 
     def run(
         self,
@@ -310,6 +325,28 @@ class BacktestEngine:
 
         for index, bar in enumerate(bars):
             if (
+                open_trade is not None
+                and pending is not None
+                and pending.side is Side.BUY
+                and index > open_trade.opened_index
+            ):
+                exit_reason = _protective_exit_reason(
+                    open_trade=open_trade,
+                    bar=bar,
+                    index=index,
+                    metadata=metadata,
+                )
+                if exit_reason is not None:
+                    events.append(BacktestEvent(at=bar.at, kind="ENTRY_REMAINDER_CANCELLED"))
+                    pending = _exit_order(
+                        strategy_id=metadata.strategy_id,
+                        bar=bar,
+                        index=index,
+                        quantity=open_trade.quantity,
+                        reason=exit_reason,
+                    )
+                    events.append(BacktestEvent(at=bar.at, kind=exit_reason))
+            if (
                 pending is not None
                 and index > pending.submitted_index
                 and self.fill_model.can_fill(
@@ -317,13 +354,28 @@ class BacktestEngine:
                     event_at=bar.at,
                 )
             ):
-                fill = _create_pending_fill(
-                    pending=pending,
-                    bar=bar,
-                    fill_model=self.fill_model,
-                    instrument=instrument,
-                    fill_id=f"backtest-fill-{len(fills) + 1}",
-                    available_cash=ledger.cash,
+                liquidity = self.fill_model.liquidity_budget(
+                    event_volume=bar.volume,
+                    max_participation=self.max_volume_participation,
+                    quantity_step=instrument.quantity_step,
+                )
+                allocated = self.fill_model.allocate_quantity(
+                    remaining_quantity=pending.quantity,
+                    available_liquidity=liquidity,
+                    quantity_step=instrument.quantity_step,
+                )
+                fill = (
+                    None
+                    if allocated == Decimal("0")
+                    else _create_pending_fill(
+                        pending=pending,
+                        quantity=allocated,
+                        bar=bar,
+                        fill_model=self.fill_model,
+                        instrument=instrument,
+                        fill_id=f"backtest-fill-{len(fills) + 1}",
+                        available_cash=ledger.cash,
+                    )
                 )
                 if fill is None:
                     events.append(BacktestEvent(at=bar.at, kind="ORDER_NOT_EXECUTABLE"))
@@ -338,70 +390,87 @@ class BacktestEngine:
                     events.append(BacktestEvent(at=bar.at, kind="FILL"))
                     if fill.side is Side.BUY:
                         assert pending.stop_loss is not None and pending.take_profit is not None
-                        open_trade = _OpenTrade(
-                            quantity=fill.quantity,
-                            stop_loss=pending.stop_loss,
-                            take_profit=pending.take_profit,
-                            opened_index=index,
-                            entry_fill=fill,
+                        open_trade = _apply_entry_fill(
+                            open_trade=open_trade,
+                            pending=pending,
+                            fill=fill,
+                            index=index,
+                        )
+                        filled_notional = pending.filled_notional + fill.quantity * fill.price
+                        filled_stop_risk = pending.filled_stop_risk + fill.quantity * (
+                            fill.price - pending.stop_loss
                         )
                     else:
                         assert open_trade is not None
-                        fees = open_trade.entry_fill.fee + fill.fee
-                        completed_trades.append(
-                            CompletedTrade(
-                                opened_at=open_trade.entry_fill.filled_at,
-                                closed_at=fill.filled_at,
-                                quantity=fill.quantity,
-                                entry_price=open_trade.entry_fill.price,
-                                exit_price=fill.price,
-                                fees=fees,
-                                net_pnl=(fill.price - open_trade.entry_fill.price)
-                                * fill.quantity
-                                - fees,
-                            )
+                        open_trade, completed = _apply_exit_fill(
+                            open_trade=open_trade,
+                            fill=fill,
                         )
-                        open_trade = None
-                    pending = None
+                        if completed is not None:
+                            completed_trades.append(completed)
+                    remaining = pending.quantity - fill.quantity
+                    if remaining == Decimal("0"):
+                        pending = None
+                    else:
+                        pending = _PendingOrder(
+                            order_id=pending.order_id,
+                            side=pending.side,
+                            quantity=remaining,
+                            submitted_index=pending.submitted_index,
+                            submitted_at=pending.submitted_at,
+                            stop_loss=pending.stop_loss,
+                            take_profit=pending.take_profit,
+                            limit_price=pending.limit_price,
+                            approved_notional=pending.approved_notional,
+                            approved_stop_risk=pending.approved_stop_risk,
+                            filled_notional=(
+                                filled_notional
+                                if fill.side is Side.BUY
+                                else pending.filled_notional
+                            ),
+                            filled_stop_risk=(
+                                filled_stop_risk
+                                if fill.side is Side.BUY
+                                else pending.filled_stop_risk
+                            ),
+                        )
 
             snapshot = ledger.mark({instrument_id: bar.close}, bar.at)
             if snapshot.positions:
                 exposed_periods += 1
             equity_curve.append(EquityPoint(at=bar.at, value=snapshot.equity))
             if open_trade is not None and pending is None and index > open_trade.opened_index:
-                exit_reason: str | None = None
-                if bar.low <= open_trade.stop_loss:
-                    exit_reason = "STOP_LOSS"
-                elif bar.high >= open_trade.take_profit:
-                    exit_reason = "TAKE_PROFIT"
-                elif (
-                    metadata.max_holding_bars is not None
-                    and index - open_trade.opened_index >= metadata.max_holding_bars
-                ):
-                    exit_reason = "MAX_HOLDING_BARS"
+                exit_reason = _protective_exit_reason(
+                    open_trade=open_trade,
+                    bar=bar,
+                    index=index,
+                    metadata=metadata,
+                )
                 if exit_reason is not None:
-                    pending = _PendingOrder(
-                        order_id=f"exit:{metadata.strategy_id}:{bar.at.isoformat()}",
-                        side=Side.SELL,
+                    pending = _exit_order(
+                        strategy_id=metadata.strategy_id,
+                        bar=bar,
+                        index=index,
                         quantity=open_trade.quantity,
-                        submitted_index=index,
-                        submitted_at=bar.at,
+                        reason=exit_reason,
                     )
                     events.append(BacktestEvent(at=bar.at, kind=exit_reason))
             if (
                 open_trade is not None
-                and pending is None
+                and (pending is None or pending.side is Side.BUY)
                 and metadata.mandatory_preclose_closeout
                 and index + 1 < len(bars)
                 and bar.at.astimezone(ZoneInfo(instrument.timezone)).date()
                 != bars[index + 1].at.astimezone(ZoneInfo(instrument.timezone)).date()
             ):
-                pending = _PendingOrder(
-                    order_id=f"session-exit:{metadata.strategy_id}:{bar.at.isoformat()}",
-                    side=Side.SELL,
+                if pending is not None:
+                    events.append(BacktestEvent(at=bar.at, kind="ENTRY_REMAINDER_CANCELLED"))
+                pending = _exit_order(
+                    strategy_id=metadata.strategy_id,
+                    bar=bar,
+                    index=index,
                     quantity=open_trade.quantity,
-                    submitted_index=index,
-                    submitted_at=bar.at,
+                    reason="SESSION_CLOSEOUT",
                 )
                 events.append(BacktestEvent(at=bar.at, kind="SESSION_CLOSEOUT"))
             context = StrategyContext(
@@ -523,6 +592,7 @@ class BacktestEngine:
         stressed = BacktestEngine(
             costs=stressed_costs,
             risk_policy=self.risk_policy,
+            max_volume_participation=self.max_volume_participation,
         ).run(
             instrument=instrument,
             bars=bars,
@@ -532,9 +602,124 @@ class BacktestEngine:
         return RobustnessResult(base=base, stressed=stressed, stressed_costs=stressed_costs)
 
 
+def _apply_entry_fill(
+    *,
+    open_trade: _OpenTrade | None,
+    pending: _PendingOrder,
+    fill: Fill,
+    index: int,
+) -> _OpenTrade:
+    assert pending.stop_loss is not None and pending.take_profit is not None
+    notional = fill.quantity * fill.price
+    if open_trade is None:
+        return _OpenTrade(
+            quantity=fill.quantity,
+            stop_loss=pending.stop_loss,
+            take_profit=pending.take_profit,
+            opened_index=index,
+            opened_at=fill.filled_at,
+            entry_quantity=fill.quantity,
+            entry_notional=notional,
+            entry_fees=fill.fee,
+        )
+    return _OpenTrade(
+        quantity=open_trade.quantity + fill.quantity,
+        stop_loss=open_trade.stop_loss,
+        take_profit=open_trade.take_profit,
+        opened_index=open_trade.opened_index,
+        opened_at=open_trade.opened_at,
+        entry_quantity=open_trade.entry_quantity + fill.quantity,
+        entry_notional=open_trade.entry_notional + notional,
+        entry_fees=open_trade.entry_fees + fill.fee,
+        exit_quantity=open_trade.exit_quantity,
+        exit_notional=open_trade.exit_notional,
+        exit_fees=open_trade.exit_fees,
+    )
+
+
+def _apply_exit_fill(
+    *,
+    open_trade: _OpenTrade,
+    fill: Fill,
+) -> tuple[_OpenTrade | None, CompletedTrade | None]:
+    remaining = open_trade.quantity - fill.quantity
+    if remaining < Decimal("0"):
+        raise RuntimeError("backtest exit would exceed the open position")
+    exit_quantity = open_trade.exit_quantity + fill.quantity
+    exit_notional = open_trade.exit_notional + fill.quantity * fill.price
+    exit_fees = open_trade.exit_fees + fill.fee
+    if remaining > Decimal("0"):
+        return (
+            _OpenTrade(
+                quantity=remaining,
+                stop_loss=open_trade.stop_loss,
+                take_profit=open_trade.take_profit,
+                opened_index=open_trade.opened_index,
+                opened_at=open_trade.opened_at,
+                entry_quantity=open_trade.entry_quantity,
+                entry_notional=open_trade.entry_notional,
+                entry_fees=open_trade.entry_fees,
+                exit_quantity=exit_quantity,
+                exit_notional=exit_notional,
+                exit_fees=exit_fees,
+            ),
+            None,
+        )
+    fees = open_trade.entry_fees + exit_fees
+    return (
+        None,
+        CompletedTrade(
+            opened_at=open_trade.opened_at,
+            closed_at=fill.filled_at,
+            quantity=open_trade.entry_quantity,
+            entry_price=open_trade.entry_notional / open_trade.entry_quantity,
+            exit_price=exit_notional / exit_quantity,
+            fees=fees,
+            net_pnl=exit_notional - open_trade.entry_notional - fees,
+        ),
+    )
+
+
+def _protective_exit_reason(
+    *,
+    open_trade: _OpenTrade,
+    bar: Bar,
+    index: int,
+    metadata: StrategyMetadata,
+) -> str | None:
+    if bar.low <= open_trade.stop_loss:
+        return "STOP_LOSS"
+    if bar.high >= open_trade.take_profit:
+        return "TAKE_PROFIT"
+    if (
+        metadata.max_holding_bars is not None
+        and index - open_trade.opened_index >= metadata.max_holding_bars
+    ):
+        return "MAX_HOLDING_BARS"
+    return None
+
+
+def _exit_order(
+    *,
+    strategy_id: str,
+    bar: Bar,
+    index: int,
+    quantity: Decimal,
+    reason: str,
+) -> _PendingOrder:
+    return _PendingOrder(
+        order_id=f"{reason.lower()}:{strategy_id}:{bar.at.isoformat()}",
+        side=Side.SELL,
+        quantity=quantity,
+        submitted_index=index,
+        submitted_at=bar.at,
+    )
+
+
 def _create_pending_fill(
     *,
     pending: _PendingOrder,
+    quantity: Decimal,
     bar: Bar,
     fill_model: FillModel,
     instrument: Instrument,
@@ -547,7 +732,7 @@ def _create_pending_fill(
             order_id=pending.order_id,
             instrument=instrument,
             side=Side.SELL,
-            quantity=pending.quantity,
+            quantity=quantity,
             reference_price=bar.open,
             submitted_at=pending.submitted_at,
             filled_at=bar.at,
@@ -565,7 +750,7 @@ def _create_pending_fill(
         order_id=pending.order_id,
         instrument=instrument,
         side=Side.BUY,
-        quantity=pending.quantity,
+        quantity=quantity,
         reference_price=min(bar.open, pending.limit_price),
         submitted_at=pending.submitted_at,
         filled_at=bar.at,
@@ -574,12 +759,12 @@ def _create_pending_fill(
     actual_stop_risk = candidate.quantity * (candidate.price - pending.stop_loss)
     if (
         candidate.price > pending.limit_price
-        or actual_notional > pending.approved_notional
-        or actual_notional < instrument.minimum_notional
+        or pending.filled_notional + actual_notional > pending.approved_notional
+        or pending.approved_notional < instrument.minimum_notional
         or actual_notional + candidate.fee > available_cash
         or not pending.stop_loss < candidate.price < pending.take_profit
         or actual_stop_risk < Decimal("0")
-        or actual_stop_risk > pending.approved_stop_risk
+        or pending.filled_stop_risk + actual_stop_risk > pending.approved_stop_risk
     ):
         return None
     return candidate

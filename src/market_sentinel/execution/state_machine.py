@@ -73,8 +73,6 @@ _ALLOWED: dict[OrderStatus, frozenset[OrderStatus]] = {
     OrderStatus.UNKNOWN: frozenset(
         {
             OrderStatus.ACKNOWLEDGED,
-            OrderStatus.PARTIALLY_FILLED,
-            OrderStatus.FILLED,
             OrderStatus.REJECTED,
             OrderStatus.CANCELLED,
             OrderStatus.EXPIRED,

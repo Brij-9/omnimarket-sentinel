@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from market_sentinel.domain.enums import AssetClass, OrderType
-from market_sentinel.domain.models import BrokerOrder, MarketSnapshot, OrderIntent, Position
+from market_sentinel.domain.models import (
+    BrokerOrder,
+    Fill,
+    Instrument,
+    MarketSnapshot,
+    OrderIntent,
+    Position,
+)
 from market_sentinel.operations.audit import AuditEvent
+
+_BROKER_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,8 +40,7 @@ class BrokerCapabilities:
     def __post_init__(self) -> None:
         if (
             not isinstance(self.broker, str)
-            or not self.broker
-            or self.broker != self.broker.strip()
+            or _BROKER_IDENTIFIER.fullmatch(self.broker) is None
         ):
             raise ValueError("broker capability identity must be nonempty and trimmed")
         if not isinstance(self.supported_asset_classes, frozenset) or not all(
@@ -74,6 +83,14 @@ class BrokerAdapter(Protocol):
     def list_orders(self) -> tuple[BrokerOrder, ...]: ...
 
     def open_orders(self) -> tuple[BrokerOrder, ...]: ...
+
+    def reconcile_unknown_fills(
+        self,
+        authoritative_order: BrokerOrder,
+        new_fills: tuple[Fill, ...],
+        *,
+        instrument: Instrument,
+    ) -> BrokerOrder: ...
 
     def cancel(self, order_id: str, *, at: datetime) -> BrokerOrder: ...
 

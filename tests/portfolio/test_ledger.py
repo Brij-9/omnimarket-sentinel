@@ -1,5 +1,6 @@
 """Behavioral tests for the long-only portfolio ledger."""
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -11,6 +12,7 @@ from market_sentinel.portfolio.ledger import (
     DuplicateFillError,
     InsufficientPositionError,
     PortfolioLedger,
+    PortfolioLedgerState,
 )
 
 
@@ -252,3 +254,48 @@ def test_mark_rejects_each_unusable_supplied_price_without_changing_valuation(
     assert after == before
     assert ledger.position_hash() == before_hash
     assert ledger.drawdown == before_drawdown
+
+
+def test_validated_state_round_trip_preserves_every_accounting_accumulator() -> None:
+    """Replaying only fills and the latest mark loses the historical peak and drawdown."""
+    at = datetime(2026, 8, 9, 10, tzinfo=UTC)
+    ledger = PortfolioLedger(starting_cash=Decimal("1000"), currency="USD")
+    ledger.apply_fill(_fill("entry", Side.BUY, "1", "100"))
+    ledger.mark({"AAPL@alpaca": Decimal("150")}, at)
+    before = ledger.mark({"AAPL@alpaca": Decimal("80")}, at + timedelta(minutes=1))
+
+    state = ledger.export_state()
+    restored = PortfolioLedger.from_state(state)
+
+    assert isinstance(state, PortfolioLedgerState)
+    assert restored.export_state() == state
+    assert restored.snapshot(at + timedelta(minutes=2)).model_copy(
+        update={"observed_at": before.observed_at}
+    ) == before
+    with pytest.raises(DuplicateFillError):
+        restored.apply_fill(_fill("entry", Side.BUY, "1", "100"))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda state: replace(state, cash=Decimal("NaN")),
+        lambda state: replace(state, equity=state.equity + Decimal("1")),
+        lambda state: replace(state, peak_equity=state.equity - Decimal("1")),
+        lambda state: replace(state, drawdown=Decimal("-1")),
+        lambda state: replace(state, fill_ids=("entry", "entry")),
+    ],
+)
+def test_ledger_state_import_rejects_malformed_or_inconsistent_values(
+    mutation: object,
+) -> None:
+    """A forged replay state must not bypass ledger accounting invariants."""
+    ledger = PortfolioLedger(starting_cash=Decimal("1000"), currency="USD")
+    ledger.apply_fill(_fill("entry", Side.BUY, "1", "100"))
+    ledger.mark(
+        {"AAPL@alpaca": Decimal("110")},
+        datetime(2026, 8, 9, 10, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValueError, match="ledger state"):
+        PortfolioLedger.from_state(mutation(ledger.export_state()))  # type: ignore[operator]

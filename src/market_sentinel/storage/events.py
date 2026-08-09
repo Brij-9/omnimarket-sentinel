@@ -101,11 +101,11 @@ class EventStore:
             connection.execute(events.insert(), prepared)
 
     def stream(self, aggregate_id: str) -> Iterator[EventRecord]:
-        """Yield aggregate events in deterministic temporal order."""
+        """Yield aggregate events in authoritative database append order."""
         statement = (
             select(events)
             .where(events.c.aggregate_id == aggregate_id)
-            .order_by(events.c.occurred_at, events.c.sequence)
+            .order_by(events.c.sequence)
         )
         with self._engine.connect() as connection:
             rows = connection.execute(statement).mappings().all()

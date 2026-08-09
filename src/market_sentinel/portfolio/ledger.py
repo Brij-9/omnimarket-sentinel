@@ -27,6 +27,32 @@ class _PositionState:
     average_price: Decimal
 
 
+@dataclass(frozen=True, slots=True)
+class PortfolioLedgerPositionState:
+    """One immutable position in an exact ledger recovery snapshot."""
+
+    instrument_id: str
+    quantity: Decimal
+    average_price: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class PortfolioLedgerState:
+    """Complete accounting state required for exact crash recovery."""
+
+    starting_cash: Decimal
+    currency: str
+    cash: Decimal
+    positions: tuple[PortfolioLedgerPositionState, ...]
+    market_prices: tuple[tuple[str, Decimal], ...]
+    fill_ids: tuple[str, ...]
+    gross_realized_pnl: Decimal
+    fees: Decimal
+    equity: Decimal
+    peak_equity: Decimal
+    drawdown: Decimal
+
+
 class PortfolioLedger:
     """Apply fills once, value open long positions, and produce reconciliation snapshots."""
 
@@ -57,6 +83,127 @@ class PortfolioLedger:
     def drawdown(self) -> Decimal:
         """Return the current fractional decline from the ledger's peak equity."""
         return self._drawdown
+
+    def export_state(self) -> PortfolioLedgerState:
+        """Return every accumulator needed to restore this ledger exactly."""
+        return PortfolioLedgerState(
+            starting_cash=self._starting_cash,
+            currency=self._currency,
+            cash=self._cash,
+            positions=tuple(
+                PortfolioLedgerPositionState(
+                    instrument_id=instrument_id,
+                    quantity=position.quantity,
+                    average_price=position.average_price,
+                )
+                for instrument_id, position in sorted(self._positions.items())
+            ),
+            market_prices=tuple(sorted(self._market_prices.items())),
+            fill_ids=tuple(sorted(self._fill_ids)),
+            gross_realized_pnl=self._gross_realized_pnl,
+            fees=self._fees,
+            equity=self._equity,
+            peak_equity=self._peak_equity,
+            drawdown=self._drawdown,
+        )
+
+    @classmethod
+    def from_state(cls, state: PortfolioLedgerState) -> PortfolioLedger:
+        """Validate and restore an exact immutable recovery snapshot."""
+        try:
+            if not isinstance(state, PortfolioLedgerState):
+                raise ValueError
+            starting_cash = _require_positive_decimal(
+                state.starting_cash,
+                field_name="starting_cash",
+            )
+            if (
+                not isinstance(state.currency, str)
+                or not state.currency
+                or state.currency != state.currency.strip()
+            ):
+                raise ValueError
+            cash = _require_finite_decimal(state.cash)
+            gross_realized = _require_finite_decimal(state.gross_realized_pnl)
+            fees = _require_nonnegative_decimal(state.fees, field_name="fees")
+            equity = _require_finite_decimal(state.equity)
+            peak = _require_finite_decimal(state.peak_equity)
+            drawdown = _require_nonnegative_decimal(
+                state.drawdown,
+                field_name="drawdown",
+            )
+            if not isinstance(state.positions, tuple):
+                raise ValueError
+            positions: dict[str, _PositionState] = {}
+            for position in state.positions:
+                if (
+                    not isinstance(position, PortfolioLedgerPositionState)
+                    or not position.instrument_id
+                    or position.instrument_id in positions
+                ):
+                    raise ValueError
+                positions[position.instrument_id] = _PositionState(
+                    quantity=_require_positive_decimal(
+                        position.quantity,
+                        field_name="quantity",
+                    ),
+                    average_price=_require_positive_decimal(
+                        position.average_price,
+                        field_name="average_price",
+                    ),
+                )
+            if not isinstance(state.market_prices, tuple):
+                raise ValueError
+            market_prices: dict[str, Decimal] = {}
+            for item in state.market_prices:
+                if (
+                    not isinstance(item, tuple)
+                    or len(item) != 2
+                    or not isinstance(item[0], str)
+                    or not item[0]
+                    or item[0] in market_prices
+                ):
+                    raise ValueError
+                market_prices[item[0]] = _require_positive_decimal(
+                    item[1],
+                    field_name="market_price",
+                )
+            if any(instrument_id not in market_prices for instrument_id in positions):
+                raise ValueError
+            if (
+                not isinstance(state.fill_ids, tuple)
+                or any(not isinstance(fill_id, str) or not fill_id for fill_id in state.fill_ids)
+                or len(set(state.fill_ids)) != len(state.fill_ids)
+            ):
+                raise ValueError
+            computed_equity = cash + sum(
+                (
+                    position.quantity * market_prices[instrument_id]
+                    for instrument_id, position in positions.items()
+                ),
+                Decimal("0"),
+            )
+            if computed_equity != equity or peak < max(starting_cash, equity):
+                raise ValueError
+            expected_drawdown = (
+                (peak - equity) / peak if peak > Decimal("0") else Decimal("0")
+            )
+            if drawdown != expected_drawdown:
+                raise ValueError
+        except (TypeError, ValueError, ArithmeticError) as error:
+            raise ValueError("invalid portfolio ledger state") from error
+
+        ledger = cls(starting_cash=starting_cash, currency=state.currency)
+        ledger._cash = cash
+        ledger._positions = positions
+        ledger._market_prices = market_prices
+        ledger._fill_ids = set(state.fill_ids)
+        ledger._gross_realized_pnl = gross_realized
+        ledger._fees = fees
+        ledger._equity = equity
+        ledger._peak_equity = peak
+        ledger._drawdown = drawdown
+        return ledger
 
     def apply_fill(self, fill: Fill) -> None:
         """Apply one fill atomically using average-cost long-only accounting."""
@@ -243,4 +390,10 @@ def _require_positive_decimal(value: object, *, field_name: str) -> Decimal:
 def _require_nonnegative_decimal(value: object, *, field_name: str) -> Decimal:
     if not isinstance(value, Decimal) or not value.is_finite() or value < Decimal("0"):
         raise ValueError(f"{field_name} must be a finite Decimal greater than or equal to zero")
+    return value
+
+
+def _require_finite_decimal(value: object) -> Decimal:
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise ValueError("value must be a finite Decimal")
     return value

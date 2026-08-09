@@ -62,8 +62,6 @@ def _order(status: OrderStatus = OrderStatus.PROPOSED) -> BrokerOrder:
         (OrderStatus.PARTIALLY_FILLED, OrderStatus.EXPIRED),
         (OrderStatus.PARTIALLY_FILLED, OrderStatus.UNKNOWN),
         (OrderStatus.UNKNOWN, OrderStatus.ACKNOWLEDGED),
-        (OrderStatus.UNKNOWN, OrderStatus.PARTIALLY_FILLED),
-        (OrderStatus.UNKNOWN, OrderStatus.FILLED),
         (OrderStatus.UNKNOWN, OrderStatus.REJECTED),
         (OrderStatus.UNKNOWN, OrderStatus.CANCELLED),
         (OrderStatus.UNKNOWN, OrderStatus.EXPIRED),
@@ -232,8 +230,6 @@ def test_every_order_status_pair_matches_the_explicit_transition_matrix() -> Non
         },
         OrderStatus.UNKNOWN: {
             OrderStatus.ACKNOWLEDGED,
-            OrderStatus.PARTIALLY_FILLED,
-            OrderStatus.FILLED,
             OrderStatus.REJECTED,
             OrderStatus.CANCELLED,
             OrderStatus.EXPIRED,
