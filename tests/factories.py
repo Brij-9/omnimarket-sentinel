@@ -244,3 +244,19 @@ def portfolio(
         positions=positions,
         observed_at=observed_at,
     )
+
+
+def position(
+    instrument_id: str = "AAPL@alpaca",
+    quantity: Decimal | str = Decimal("1"),
+    average_price: Decimal | str = Decimal("1"),
+    market_price: Decimal | str = Decimal("1"),
+    unrealized_pnl: Decimal | str = Decimal("0"),
+) -> Position:
+    return Position(
+        instrument_id=instrument_id,
+        quantity=Decimal(quantity),
+        average_price=Decimal(average_price),
+        market_price=Decimal(market_price),
+        unrealized_pnl=Decimal(unrealized_pnl),
+    )

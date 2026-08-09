@@ -6,9 +6,9 @@ import pytest
 
 from market_sentinel.domain.enums import AssetClass, Side
 from market_sentinel.domain.models import RiskDecision
-from market_sentinel.risk.engine import PositionSizer, RiskEngine
+from market_sentinel.risk.engine import PositionSizer, RiskEngine, portfolio_hash
 from market_sentinel.risk.policy import RiskPolicy
-from tests.factories import instrument, intent, portfolio, signal, snapshot
+from tests.factories import instrument, intent, portfolio, position, signal, snapshot
 
 NOW = datetime(2026, 8, 9, 10, tzinfo=UTC)
 
@@ -66,7 +66,7 @@ def test_reason_codes_are_stable_and_fail_closed(expected: str) -> None:
     policy = RiskPolicy.safe_defaults()
     base_intent = intent(notional="1", limit_price="1", stop_loss="0.5", take_profit="2")
     base_market = snapshot()
-    base_portfolio = portfolio(equity="100", peak_equity="100")
+    base_portfolio = portfolio(cash="100", equity="100", peak_equity="100")
     engine = RiskEngine(policy=policy)
 
     if expected == "KILL_SWITCH_ACTIVE":
@@ -82,9 +82,9 @@ def test_reason_codes_are_stable_and_fail_closed(expected: str) -> None:
     elif expected == "MISSING_PROTECTIVE_EXIT":
         base_intent = intent(notional="1", limit_price="1", stop_loss=None, take_profit=None)
     elif expected == "DRAWDOWN_LIMIT":
-        base_portfolio = portfolio(equity="89", peak_equity="100")
+        base_portfolio = portfolio(cash="89", equity="89", peak_equity="100")
     elif expected == "DAILY_LOSS_LIMIT":
-        base_portfolio = portfolio(equity="100", peak_equity="100", daily_pnl="-2")
+        base_portfolio = portfolio(cash="100", equity="100", peak_equity="100", daily_pnl="-2")
     elif expected == "LEVERAGE_FORBIDDEN":
         base_intent = intent(
             notional="1", limit_price="1", stop_loss="0.5", take_profit="2", product="margin"
@@ -99,7 +99,13 @@ def test_reason_codes_are_stable_and_fail_closed(expected: str) -> None:
         base_intent = intent(notional="11", limit_price="1", stop_loss="0.5", take_profit="2")
     elif expected == "GROSS_EXPOSURE_LIMIT":
         base_intent = intent(notional="41", limit_price="1", stop_loss="0.5", take_profit="2")
-        base_portfolio = portfolio(equity="100", peak_equity="100", gross_exposure="10")
+        base_portfolio = portfolio(
+            cash="90",
+            equity="100",
+            peak_equity="100",
+            gross_exposure="10",
+            positions=(position(quantity="10"),),
+        )
     elif expected == "BELOW_MINIMUM_NOTIONAL":
         base_intent = intent(notional="0.5", limit_price="1", stop_loss="0.5", take_profit="2")
     elif expected == "INVALID_PRECISION":
@@ -111,6 +117,10 @@ def test_reason_codes_are_stable_and_fail_closed(expected: str) -> None:
         asset_class=AssetClass.FUTURE if expected == "DERIVATIVE_FORBIDDEN" else AssetClass.EQUITY,
         quantity_step="0.01",
     )
+    if expected != "PORTFOLIO_HASH_MISMATCH":
+        base_intent = base_intent.model_copy(
+            update={"snapshot_hash": portfolio_hash(base_portfolio)}
+        )
     decision = engine.assess(
         intent=base_intent,
         instrument=tested_instrument,
@@ -126,6 +136,14 @@ def test_reason_codes_are_stable_and_fail_closed(expected: str) -> None:
 
 
 def test_reasons_follow_the_documented_order_when_multiple_gates_fail() -> None:
+    account = portfolio(
+        cash="39",
+        equity="89",
+        peak_equity="100",
+        gross_exposure="50",
+        daily_pnl="-2",
+        positions=(position(instrument_id="held@alpaca", quantity="50"),),
+    )
     decision = RiskEngine.safe_defaults(kill_switch=True).assess(
         intent=intent(
             notional="0.5",
@@ -134,10 +152,11 @@ def test_reasons_follow_the_documented_order_when_multiple_gates_fail() -> None:
             take_profit=None,
             expires_at=NOW,
             product="margin",
+            snapshot_hash=portfolio_hash(account),
         ),
         instrument=instrument(asset_class=AssetClass.FUTURE, quantity_step="0.01"),
         market=snapshot(source_at=NOW - timedelta(seconds=61)),
-        portfolio=portfolio(equity="89", peak_equity="100", gross_exposure="50", daily_pnl="-2"),
+        portfolio=account,
         now=NOW,
     )
 
@@ -157,11 +176,12 @@ def test_reasons_follow_the_documented_order_when_multiple_gates_fail() -> None:
 
 def test_position_sizer_rounds_down_and_rejects_below_venue_minimum() -> None:
     sizer = PositionSizer(policy=RiskPolicy.safe_defaults())
+    account = portfolio(cash="10", equity="10")
     sized = sizer.create_intent(
         signal=signal(entry_price="100", invalidation_price="99", take_profit="102"),
         instrument=instrument(quantity_step="0.01", minimum_notional="1.01"),
-        portfolio=portfolio(equity="10"),
-        snapshot_hash="portfolio-hash",
+        portfolio=account,
+        snapshot_hash=portfolio_hash(account),
         now=NOW,
     )
 

@@ -26,17 +26,22 @@ class RiskPolicy:
     decision_ttl: timedelta = timedelta(seconds=60)
 
     def __post_init__(self) -> None:
-        for value in (
-            self.max_trade_risk_fraction,
-            self.max_position_fraction,
-            self.max_gross_exposure_fraction,
-            self.max_daily_loss_fraction,
-            self.max_drawdown_fraction,
-        ):
-            if not value.is_finite() or not Decimal("0") < value <= Decimal("1"):
-                raise ValueError("risk-policy fractions must be finite Decimals in (0, 1]")
-        if self.decision_ttl <= timedelta(0):
-            raise ValueError("decision_ttl must be positive")
+        limits = (
+            (self.max_trade_risk_fraction, SAFE_MAX_TRADE_RISK_FRACTION),
+            (self.max_position_fraction, SAFE_MAX_POSITION_FRACTION),
+            (self.max_gross_exposure_fraction, SAFE_MAX_GROSS_EXPOSURE_FRACTION),
+            (self.max_daily_loss_fraction, SAFE_MAX_DAILY_LOSS_FRACTION),
+            (self.max_drawdown_fraction, SAFE_MAX_DRAWDOWN_FRACTION),
+        )
+        for value, safe_maximum in limits:
+            if (
+                not isinstance(value, Decimal)
+                or not value.is_finite()
+                or not Decimal("0") < value <= safe_maximum
+            ):
+                raise ValueError("risk-policy fractions may not exceed fixed safe limits")
+        if not timedelta(0) < self.decision_ttl <= timedelta(seconds=60):
+            raise ValueError("decision_ttl must be positive and no greater than 60 seconds")
 
     @classmethod
     def safe_defaults(cls) -> "RiskPolicy":

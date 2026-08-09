@@ -6,7 +6,8 @@ from decimal import Decimal
 from hypothesis import given
 from hypothesis import strategies as st
 
-from market_sentinel.risk.engine import PositionSizer, RiskEngine
+from market_sentinel.domain.models import OrderIntent
+from market_sentinel.risk.engine import PositionSizer, RiskEngine, portfolio_hash
 from market_sentinel.risk.policy import RiskPolicy
 from tests.factories import instrument, intent, portfolio, signal, snapshot
 
@@ -22,6 +23,7 @@ NOW = datetime(2026, 8, 9, 10, tzinfo=UTC)
 def test_approved_size_never_exceeds_position_or_stop_risk_limits(
     equity: Decimal, entry: Decimal, stop_distance: Decimal, step: Decimal
 ) -> None:
+    account = portfolio(cash=equity, equity=equity, peak_equity=equity)
     sized = PositionSizer(policy=RiskPolicy.safe_defaults()).create_intent(
         signal=signal(
             entry_price=entry,
@@ -29,12 +31,11 @@ def test_approved_size_never_exceeds_position_or_stop_risk_limits(
             take_profit=entry + stop_distance,
         ),
         instrument=instrument(quantity_step=step, minimum_notional="0.01"),
-        portfolio=portfolio(equity=equity, peak_equity=equity),
-        snapshot_hash="hash",
+        portfolio=account,
+        snapshot_hash=portfolio_hash(account),
         now=NOW,
     )
-    if hasattr(sized, "approved"):
-        return
+    assert isinstance(sized, OrderIntent)
 
     quantity = sized.quantity
     assert quantity is not None
@@ -44,30 +45,33 @@ def test_approved_size_never_exceeds_position_or_stop_risk_limits(
 
 
 @given(
-    notional=st.decimals(min_value="1", max_value="10", places=2),
-    extra_loss=st.decimals(min_value="2", max_value="20", places=2),
+    notional=st.decimals(min_value="0.01", max_value="1", places=2),
 )
-def test_adding_a_rejection_condition_never_turns_rejection_into_approval(
-    notional: Decimal, extra_loss: Decimal
+def test_adding_a_rejection_condition_cannot_leave_an_approval_approved(
+    notional: Decimal,
 ) -> None:
+    account = portfolio(cash="100", equity="100", peak_equity="100")
+    accepted_intent = intent(
+        notional=notional,
+        limit_price="1",
+        stop_loss="0.5",
+        take_profit="2",
+        snapshot_hash=portfolio_hash(account),
+    )
     baseline = RiskEngine.safe_defaults().assess(
-        intent=intent(notional=notional, limit_price="1", stop_loss="0.5", take_profit="2"),
-        instrument=instrument(),
+        intent=accepted_intent,
+        instrument=instrument(minimum_notional="0.01"),
         market=snapshot(),
-        portfolio=portfolio(equity="100", peak_equity="100", gross_exposure="60"),
+        portfolio=account,
         now=NOW,
     )
     with_extra_rejection = RiskEngine.safe_defaults().assess(
-        intent=intent(
-            notional=notional, limit_price="1", stop_loss="0.5", take_profit="2", product="margin"
-        ),
-        instrument=instrument(),
+        intent=accepted_intent.model_copy(update={"product": "margin"}),
+        instrument=instrument(minimum_notional="0.01"),
         market=snapshot(),
-        portfolio=portfolio(
-            equity="100", peak_equity="100", gross_exposure="60", daily_pnl=-extra_loss
-        ),
+        portfolio=account,
         now=NOW,
     )
 
-    assert baseline.approved is False
+    assert baseline.approved is True
     assert with_extra_rejection.approved is False
