@@ -6,13 +6,13 @@ import copy as copy_module
 import hashlib
 import inspect
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -4219,3 +4219,55 @@ def test_market_bulk_terminal_index_assignment_rolls_back_atomically() -> None:
 
     broker.on_snapshot(next_snapshot, _instrument())
     assert all(broker.get_order(order.order_id).status is OrderStatus.EXPIRED for order in orders)
+
+
+def test_market_one_terminal_order_never_scans_169_unknown_reservations() -> None:
+    """MARKET index work is bounded by executable orders, not UNKNOWN reservations."""
+
+    class CountingUnknownTuple(tuple[str, ...]):
+        iterated_ids: int
+
+        def __iter__(self) -> Iterator[str]:
+            for order_id in super().__iter__():
+                self.iterated_ids += 1
+                yield order_id
+
+    broker = PaperBroker(starting_cash=Decimal("100000"))
+    initial = _snapshot(_bar(0, open_price="100"))
+    orders = [
+        broker.submit(
+            _intent(
+                intent_id=f"mixed-reservation-{index}",
+                quantity=Decimal("0.1"),
+                expires_at=(
+                    AT + timedelta(minutes=1)
+                    if index == 169
+                    else AT + timedelta(minutes=10)
+                ),
+            ),
+            initial,
+        )
+        for index in range(170)
+    ]
+    for order in orders[:169]:
+        broker.mark_unknown(order.order_id, at=AT)
+    state = cast(Any, broker._state)
+    index = getattr(state, "unknown_order_ids", None)
+    if index is None:
+        index = state.reserved_order_ids
+    counting = CountingUnknownTuple(index["AAPL@alpaca"])
+    counting.iterated_ids = 0
+    index["AAPL@alpaca"] = counting
+
+    broker.on_snapshot(
+        _snapshot(*initial.bars, _bar(1, open_price="100", volume="0")),
+        _instrument(),
+    )
+
+    assert broker.get_order(orders[-1].order_id).status is OrderStatus.EXPIRED
+    assert all(
+        broker.get_order(order.order_id).status is OrderStatus.UNKNOWN
+        for order in orders[:169]
+    )
+    assert counting.iterated_ids <= 1
+    assert index["AAPL@alpaca"] is counting
