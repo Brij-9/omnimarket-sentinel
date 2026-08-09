@@ -1,0 +1,38 @@
+{
+  "thesis": "Durable services growth and improving margins support the long-term case.",
+  "bear_case": "Premium valuation leaves little room for weaker demand.",
+  "catalysts": [
+    "Next quarterly earnings release",
+    "New product cycle"
+  ],
+  "risks": [
+    "Multiple compression",
+    "Regulatory pressure"
+  ],
+  "confidence": 72,
+  "confidence_scale": "percent",
+  "model_id": "fixture-model",
+  "configuration": {
+    "llm_provider": "fixture",
+    "deep_think_llm": "fixture-model",
+    "quick_think_llm": "fixture-model",
+    "checkpoint_enabled": false,
+    "selected_analysts": [
+      "market",
+      "news",
+      "fundamentals"
+    ]
+  },
+  "evidence": [
+    {
+      "uri": "https://example.test/aapl/earnings",
+      "title": "AAPL quarterly results",
+      "published_at": "2026-08-08T18:30:00Z"
+    },
+    {
+      "uri": "https://example.test/aapl/products#launch",
+      "title": "AAPL product announcement",
+      "published_at": "2026-08-08T19:15:00+00:00"
+    }
+  ]
+}
