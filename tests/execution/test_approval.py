@@ -36,7 +36,7 @@ def _authenticated_service(
         audit_log=AuditLog(store, clock),
         authenticator=SafetyAuthenticator(key=key, nonce_source=lambda: b"a" * 32),
     )
-    return ApprovalService(clock=clock, safety_repository=repository), store
+    return ApprovalService(clock=clock, safety_capability=repository.approval_capability()), store
 
 
 def _approved(*, quantity: str = "0.1", snapshot_hash: str = "a" * 64) -> RiskDecision:
@@ -312,8 +312,8 @@ def test_issuance_persistence_exception_has_no_secret_cause_or_context() -> None
     service, _ = _authenticated_service(FrozenClock(DEFAULT_INSTANT))
     with (
         patch.object(
-            SafetyRepository,
-            "record_many",
+            AuditLog,
+            "record_many_if_heads",
             side_effect=RuntimeError("api_key=secret-token-123"),
         ),
         pytest.raises(ApprovalError) as captured,

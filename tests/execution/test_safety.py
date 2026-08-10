@@ -11,7 +11,6 @@ from market_sentinel.execution import SafetyAuthenticator as PublicSafetyAuthent
 from market_sentinel.execution.canonical import CanonicalEncodingError, canonical_decimal
 from market_sentinel.execution.safety import (
     SafetyAuthenticator,
-    SafetyEvent,
     SafetyIntegrityError,
     SafetyRepository,
 )
@@ -58,8 +57,13 @@ def test_decimal_canonicalization_rejects_wrong_or_resource_hostile_values(bad: 
 
 def test_unsigned_public_safety_row_cannot_authorize_replay() -> None:
     """A matching public AuditLog row is not authenticated safety authority."""
-    repository = _repository()
-    repository.audit_log.record(
+    clock = FrozenClock(DEFAULT_INSTANT)
+    audit = AuditLog(EventStore(create_engine_and_schema("sqlite+pysqlite:///:memory:")), clock)
+    repository = SafetyRepository(
+        audit_log=audit,
+        authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"n" * 32),
+    )
+    audit.record(
         "forged",
         "reconciliation.healthy",
         "live-reconciliation",
@@ -74,21 +78,17 @@ def test_signed_rows_survive_restart_with_same_key_and_wrong_key_fails(tmp_path:
     """Only possession of the same local key can replay persisted safety authority."""
     path = tmp_path / "safety.db"
     repository = _repository(path)
-    repository.record_many(
-        (
-            SafetyEvent(
-                event_id="signed",
-                kind="kill_switch.activated",
-                aggregate_id="live-kill-switch",
-                payload={"reason_codes": ["TEST"]},
-                occurred_at=DEFAULT_INSTANT,
-            ),
-        )
+    row = repository.reconciliation_capability().persist_report(
+        broker="alpaca",
+        broker_hash="a" * 64,
+        ledger_hash="b" * 64,
+        reason_codes=("CASH_MISMATCH",),
+        checked_at=DEFAULT_INSTANT,
     )
 
-    assert _repository(path).stream_verified("live-kill-switch")[0].event_id == "signed"
+    assert _repository(path).stream_verified("live-reconciliation")[0].event_id == row.event_id
     with pytest.raises(SafetyIntegrityError):
-        _repository(path, key=OTHER_KEY).stream_verified("live-kill-switch")
+        _repository(path, key=OTHER_KEY).stream_verified("live-reconciliation")
 
 
 def test_authenticator_repr_and_errors_never_disclose_key_or_nonce() -> None:
@@ -131,15 +131,14 @@ def test_nonce_source_exception_is_sanitized_without_context() -> None:
 def test_safety_event_rejects_naive_time() -> None:
     """Safety MACs never depend on local timezone interpretation."""
     repository = _repository()
-    event = SafetyEvent(
-        "naive",
-        "kill_switch.activated",
-        "live-kill-switch",
-        {},
-        (DEFAULT_INSTANT + timedelta(seconds=1)).replace(tzinfo=None),
-    )
     with pytest.raises(ValueError):
-        repository.record_many((event,))
+        repository.reconciliation_capability().persist_report(
+            broker="alpaca",
+            broker_hash="a" * 64,
+            ledger_hash="b" * 64,
+            reason_codes=(),
+            checked_at=(DEFAULT_INSTANT + timedelta(seconds=1)).replace(tzinfo=None),
+        )
 
 
 def test_authenticated_safety_configuration_has_an_explicit_public_api() -> None:

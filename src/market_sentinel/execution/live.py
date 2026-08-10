@@ -5,9 +5,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
-from uuid import uuid4
-
-from sqlalchemy.exc import IntegrityError
 
 from market_sentinel.brokers.preflight import PreflightReport, required_gate_names
 from market_sentinel.domain.clock import Clock
@@ -22,15 +19,16 @@ from market_sentinel.domain.models import (
 from market_sentinel.execution.approval import ApprovalError, ApprovalService, OrderConfirmation
 from market_sentinel.execution.base import BrokerCapabilities
 from market_sentinel.execution.reconcile import (
-    KILL_SWITCH_AGGREGATE,
-    LIVE_INTERLOCK_AGGREGATE,
-    RECONCILIATION_AGGREGATE,
     KillSwitchError,
     Reconciler,
     ReconciliationReport,
     SafetyFence,
 )
-from market_sentinel.execution.safety import SafetyEvent, SafetyIntegrityError, SafetyRepository
+from market_sentinel.execution.safety import (
+    LiveSafetyCapability,
+    SafetyAlreadyUsedError,
+    SafetyIntegrityError,
+)
 from market_sentinel.portfolio.ledger import PortfolioLedger
 from market_sentinel.storage.events import EventHeadConflict
 
@@ -63,7 +61,7 @@ class LiveOrderService:
         broker: LiveBroker,
         approval_service: ApprovalService,
         reconciler: Reconciler,
-        safety_repository: SafetyRepository,
+        safety_capability: LiveSafetyCapability,
         clock: Clock,
         ledger: PortfolioLedger,
     ) -> None:
@@ -71,13 +69,11 @@ class LiveOrderService:
             raise ValueError("live execution requires the exact approval service")
         if type(reconciler) is not Reconciler:
             raise ValueError("live execution requires the exact reconciler")
-        if type(safety_repository) is not SafetyRepository:
-            raise ValueError("live execution requires an authenticated safety repository")
+        if type(safety_capability) is not LiveSafetyCapability:
+            raise ValueError("live execution requires its exact safety capability")
         if (
-            safety_repository.event_store_identity
-            is not reconciler.safety_repository.event_store_identity
-            or safety_repository.event_store_identity
-            is not approval_service.safety_repository.event_store_identity
+            safety_capability.store_identity is not reconciler.safety_store_identity
+            or safety_capability.store_identity is not approval_service.safety_store_identity
         ):
             raise ValueError("live safety services must share one EventStore")
         if type(ledger) is not PortfolioLedger:
@@ -88,7 +84,7 @@ class LiveOrderService:
         self._broker = broker
         self._approval = approval_service
         self._reconciler = reconciler
-        self._safety = safety_repository
+        self._safety = safety_capability
         self._clock = clock
         self._ledger = ledger
         self._broker_name = broker_name
@@ -192,32 +188,13 @@ class LiveOrderService:
             raise LiveOrderError("SUBMISSION_UNKNOWN") from None
         try:
             acknowledged_at = _aware_utc(self._clock.now())
-            nonce = uuid4().hex
-            self._safety.record_many(
-                (
-                    SafetyEvent(
-                        f"live-ack-{nonce}",
-                        "live.acknowledged",
-                        intent.intent_id,
-                        {
-                            "broker": self._broker_name,
-                            "broker_order_id": submitted.order_id,
-                            "client_intent_id": intent.intent_id,
-                            "status": submitted.status.value,
-                        },
-                        acknowledged_at,
-                    ),
-                    SafetyEvent(
-                        f"interlock-ack-{nonce}",
-                        "live.interlock_resolved",
-                        LIVE_INTERLOCK_AGGREGATE,
-                        {
-                            "resolution": "acknowledged",
-                            "submission_id": confirmation.confirmation_id,
-                        },
-                        acknowledged_at,
-                    ),
-                )
+            self._safety.record_acknowledgement(
+                intent_id=intent.intent_id,
+                broker=self._broker_name,
+                broker_order_id=submitted.order_id,
+                status=submitted.status.value,
+                submission_id=confirmation.confirmation_id,
+                occurred_at=acknowledged_at,
             )
         except BaseException:
             acknowledgement_persisted = False
@@ -330,86 +307,30 @@ class LiveOrderService:
         instant: datetime,
         fence: SafetyFence,
     ) -> None:
-        confirmation_aggregate = f"live-confirmation:{confirmation.confirmation_id}"
-        claim_event_id = f"live-confirmation-{confirmation.confirmation_id}"
-        nonce = uuid4().hex
         try:
-            confirmation_rows = self._safety.stream_verified(confirmation_aggregate)
-        except SafetyIntegrityError:
-            confirmation_rows = ()
-        if (
-            len(confirmation_rows) > 1
-            and confirmation_rows[-1].kind == "live.confirmation_consumed"
-        ):
-            raise LiveOrderError("CONFIRMATION_USED")
-        if len(confirmation_rows) != 1 or confirmation_rows[0].kind != "confirmation.issued":
-            raise LiveOrderError("CONFIRMATION_INVALID")
-        issuance_head = confirmation_rows[0].event_id
-        try:
-            self._safety.record_many_if_heads(
-                (
-                    SafetyEvent(
-                        f"live-claim-audit-{nonce}",
-                        "live.confirmation_claimed",
-                        intent.intent_id,
-                        {
-                            "broker": self._broker_name,
-                            "confirmation_fingerprint": confirmation.fingerprint,
-                            "expires_at": _time_text(confirmation.expires_at),
-                        },
-                        instant,
-                    ),
-                    SafetyEvent(
-                        claim_event_id,
-                        "live.confirmation_consumed",
-                        confirmation_aggregate,
-                        {"intent_id": intent.intent_id},
-                        instant,
-                    ),
-                    SafetyEvent(
-                        f"live-start-{nonce}",
-                        "live.submission_started",
-                        intent.intent_id,
-                        {
-                            "broker": self._broker_name,
-                            "client_intent_id": intent.intent_id,
-                        },
-                        instant,
-                    ),
-                    SafetyEvent(
-                        f"interlock-start-{nonce}",
-                        "live.interlock_started",
-                        LIVE_INTERLOCK_AGGREGATE,
-                        {
-                            "intent_id": intent.intent_id,
-                            "submission_id": confirmation.confirmation_id,
-                        },
-                        instant,
-                    ),
-                ),
-                {
-                    RECONCILIATION_AGGREGATE: fence.reconciliation_head,
-                    KILL_SWITCH_AGGREGATE: fence.kill_switch_head,
-                    LIVE_INTERLOCK_AGGREGATE: fence.interlock_head,
-                    confirmation_aggregate: issuance_head,
-                },
+            self._safety.claim_and_start(
+                intent_id=intent.intent_id,
+                broker=self._broker_name,
+                confirmation_id=confirmation.confirmation_id,
+                fingerprint=confirmation.fingerprint,
+                expires_at=confirmation.expires_at,
+                reconciliation_head=fence.reconciliation_head,
+                kill_switch_head=fence.kill_switch_head,
+                interlock_head=fence.interlock_head,
+                occurred_at=instant,
             )
+        except SafetyAlreadyUsedError:
+            raise LiveOrderError("CONFIRMATION_USED") from None
+        except SafetyIntegrityError:
+            raise LiveOrderError("CONFIRMATION_INVALID") from None
         except EventHeadConflict:
             failure = "conflict"
-        except IntegrityError:
-            failure = "persistence"
         except BaseException:
             failure = "persistence"
         else:
             failure = ""
         if not failure:
             return
-        try:
-            after = self._safety.stream_verified(confirmation_aggregate)
-        except SafetyIntegrityError:
-            after = ()
-        if len(after) > 1 and after[-1].kind == "live.confirmation_consumed":
-            raise LiveOrderError("CONFIRMATION_USED")
         if failure == "conflict":
             raise LiveOrderError("SAFETY_STATE_CHANGED")
         raise LiveOrderError("AUDIT_PERSISTENCE_FAILED")
@@ -430,7 +351,11 @@ class LiveOrderService:
 
     def _persist_unknown(self, intent_id: str, submission_id: str) -> None:
         try:
-            self._reconciler.record_submission_unknown(intent_id, submission_id)
+            self._safety.record_unknown(
+                intent_id=intent_id,
+                submission_id=submission_id,
+                occurred_at=_aware_utc(self._clock.now()),
+            )
         except BaseException:
             persisted = False
         else:

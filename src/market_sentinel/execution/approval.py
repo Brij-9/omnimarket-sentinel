@@ -14,7 +14,7 @@ from market_sentinel.domain.clock import Clock
 from market_sentinel.domain.enums import OrderType, Side
 from market_sentinel.domain.models import OrderIntent, RiskDecision
 from market_sentinel.execution.canonical import CanonicalEncodingError, canonical_decimal
-from market_sentinel.execution.safety import SafetyEvent, SafetyIntegrityError, SafetyRepository
+from market_sentinel.execution.safety import ApprovalSafetyCapability, SafetyIntegrityError
 
 CONFIRMATION_PHRASE = "I_CONFIRM_REAL_MONEY_ORDER"
 DEFAULT_CONFIRMATION_LIFETIME = timedelta(minutes=5)
@@ -43,16 +43,16 @@ class OrderConfirmation:
 class ApprovalService:
     """Create and verify exact, expiring confirmation fingerprints."""
 
-    def __init__(self, *, clock: Clock, safety_repository: SafetyRepository) -> None:
-        if type(safety_repository) is not SafetyRepository:
-            raise ValueError("approval requires an authenticated safety repository")
+    def __init__(self, *, clock: Clock, safety_capability: ApprovalSafetyCapability) -> None:
+        if type(safety_capability) is not ApprovalSafetyCapability:
+            raise ValueError("approval requires its exact safety capability")
         self._clock = clock
-        self._safety = safety_repository
+        self._safety = safety_capability
 
     @property
-    def safety_repository(self) -> SafetyRepository:
-        """Return the exact authenticated durability boundary used for issuance."""
-        return self._safety
+    def safety_store_identity(self) -> object:
+        """Return only the opaque shared-store identity, never a writer or signer."""
+        return self._safety.store_identity
 
     def create(
         self,
@@ -78,40 +78,21 @@ class ApprovalService:
         expires_at = instant + lifetime
         fingerprint = _fingerprint(intent, risk_decision, resolved_broker, expires_at)
         try:
-            issuance_seed = self._safety.new_nonce()
-            nonce = self._safety.new_nonce()
-        except (TypeError, ValueError):
-            nonce_pair = None
-        else:
-            nonce_pair = (issuance_seed, nonce)
-        if nonce_pair is None:
-            raise ApprovalError("confirmation nonce source failed")
-        issuance_seed, nonce = nonce_pair
-        confirmation_id = hashlib.sha256(
-            b"omnimarket-sentinel:confirmation-issuance-id:v1\x00" + bytes.fromhex(issuance_seed)
-        ).hexdigest()
-        aggregate = f"live-confirmation:{confirmation_id}"
-        event_id = f"confirmation-issued-{confirmation_id}"
-        payload = {
-            "broker": resolved_broker,
-            "created_at": _time_text(instant),
-            "expires_at": _time_text(expires_at),
-            "fingerprint": fingerprint,
-            "nonce": nonce,
-            "risk_decision_hash": risk_decision_hash(risk_decision),
-        }
-        try:
-            self._safety.record_many(
-                (SafetyEvent(event_id, "confirmation.issued", aggregate, payload, instant),)
+            confirmation_id, nonce, mac = self._safety.issue_confirmation(
+                phrase=phrase,
+                broker=resolved_broker,
+                created_at=instant,
+                expires_at=expires_at,
+                fingerprint=fingerprint,
+                risk_decision_hash=risk_decision_hash(risk_decision),
             )
-            [issued] = self._safety.stream_verified(aggregate)
         except BaseException:
-            issued = None
-        if issued is None:
+            issued_values = None
+        else:
+            issued_values = (confirmation_id, nonce, mac)
+        if issued_values is None:
             raise ApprovalError("confirmation persistence failed") from None
-        mac = issued.payload.get("safety_mac")
-        if type(mac) is not str:
-            raise ApprovalError("confirmation persistence failed")
+        confirmation_id, nonce, mac = issued_values
         return OrderConfirmation(
             confirmation_id=confirmation_id,
             fingerprint=fingerprint,
@@ -161,9 +142,8 @@ class ApprovalService:
         if fingerprint_input is None:
             raise ApprovalError("confirmation input is malformed")
         resolved_broker, expected = fingerprint_input
-        aggregate = f"live-confirmation:{confirmation.confirmation_id}"
         try:
-            rows = self._safety.stream_verified(aggregate)
+            rows = self._safety.confirmation_events(confirmation.confirmation_id)
         except SafetyIntegrityError:
             rows = ()
         if not rows:

@@ -17,7 +17,7 @@ from market_sentinel.execution.reconcile import (
     KillSwitchError,
     Reconciler,
 )
-from market_sentinel.execution.safety import SafetyAuthenticator, SafetyEvent, SafetyRepository
+from market_sentinel.execution.safety import SafetyAuthenticator, SafetyRepository
 from market_sentinel.operations.audit import AuditLog
 from market_sentinel.portfolio.ledger import PortfolioLedger
 from market_sentinel.storage.db import create_engine_and_schema
@@ -35,7 +35,11 @@ def _services(path: Path | None = None) -> tuple[FrozenClock, EventStore, Reconc
         audit_log=AuditLog(store, clock),
         authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"r" * 32),
     )
-    return clock, store, Reconciler(safety_repository=repository, clock=clock)
+    return (
+        clock,
+        store,
+        Reconciler(safety_capability=repository.reconciliation_capability(), clock=clock),
+    )
 
 
 def _ledger() -> PortfolioLedger:
@@ -121,11 +125,12 @@ def test_position_and_cash_mismatches_activate_persistent_kill_switch(
     assert report.healthy is False
     assert expected_code in report.reason_codes
     restarted_store = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{db}"))
+    restarted_repository = SafetyRepository(
+        audit_log=AuditLog(restarted_store, clock),
+        authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"r" * 32),
+    )
     restarted = Reconciler(
-        safety_repository=SafetyRepository(
-            audit_log=AuditLog(restarted_store, clock),
-            authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"r" * 32),
-        ),
+        safety_capability=restarted_repository.reconciliation_capability(),
         clock=clock,
     )
     assert restarted.kill_switch_active() is True
@@ -272,11 +277,12 @@ def test_racing_unhealthy_event_cannot_be_erased_by_clear(tmp_path: Path) -> Non
     _clock, _store, first = _services(db)
     clock2 = FrozenClock(DEFAULT_INSTANT + timedelta(seconds=1))
     store2 = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{db}"))
+    second_repository = SafetyRepository(
+        audit_log=AuditLog(store2, clock2),
+        authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"r" * 32),
+    )
     second = Reconciler(
-        safety_repository=SafetyRepository(
-            audit_log=AuditLog(store2, clock2),
-            authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"r" * 32),
-        ),
+        safety_capability=second_repository.reconciliation_capability(),
         clock=clock2,
     )
     first.compare(_snapshot(cash=Decimal("89")), _ledger(), ())
@@ -333,20 +339,15 @@ def test_signed_clear_requires_exact_existing_prior_activation_marker(
     payload: dict[str, object],
 ) -> None:
     """Even a signed malformed clear cannot cover a nonexistent or future activation."""
-    clock, _store, reconciler = _services()
-    reconciler.compare(_snapshot(cash=Decimal("89")), _ledger(), ())
-    reconciler.safety_repository.record_many(
-        (
-            SafetyEvent(
-                "malformed-clear",
-                "kill_switch.cleared",
-                "live-kill-switch",
-                payload,
-                clock.now(),
-            ),
-        )
+    clock = FrozenClock(DEFAULT_INSTANT)
+    store = EventStore(create_engine_and_schema("sqlite+pysqlite:///:memory:"))
+    repository = SafetyRepository(
+        audit_log=AuditLog(store, clock),
+        authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"r" * 32),
     )
-    assert reconciler.kill_switch_active() is True
+    capability = repository.reconciliation_capability()
+    with pytest.raises(TypeError):
+        capability.clear_kill_switch(**payload)  # type: ignore[arg-type]
 
 
 def test_broker_and_full_ledger_hashes_are_context_independent_and_collision_free() -> None:
@@ -394,7 +395,7 @@ def test_reconciliation_persistence_exception_has_no_secret_context() -> None:
     _clock, _store, reconciler = _services()
     with (
         patch.object(
-            SafetyRepository,
+            AuditLog,
             "record_many",
             side_effect=RuntimeError("api_key=secret-token-123"),
         ),

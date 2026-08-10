@@ -24,8 +24,10 @@ from market_sentinel.execution.reconcile import (
     ReconciliationReport,
 )
 from market_sentinel.execution.safety import (
+    ApprovalSafetyCapability,
+    LiveSafetyCapability,
+    ReconciliationSafetyCapability,
     SafetyAuthenticator,
-    SafetyEvent,
     SafetyIntegrityError,
     SafetyRepository,
 )
@@ -59,7 +61,9 @@ __all__ = [
     "ReconciliationReport",
     "SessionHead",
     "SafetyAuthenticator",
-    "SafetyEvent",
+    "ApprovalSafetyCapability",
+    "LiveSafetyCapability",
+    "ReconciliationSafetyCapability",
     "SafetyIntegrityError",
     "SafetyRepository",
 ]
