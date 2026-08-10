@@ -7,10 +7,12 @@ import gc
 import json
 import os
 import pickle
+import re
 import subprocess
 import tarfile
+import urllib.parse as url_parse_module
 import zipfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -20,11 +22,14 @@ from threading import Event, Lock, Thread, current_thread
 from types import MappingProxyType
 
 import pytest
+import typer
 from sqlalchemy import func, select
 from typer.testing import CliRunner
 
 import market_sentinel.cli as cli_module
+import market_sentinel.execution.live as live_module
 import market_sentinel.operations.dashboard as dashboard_module
+import market_sentinel.security as security_module
 from market_sentinel.brokers.preflight import PreflightReport, gate, required_gate_names
 from market_sentinel.cli import (
     CONFIRMATION_PHRASE,
@@ -333,6 +338,10 @@ class _LocalLiveBroker:
         self.query_calls = 0
         self.submit_error: BaseException | None = None
         self.order_id = "broker-order-1"
+        self.last_order: BrokerOrder | None = None
+        self.response_mutation: tuple[str, str] | None = None
+        self.submit_hook: Callable[[], None] | None = None
+        self._post_submit_clock_reads = 0
 
     def preflight(self) -> PreflightReport:
         return _ready_report(self.broker_name)
@@ -357,7 +366,9 @@ class _LocalLiveBroker:
         self.submit_calls += 1
         if self.submit_error is not None:
             raise self.submit_error
-        return BrokerOrder(
+        if self.submit_hook is not None:
+            self.submit_hook()
+        self.last_order = BrokerOrder(
             order_id=self.order_id,
             client_order_id=intent.intent_id,
             broker=self.broker_name,
@@ -370,11 +381,33 @@ class _LocalLiveBroker:
             submitted_at=AT,
             updated_at=AT,
         )
+        return self.last_order
+
+    def mutate_response_after_validation(self, field: str, value: str) -> None:
+        self.response_mutation = (field, value)
+
+    def on_clock_read(self) -> None:
+        if self.last_order is None or self.response_mutation is None:
+            return
+        self._post_submit_clock_reads += 1
+        if self._post_submit_clock_reads == 2:
+            field, value = self.response_mutation
+            object.__setattr__(self.last_order, field, value)
 
     def get_order_by_client_id(self, client_intent_id: str) -> BrokerOrder:
         del client_intent_id
         self.query_calls += 1
         raise RuntimeError("provider credential must not escape")
+
+
+class _LiveClock(FrozenClock):
+    def __init__(self, instant: datetime, broker: _LocalLiveBroker) -> None:
+        super().__init__(instant)
+        self._broker = broker
+
+    def now(self) -> datetime:
+        self._broker.on_clock_read()
+        return super().now()
 
 
 class _LiveHarness:
@@ -389,10 +422,11 @@ class _LiveHarness:
         self.engine = create_engine_and_schema(
             f"sqlite+pysqlite:///{tmp_path / 'live-cli.db'}"
         )
-        self.clock = FrozenClock(AT)
         self.broker_name = broker_name
         self.external_broker = external_broker
         self.instrument_id = instrument_id
+        self.broker = _LocalLiveBroker(broker_name)
+        self.clock = _LiveClock(AT, self.broker)
         self.store = EventStore(self.engine)
         nonces = count(1)
         nonce_lock = Lock()
@@ -418,7 +452,6 @@ class _LiveHarness:
             clock=self.clock,
         )
         self.report = self.healthy_report()
-        self.broker = _LocalLiveBroker(broker_name)
         self.live = LiveOrderService(
             broker=self.broker,
             approval_service=self.approval,
@@ -432,6 +465,13 @@ class _LiveHarness:
     def event_count(self) -> int:
         with self.engine.connect() as connection:
             return int(connection.scalar(select(func.count()).select_from(events)) or 0)
+
+    def audit_rows(self) -> tuple[tuple[str, str], ...]:
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(events.c.kind, events.c.payload_json).order_by(events.c.sequence)
+            )
+            return tuple((str(row.kind), str(row.payload_json)) for row in rows)
 
     def healthy_report(self) -> ReconciliationReport:
         return self.reconciler.compare(
@@ -1042,6 +1082,245 @@ def test_live_broker_order_output_rejects_natural_language_credentials(
     assert result.exit_code == 30
     assert result.stdout.strip() == '{"error":"LIVE_RESPONSE_INVALID"}'
     assert secret_value not in result.stdout
+
+
+_ENCODED_BROKER_IDENTIFIERS = (
+    ("order_id", "%42asic+QWxhZGRpbjpvcGVuIHNlc2FtZQ%3D%3D", "Basic QWxh"),
+    (
+        "client_order_id",
+        "%41uthorization+was+%42earer+live-token-value-123456",
+        "Authorization was Bearer",
+    ),
+    ("broker", "%43ookie%3A+session%3Dlive-cookie-value", "Cookie: session="),
+    ("instrument_id", "%61pi%5Fkey%3Dsecret-token-123456", "api_key="),
+    ("order_id", "%61ccess%4Bey%3Dlive-access-value-123456", "accessKey="),
+    ("client_order_id", "%70rivate%4Bey%3Dlive-private-value-123456", "privateKey="),
+    ("broker", "%63redential%3Dlive-credential-value-123456", "credential="),
+    ("instrument_id", "%70assword%3Dhunter-two-secret-value", "password="),
+    ("order_id", "%74oken%3Dlive-token-value-123456", "token="),
+    (
+        "client_order_id",
+        "%2541uthorization%253A%2520Bearer%2520double-encoded-token-123456",
+        "Authorization: Bearer",
+    ),
+    ("broker", "opaque%ZZprovider-value", "opaque"),
+    (
+        "instrument_id",
+        "X" * (4096 - len("-%61pi%5Fkey%3Dmax-length-secret-123456"))
+        + "-%61pi%5Fkey%3Dmax-length-secret-123456",
+        "api_key=max-length",
+    ),
+    ("order_id", "交易-%54oKeN%3Dunicode-secret-value-123456", "ToKeN="),
+    ("client_order_id", "é" * 2049, "ééé"),
+    (
+        "broker",
+        "%25252541uthorization%2525253A%25252520Bearer%25252520ambiguous-token",
+        "Authorization: Bearer",
+    ),
+    ("order_id", "\ud800", "\ud800"),
+    ("order_id", "%61pi+key%3DOpaqueValue123456", "api key="),
+    ("client_order_id", "%61pi%20key%3DOpaqueValue123456", "api key="),
+    ("broker", "%61ccess+key%3DOpaqueValue123456", "access key="),
+    ("instrument_id", "%70rivate+key%3DOpaqueValue123456", "private key="),
+    ("order_id", "%73ession+id%3DOpaqueValue123456", "session id="),
+    ("order_id", "%61pi%09key%3DOpaqueValue123456", "api\tkey="),
+    ("client_order_id", "api  key=OpaqueValue123456", "api  key="),
+    ("broker", "%61ccess%C2%A0key%3DOpaqueValue123456", "access\u00a0key="),
+    ("instrument_id", "%70rivate%2Ekey%3DOpaqueValue123456", "private.key="),
+    ("order_id", "%61pi%2Fkey%3DOpaqueValue123456", "api/key="),
+)
+
+
+@pytest.mark.parametrize(("field", "encoded_value", "decoded_marker"), _ENCODED_BROKER_IDENTIFIERS)
+def test_real_task14_cli_rejects_encoded_credentials_after_truthful_acknowledgement(
+    tmp_path: Path,
+    field: str,
+    encoded_value: str,
+    decoded_marker: str,
+) -> None:
+    """Encoded provider text must not escape after the one truthful broker acknowledgement."""
+    harness = _LiveHarness(tmp_path)
+    if field == "order_id":
+        harness.broker.order_id = encoded_value
+    else:
+        harness.broker.mutate_response_after_validation(field, encoded_value)
+
+    result = _live_cli_result(harness)
+    audit_rows = harness.audit_rows()
+    audit_text = json.dumps(audit_rows, ensure_ascii=False)
+
+    assert result.exit_code == 30
+    assert result.stdout.strip() == '{"error":"LIVE_RESPONSE_INVALID"}'
+    assert harness.broker.submit_calls == 1
+    assert harness.broker.query_calls == 0
+    assert "live.acknowledged" in {kind for kind, _payload in audit_rows}
+    assert "live.submission_unknown" not in {kind for kind, _payload in audit_rows}
+    for unsafe in (encoded_value, decoded_marker):
+        assert unsafe not in result.stdout
+        assert unsafe not in audit_text
+        assert result.exception is not None
+        error: BaseException | None = result.exception
+        while error is not None:
+            assert unsafe not in str(error)
+            if error.__cause__ is not None:
+                assert unsafe not in str(error.__cause__)
+            error = error.__context__
+
+
+def test_broker_identifier_secret_detection_is_shared_and_bounded() -> None:
+    """CLI and dashboard must reject the same encoded, malformed, and bounded text."""
+    for field in ("order_id", "client_order_id", "broker", "instrument_id"):
+        for encoded_value, _decoded_marker in (
+            (item[1], item[2]) for item in _ENCODED_BROKER_IDENTIFIERS
+        ):
+            order = BrokerOrder(
+                order_id="broker-order-1",
+                client_order_id="intent-1",
+                broker="alpaca",
+                instrument_id="AAPL@alpaca",
+                status=OrderStatus.ACKNOWLEDGED,
+                requested_quantity=Decimal("0.1"),
+                requested_notional=None,
+                filled_quantity=Decimal("0"),
+                average_fill_price=None,
+                submitted_at=AT,
+                updated_at=AT,
+            )
+            object.__setattr__(order, field, encoded_value)
+            emitted: list[Mapping[str, object]] = []
+
+            with pytest.raises(typer.Exit):
+                cli_module._emit_broker_order(
+                    order,
+                    secret_detector=cli_module._secret_shaped,
+                    emit=emitted.append,
+                )
+
+            assert emitted == []
+            assert dashboard_module._secret_value(encoded_value)
+
+
+def test_live_acknowledgement_uses_pre_provider_captured_audit_redactor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Broker-time module rebinding must not place a response credential in durable audit."""
+    harness = _LiveHarness(tmp_path)
+    credential = "api_key=OpaqueValue123456"
+    harness.broker.order_id = credential
+    harness.broker.submit_hook = lambda: monkeypatch.setattr(
+        live_module,
+        "redact_secret_text",
+        lambda value: value,
+    )
+
+    result = _live_cli_result(harness)
+    audit_rows = harness.audit_rows()
+    audit_text = json.dumps(audit_rows, ensure_ascii=False)
+
+    assert result.exit_code == 30
+    assert result.stdout.strip() == '{"error":"LIVE_RESPONSE_INVALID"}'
+    assert harness.broker.submit_calls == 1
+    assert harness.broker.query_calls == 0
+    assert "live.acknowledged" in {kind for kind, _payload in audit_rows}
+    assert credential not in result.stdout
+    assert credential not in audit_text
+
+
+def test_live_facade_rejects_pre_entry_double_rebound_audit_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Container-time replacement of both audit globals must fail before any durable effect."""
+    harness = _LiveHarness(tmp_path)
+    events_before = harness.event_count()
+    credential = "api_key=OpaqueValue123456"
+    harness.broker.order_id = credential
+
+    def unsafe_identity(value: str) -> str:
+        return value
+
+    def container_factory() -> ServiceContainer:
+        harness.live._audit_redactor = unsafe_identity
+        monkeypatch.setattr(live_module, "_AUDIT_REDACTOR", unsafe_identity)
+        monkeypatch.setattr(live_module, "redact_secret_text", unsafe_identity)
+        return ServiceContainer(live_submission=harness.facade())
+
+    result = CliRunner().invoke(build_app(container_factory), _live_cli_args(harness))
+
+    assert result.exit_code != 0
+    assert credential not in result.stdout
+    assert harness.broker.submit_calls == 0
+    assert harness.broker.query_calls == 0
+    assert harness.event_count() == events_before
+
+
+def test_broker_cannot_rebind_nested_secret_detector_dependencies(
+    tmp_path: Path,
+) -> None:
+    """Provider-time security-module mutation must not alter CLI or audit decisions."""
+    assert live_module._AUDIT_REDACTOR is live_module.redact_secret_text
+    harness = _LiveHarness(tmp_path)
+    credential = "api_key=OpaqueValue123456"
+    harness.broker.order_id = credential
+    originals = (
+        security_module._SECRET_TEXT,
+        security_module._MALFORMED_PERCENT_ESCAPE,
+        security_module.secret_text_present,
+        security_module._REDACTED,
+        url_parse_module.unquote,
+    )
+    nested_checks: list[bool] = []
+    nested_redactions: list[str] = []
+
+    def mutate_security_module() -> None:
+        security_module._SECRET_TEXT = re.compile(r"(?!x)x")
+        security_module._MALFORMED_PERCENT_ESCAPE = re.compile(r"(?!x)x")
+        security_module.secret_text_present = lambda value: False
+        security_module._REDACTED = credential
+        try:
+            url_parse_module.unquote = lambda value, *args, **kwargs: value
+            try:
+                nested_checks.extend(
+                    (
+                        cli_module._secret_shaped("%61pi%5Fkey%3DOpaqueValue123456"),
+                        dashboard_module._secret_value("%61pi%5Fkey%3DOpaqueValue123456"),
+                    )
+                )
+            finally:
+                url_parse_module.unquote = originals[4]
+            nested_redactions.append(harness.live._audit_redactor(credential))
+        finally:
+            (
+                security_module._SECRET_TEXT,
+                security_module._MALFORMED_PERCENT_ESCAPE,
+                security_module.secret_text_present,
+                security_module._REDACTED,
+            ) = originals[:4]
+
+    harness.broker.submit_hook = mutate_security_module
+    try:
+        result = _live_cli_result(harness)
+    finally:
+        (
+            security_module._SECRET_TEXT,
+            security_module._MALFORMED_PERCENT_ESCAPE,
+            security_module.secret_text_present,
+            security_module._REDACTED,
+            url_parse_module.unquote,
+        ) = originals
+    audit_rows = harness.audit_rows()
+    audit_text = json.dumps(audit_rows, ensure_ascii=False)
+
+    assert result.exit_code == 30
+    assert result.stdout.strip() == '{"error":"LIVE_RESPONSE_INVALID"}'
+    assert harness.broker.submit_calls == 1
+    assert harness.broker.query_calls == 0
+    assert nested_checks == [True, True]
+    assert nested_redactions == ["[REDACTED]"]
+    assert "live.acknowledged" in {kind for kind, _payload in audit_rows}
+    assert credential not in result.stdout
+    assert credential not in audit_text
 
 
 class _Calendar:

@@ -19,12 +19,12 @@ from fractions import Fraction
 from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol, cast
-from urllib.parse import unquote_plus
 
 from market_sentinel.brokers.preflight import required_gate_names
 from market_sentinel.domain.enums import OrderStatus
 from market_sentinel.domain.models import GateResult
 from market_sentinel.execution.canonical import CanonicalEncodingError, canonical_decimal
+from market_sentinel.security import secret_text_present
 
 _MAX_DEPTH = 12
 _MAX_NODES = 4_096
@@ -59,23 +59,6 @@ _SECRET_KEY_PARTS = (
     "accesskey",
     "callback",
     "exception",
-)
-_SECRET_VALUE = re.compile(
-    r"(?is)(?:\b(?:basic|bearer)\s+\S+|\bsk-[a-z0-9_-]{8,}|\bgh[pousr]_[a-z0-9]{20,}|"
-    r"\b(?:authorization|proxy[-_ ]authorization)\s+(?:is|was)\s+"
-    r"(?:basic|bearer)\s+\S+|"
-    r"\bAKIA[A-Z0-9]{16}\b|-----BEGIN[^-]*(?:PRIVATE|SECRET)[^-]*-----|"
-    r"[a-z0-9_-]{20,}\.[a-z0-9_-]{20,}\.[a-z0-9_-]{20,}|"
-    r"\b(?:api[_-]?key|access[_-]?(?:key|token)|private[_-]?key|client[_-]?secret|"
-    r"refresh[_-]?token|id[_-]?token|secret|token|password|credential|authorization|"
-    r"cookie|set[_-]?cookie|session(?:id)?)\b[\"']?\s*[:=]\s*[\"']?[^\s&;,\"'}]+|"
-    r"\b(?:api[_ -]?key|access[_ -]?(?:key|token)|private[_ -]?key|"
-    r"client[_ -]?secret|refresh[_ -]?token|id[_ -]?token|secret|token|"
-    r"password|credential|authorization|cookie|set[_ -]?cookie|session(?:id)?)"
-    r"\s+(?:is|was)\s+(?:basic\s+|bearer\s+)?[^\s&;,\"'}]+|"
-    r"\b(?:[a-z0-9]+[-_])?(?:real[-_])?(?:secret|token|password|credential|"
-    r"private[-_]?key|access[-_]?key)(?:[-_](?:value|key|token))?[-_:]"
-    r"[a-z0-9][a-z0-9_-]{7,}\b)"
 )
 _REDACTED = "[REDACTED]"
 
@@ -1245,7 +1228,4 @@ def _nonempty_exact_tuple(value: object, item_type: type[object], reason: str) -
         raise DashboardValidationError(reason)
 
 
-def _secret_value(value: str) -> bool:
-    return _SECRET_VALUE.search(value) is not None or _SECRET_VALUE.search(
-        unquote_plus(value)
-    ) is not None
+_secret_value = secret_text_present

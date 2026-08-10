@@ -48,6 +48,7 @@ from market_sentinel.operations.dashboard import (
 from market_sentinel.operations.dashboard import (
     export_dashboard as write_dashboard,
 )
+from market_sentinel.security import redact_secret_text, secret_text_present
 
 CONFIRMATION_PHRASE = "I_CONFIRM_REAL_MONEY_ORDER"
 _BROKERS = ("alpaca", "groww", "ccxt")
@@ -69,15 +70,6 @@ _CAPTURED_PREFLIGHT_MANIFESTS: Mapping[str, frozenset[str]] = MappingProxyType(
 )
 _APPROVAL_CREATE_IMPLEMENTATION = ApprovalService.create
 _LIVE_SUBMIT_IMPLEMENTATION = LiveOrderService.submit_confirmed
-_SECRET_TEXT = re.compile(
-    r"(?i)(?:\b(?:basic|bearer)\s+\S+|"
-    r"\b(?:authorization|proxy[-_ ]authorization|cookie|set[-_ ]cookie)"
-    r"\s*(?::|=|is\s|was\s)\s*(?:basic\s+|bearer\s+)?\S+|"
-    r"-----BEGIN|private.?key|access.?key|api.?key|secret|password|credential|"
-    r"gh[pousr]_|sk-[a-z0-9_-]{8,})"
-)
-
-
 class WorkflowService(Protocol):
     def run(self, request: WorkflowRequest) -> Mapping[str, object]: ...
 
@@ -373,6 +365,7 @@ def _live_facade_binding(handle: Task14CliLiveFacade) -> _Task14CliLiveBinding:
         or type(binding.preflight) is not PreflightReport
         or type(binding.reconciliation) is not ReconciliationReport
         or binding.live_order_service._approval is not binding.approval_service
+        or not binding.live_order_service.audit_boundary_intact
     ):
         raise ValueError("live CLI facade is not factory registered")
     try:
@@ -521,6 +514,7 @@ def create_task14_cli_live_facade(
         or type(preflight) is not PreflightReport
         or type(reconciliation) is not ReconciliationReport
         or live_order_service._approval is not approval_service
+        or not live_order_service.audit_boundary_intact
     ):
         raise ValueError("live CLI facade requires exact shared Task 14 services")
     try:
@@ -646,6 +640,7 @@ def build_app(
     proposal_matcher = _proposal_matches_request
     broker_order_emitter = _emit_broker_order
     secret_detector = _secret_shaped
+    audit_redactor_anchor = redact_secret_text
     mapping_emitter = _emit
     preflight_manifests = _CAPTURED_PREFLIGHT_MANIFESTS
     preflight_validator = _validated_preflight
@@ -867,6 +862,7 @@ def build_app(
                 and binding.reconciliation is reconciliation
                 and binding.store_identity is store_identity
                 and live_order_service._approval is approval_service
+                and live_order_service._audit_redactor is audit_redactor_anchor
                 and approval_service.safety_store_identity is store_identity
                 and live_order_service.safety_store_identity is store_identity
                 )
@@ -1283,8 +1279,7 @@ def _proposal_fingerprint(broker: str, intent: OrderIntent, risk: RiskDecision) 
     ).hexdigest()
 
 
-def _secret_shaped(value: object) -> bool:
-    return type(value) is str and _SECRET_TEXT.search(value) is not None
+_secret_shaped = secret_text_present
 
 
 def _validated_preflight(

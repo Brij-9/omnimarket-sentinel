@@ -31,7 +31,10 @@ from market_sentinel.execution.safety import (
     SafetyStateChangedError,
 )
 from market_sentinel.portfolio.ledger import PortfolioLedger
+from market_sentinel.security import redact_secret_text
 from market_sentinel.storage.events import EventHeadConflict
+
+_AUDIT_REDACTOR = redact_secret_text
 
 
 class LiveOrderError(RuntimeError):
@@ -95,6 +98,15 @@ class LiveOrderService:
         self._clock = clock
         self._ledger = ledger
         self._broker_name = broker_name
+        self._audit_redactor = _AUDIT_REDACTOR
+
+    @property
+    def audit_boundary_intact(self) -> bool:
+        """Report whether this exact service retains its construction-time redactor."""
+        return (
+            self._audit_redactor is _AUDIT_REDACTOR
+            and self._audit_redactor is redact_secret_text
+        )
 
     @property
     def safety_store_identity(self) -> object:
@@ -117,6 +129,9 @@ class LiveOrderService:
         reconciliation: ReconciliationReport,
     ) -> BrokerOrder:
         """Submit once after gates, atomically claimed confirmation, and start audit."""
+        audit_redactor = self._audit_redactor
+        if not self.audit_boundary_intact:
+            raise LiveOrderError("AUDIT_PERSISTENCE_FAILED")
         self._require_preflight(preflight)
         self._require_capabilities(intent)
         instant = _aware_utc(self._clock.now())
@@ -208,7 +223,7 @@ class LiveOrderService:
             self._safety.record_acknowledgement(
                 intent_id=intent.intent_id,
                 broker=self._broker_name,
-                broker_order_id=submitted.order_id,
+                broker_order_id=audit_redactor(submitted.order_id),
                 status=submitted.status.value,
                 submission_id=confirmation.confirmation_id,
                 occurred_at=acknowledged_at,
