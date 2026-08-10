@@ -220,6 +220,8 @@ python -m market_sentinel.cli export-dashboard
 
 A read-mostly local dashboard shows provider health, market freshness, research evidence, strategy/version, validation metrics, positions, risk budget, promotion status, order approvals, and the aspirational target gap. Alerts are emitted for risk breaches, stale inputs, provider degradation, reconciliation failure, and kill-switch activation.
 
+Dashboard file publication is platform-safe and fail-closed. Windows uses an open-handle-bound atomic replacement. POSIX exports directly link the held temporary-file descriptor to a currently absent destination; an existing or raced destination is never overwritten. Operators and automation must therefore use a fresh unique/versioned `.json` path for each POSIX export.
+
 ## 14. Security and compliance
 
 - `.env` and local state are excluded from Git.

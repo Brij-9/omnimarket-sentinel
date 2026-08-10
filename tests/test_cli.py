@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
 
 import click
 import pytest
@@ -63,6 +64,10 @@ class _SecretShapedWorkflow:
         del request
         return {
             "assignment": "api_key=secret-token-123",
+            "natural_one": "The api key is natural-secret-value-123",
+            "natural_two": "Authorization is Basic dXNlcjpwYXNzd29yZA==",
+            "natural_three": "Authorization was Bearer natural-bearer-value",
+            "natural_four": "Cookie is sessionid=natural-cookie-value",
             "header": "Authorization: Bearer header-value",
             "query": "https://local.invalid/?credential=live-value",
             "encoded": "https://local.invalid/?api%5Fkey=encoded-value",
@@ -275,6 +280,114 @@ def test_preflight_rejects_pass_reason_contradictions() -> None:
         assert result.stdout.strip() == '{"error":"PREFLIGHT_INVALID"}'
 
 
+def test_preflight_rejects_oversized_tuple_before_gate_field_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manifest length is rejected before traversing or hashing any gate fields."""
+    sample = GateResult(name="MARKET_SENTINEL_MODE", passed=True, reason_code="OK")
+    report = PreflightReport("alpaca", (sample,) * 513)
+    original_getattribute = GateResult.__getattribute__
+    accessed: list[str] = []
+
+    def observe(self: GateResult, name: str) -> object:
+        if name in {"name", "passed", "reason_code"}:
+            accessed.append(name)
+        return original_getattribute(self, name)
+
+    monkeypatch.setattr(GateResult, "__getattribute__", observe)
+
+    assert cli_module._validated_preflight(report, "alpaca") is None
+    assert accessed == []
+
+
+@pytest.mark.parametrize(
+    ("name", "reason"),
+    (("X" * 10_000, "OK"), ("MARKET_SENTINEL_MODE", "R" * 10_000)),
+)
+def test_preflight_rejects_oversized_gate_strings(name: str, reason: str) -> None:
+    """Gate identifiers and reasons are bounded before set/hash work."""
+    required = sorted(required_gate_names("alpaca"))
+    gates = [GateResult(name=item, passed=True, reason_code="OK") for item in required]
+    gates[0] = GateResult(name=name, passed=reason == "OK", reason_code=reason)
+
+    assert cli_module._validated_preflight(
+        PreflightReport("alpaca", tuple(gates)),
+        "alpaca",
+    ) is None
+
+
+def test_preflight_uses_captured_manifest_before_provider_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider cannot replace the imported manifest helper and forge readiness."""
+    class _ManifestMutatingPreflight:
+        def run(self, broker: str) -> PreflightReport:
+            monkeypatch.setattr(
+                cli_module,
+                "required_gate_names",
+                lambda name: {f"ATTACKER_{name}"},
+            )
+            return PreflightReport(broker, (gate(f"ATTACKER_{broker}", True),))
+
+    result = CliRunner().invoke(
+        build_app(lambda: ServiceContainer(preflight=_ManifestMutatingPreflight())),
+        ["live-preflight", "--broker", "alpaca"],
+    )
+
+    assert result.exit_code == 20
+    assert result.stdout.strip() == '{"error":"PREFLIGHT_INVALID"}'
+
+
+def test_preflight_rejects_rebound_captured_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider cannot rebind the immutable manifest name to forge readiness."""
+    class _ManifestRebindingPreflight:
+        def run(self, broker: str) -> PreflightReport:
+            monkeypatch.setattr(
+                cli_module,
+                "_CAPTURED_PREFLIGHT_MANIFESTS",
+                MappingProxyType(
+                    {
+                        "alpaca": frozenset({"X"}),
+                        "groww": frozenset({"X"}),
+                        "ccxt-spot": frozenset({"X"}),
+                    }
+                ),
+            )
+            return PreflightReport(broker, (gate("X", True),))
+
+    result = CliRunner().invoke(
+        build_app(lambda: ServiceContainer(preflight=_ManifestRebindingPreflight())),
+        ["live-preflight", "--broker", "alpaca"],
+    )
+
+    assert result.exit_code == 20
+    assert result.stdout.strip() == '{"error":"PREFLIGHT_INVALID"}'
+
+
+def test_preflight_rejects_rebound_validator_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider cannot replace the exact validator and forge readiness."""
+    class _ValidatorRebindingPreflight:
+        def run(self, broker: str) -> PreflightReport:
+            monkeypatch.setattr(
+                cli_module,
+                "_validated_preflight",
+                lambda report, requested, manifests: ([], True),
+            )
+            return PreflightReport(broker, (gate("X", True),))
+
+    result = CliRunner().invoke(
+        build_app(lambda: ServiceContainer(preflight=_ValidatorRebindingPreflight())),
+        ["live-preflight", "--broker", "alpaca"],
+    )
+
+    assert result.exit_code == 20
+    assert result.stdout.strip() == '{"error":"PREFLIGHT_INVALID"}'
+
+
 def test_workflows_require_canonical_instrument_and_aware_dates_without_traceback() -> None:
     """Malformed instruments and naive dates must stop before injected work runs."""
     app = build_app(lambda: _container())
@@ -347,6 +460,10 @@ def test_workflow_output_redacts_assignment_query_header_and_encoded_secrets() -
     assert result.exception is None
     assert json.loads(result.stdout) == {
         "assignment": "[REDACTED]",
+        "natural_four": "[REDACTED]",
+        "natural_one": "[REDACTED]",
+        "natural_three": "[REDACTED]",
+        "natural_two": "[REDACTED]",
         "encoded": "[REDACTED]",
         "header": "[REDACTED]",
         "provider_text": "[REDACTED]",
@@ -358,6 +475,10 @@ def test_workflow_output_redacts_assignment_query_header_and_encoded_secrets() -
         "live-value",
         "encoded-value",
         "groww-real-secret-value-1234567890",
+        "natural-secret-value-123",
+        "dXNlcjpwYXNzd29yZA",
+        "natural-bearer-value",
+        "natural-cookie-value",
     ):
         assert forbidden not in result.stdout
 

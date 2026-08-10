@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta
@@ -12,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import market_sentinel.operations.dashboard as dashboard_module
 from market_sentinel.brokers.preflight import required_gate_names
 from market_sentinel.domain.clock import FrozenClock
 from market_sentinel.domain.enums import OrderStatus
@@ -173,11 +173,11 @@ def test_dashboard_atomic_replace_preserves_old_file_and_cleans_temp_on_failure(
     destination = tmp_path / "status.json"
     destination.write_text("old", encoding="utf-8")
 
-    def fail_replace(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
-        del source, target
+    def fail_commit(*args: object, **kwargs: object) -> None:
+        del args, kwargs
         raise OSError("simulated")
 
-    monkeypatch.setattr(os, "replace", fail_replace)
+    monkeypatch.setattr(dashboard_module, "_commit_open_temp", fail_commit)
     with pytest.raises(DashboardValidationError, match="DASHBOARD_WRITE_FAILED") as failure:
         export_dashboard(_status(), destination)
 

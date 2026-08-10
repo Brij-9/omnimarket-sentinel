@@ -16,7 +16,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from itertools import count
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Event, Lock, Thread, current_thread
+from types import MappingProxyType
 
 import pytest
 from sqlalchemy import func, select
@@ -36,10 +37,16 @@ from market_sentinel.cli import (
 )
 from market_sentinel.domain.clock import FrozenClock
 from market_sentinel.domain.enums import AssetClass, OrderStatus, OrderType
-from market_sentinel.domain.models import BrokerOrder, GateResult, MarketSnapshot, OrderIntent
+from market_sentinel.domain.models import (
+    BrokerOrder,
+    GateResult,
+    MarketSnapshot,
+    OrderIntent,
+    RiskDecision,
+)
 from market_sentinel.execution.approval import ApprovalService
 from market_sentinel.execution.base import BrokerCapabilities
-from market_sentinel.execution.live import LiveOrderError, LiveOrderService
+from market_sentinel.execution.live import LiveOrderService
 from market_sentinel.execution.reconcile import (
     BrokerReconciliationSnapshot,
     Reconciler,
@@ -69,6 +76,19 @@ from tests.factories import snapshot
 
 AT = datetime(2026, 8, 9, 10, tzinfo=UTC)
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _require_posix_otmpfile(path: Path) -> None:
+    """Skip integration only when the selected POSIX filesystem lacks O_TMPFILE."""
+    flag = getattr(os, "O_TMPFILE", 0)
+    if not flag:
+        pytest.skip("POSIX O_TMPFILE is unavailable")
+    try:
+        descriptor = os.open(path, os.O_RDWR | flag, 0o600)
+    except OSError:
+        pytest.skip("tmp_path filesystem does not support O_TMPFILE")
+    else:
+        os.close(descriptor)
 
 
 class _ReadyPreflight:
@@ -312,6 +332,7 @@ class _LocalLiveBroker:
         self.submit_calls = 0
         self.query_calls = 0
         self.submit_error: BaseException | None = None
+        self.order_id = "broker-order-1"
 
     def preflight(self) -> PreflightReport:
         return _ready_report(self.broker_name)
@@ -337,7 +358,7 @@ class _LocalLiveBroker:
         if self.submit_error is not None:
             raise self.submit_error
         return BrokerOrder(
-            order_id="broker-order-1",
+            order_id=self.order_id,
             client_order_id=intent.intent_id,
             broker=self.broker_name,
             instrument_id=intent.instrument_id,
@@ -495,7 +516,6 @@ def _live_cli_result(
     return CliRunner().invoke(
         build_app(
             lambda: ServiceContainer(
-                proposal=_TypedProposal(),
                 live_submission=harness.facade() if facade is None else facade,
             )
         ),
@@ -513,6 +533,37 @@ def test_real_task14_cli_facade_submits_one_exact_typed_order(tmp_path: Path) ->
     assert harness.broker.submit_calls == 1
     assert json.loads(result.stdout)["status"] == "acknowledged"
     assert harness.broker.query_calls == 0
+
+
+def test_live_command_rejects_without_executing_in_process_proposal_provider(
+    tmp_path: Path,
+) -> None:
+    """Live authority never crosses an arbitrary same-process proposal callback."""
+    harness = _LiveHarness(tmp_path)
+    events_before = harness.event_count()
+    calls = 0
+
+    class _EffectfulProposal:
+        def propose(self, request: BoundOrderRequest) -> OrderProposal:
+            nonlocal calls
+            calls += 1
+            harness.broker.submit(
+                request.domain_intent(),
+                snapshot(instrument_id=harness.instrument_id),
+            )
+            return OrderProposal.accept(request)
+
+    container = ServiceContainer(
+        proposal=_EffectfulProposal(),
+        live_submission=harness.facade(),
+    )
+    result = CliRunner().invoke(build_app(lambda: container), _live_cli_args(harness))
+
+    assert result.exit_code == 30
+    assert result.stdout.strip() == '{"error":"PROPOSAL_RESPONSE_INVALID"}'
+    assert calls == 0
+    assert harness.broker.submit_calls == 0
+    assert harness.event_count() == events_before
 
 
 def test_real_task14_cli_facade_normalizes_ccxt_external_broker_alias(tmp_path: Path) -> None:
@@ -565,6 +616,302 @@ def test_live_submit_captures_registry_validated_facade_across_proposal_call(
     assert result.exit_code != 0
     assert harness.broker.submit_calls == 0
     assert harness.event_count() == events_before
+
+
+@pytest.mark.parametrize(
+    "attack",
+    (
+        "class_submit",
+        "module_resolver",
+        "approval_create",
+        "live_submit_confirmed",
+        "proposal_reconstructor",
+        "proposal_validator",
+        "proposal_matcher",
+        "broker_order_emitter",
+    ),
+)
+def test_live_dispatch_is_fixed_before_proposal_can_mutate_dynamic_attributes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attack: str,
+) -> None:
+    """Proposal code cannot redirect live dispatch through a class or module lookup."""
+    harness = _LiveHarness(tmp_path)
+    events_before = harness.event_count()
+    dynamic_calls: list[str] = []
+
+    def class_submit(
+        facade: Task14CliLiveFacade,
+        proposal: OrderProposal,
+        phrase: str,
+    ) -> BrokerOrder:
+        del facade, phrase
+        return harness.broker.submit(
+            proposal.intent,
+            snapshot(instrument_id=harness.instrument_id),
+        )
+
+    class _FakeApproval:
+        def create(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return object()
+
+    class _FakeLive:
+        broker_name = "alpaca"
+
+        def submit_confirmed(self, **kwargs: object) -> BrokerOrder:
+            intent = kwargs["intent"]
+            market = kwargs["snapshot"]
+            assert type(intent) is OrderIntent
+            assert type(market) is MarketSnapshot
+            return harness.broker.submit(intent, market)
+
+    class _FakeBinding:
+        approval_service = _FakeApproval()
+        live_order_service = _FakeLive()
+        snapshot = snapshot()
+        preflight = _ready_report()
+        reconciliation = harness.report
+
+    class _AttackingProposal:
+        def propose(self, request: BoundOrderRequest) -> OrderProposal:
+            if attack == "class_submit":
+                monkeypatch.setattr(Task14CliLiveFacade, "submit", class_submit)
+            elif attack == "module_resolver":
+                monkeypatch.setattr(
+                    cli_module,
+                    "_live_facade_binding",
+                    lambda facade: _FakeBinding(),
+                )
+            elif attack == "approval_create":
+                def fake_create(*args: object, **kwargs: object) -> object:
+                    del args, kwargs
+                    dynamic_calls.append("approval_create")
+                    raise RuntimeError("dynamic approval method must not run")
+
+                monkeypatch.setattr(ApprovalService, "create", fake_create)
+            elif attack == "live_submit_confirmed":
+                def fake_submit(*args: object, **kwargs: object) -> BrokerOrder:
+                    del args
+                    dynamic_calls.append("live_submit_confirmed")
+                    intent = kwargs["intent"]
+                    market = kwargs["snapshot"]
+                    assert type(intent) is OrderIntent
+                    assert type(market) is MarketSnapshot
+                    return harness.broker.submit(intent, market)
+
+                monkeypatch.setattr(LiveOrderService, "submit_confirmed", fake_submit)
+            elif attack == "proposal_reconstructor":
+                def fake_reconstruct(value: object) -> OrderProposal:
+                    assert type(value) is OrderProposal
+                    dynamic_calls.append("proposal_reconstructor")
+                    harness.broker.submit(
+                        value.intent,
+                        snapshot(instrument_id=harness.instrument_id),
+                    )
+                    return value
+
+                monkeypatch.setattr(
+                    cli_module,
+                    "_reconstruct_order_proposal",
+                    fake_reconstruct,
+                )
+            elif attack == "proposal_validator":
+                def fake_validator(
+                    value: object,
+                    expected: BoundOrderRequest,
+                ) -> OrderProposal:
+                    del expected
+                    assert type(value) is OrderProposal
+                    dynamic_calls.append("proposal_validator")
+                    harness.broker.submit(
+                        value.intent,
+                        snapshot(instrument_id=harness.instrument_id),
+                    )
+                    return value
+
+                monkeypatch.setattr(cli_module, "_validated_proposal", fake_validator)
+            elif attack == "proposal_matcher":
+                def fake_matcher(value: object, expected: object) -> bool:
+                    del expected
+                    assert type(value) is OrderProposal
+                    dynamic_calls.append("proposal_matcher")
+                    harness.broker.submit(
+                        value.intent,
+                        snapshot(instrument_id=harness.instrument_id),
+                    )
+                    return True
+
+                monkeypatch.setattr(cli_module, "_proposal_matches_request", fake_matcher)
+            else:
+                def fake_emitter(value: BrokerOrder) -> None:
+                    del value
+                    dynamic_calls.append("broker_order_emitter")
+
+                monkeypatch.setattr(cli_module, "_emit_broker_order", fake_emitter)
+            return OrderProposal.accept(request)
+
+    container = ServiceContainer(
+        proposal=_AttackingProposal(),
+        live_submission=harness.facade(),
+    )
+    result = CliRunner().invoke(build_app(lambda: container), _live_cli_args(harness))
+
+    assert result.exit_code != 0
+    assert harness.broker.submit_calls == 0
+    assert harness.event_count() == events_before
+    assert dynamic_calls == []
+
+
+def test_live_proposal_cannot_rebind_request_domain_methods(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider code cannot redefine the request that was parsed before it ran."""
+    harness = _LiveHarness(tmp_path)
+    events_before = harness.event_count()
+
+    class _RequestMethodAttack:
+        def propose(self, request: BoundOrderRequest) -> OrderProposal:
+            forged_intent = request.domain_intent().model_copy(
+                update={"quantity": Decimal("0.2")}
+            )
+            forged_risk = request.domain_risk().model_copy(
+                update={
+                    "approved_quantity": Decimal("0.2"),
+                    "approved_notional": Decimal("20"),
+                }
+            )
+            forged_fingerprint = cli_module._proposal_fingerprint(
+                request.broker,
+                forged_intent,
+                forged_risk,
+            )
+            monkeypatch.setattr(
+                BoundOrderRequest,
+                "domain_intent",
+                lambda self: forged_intent,
+            )
+            monkeypatch.setattr(
+                BoundOrderRequest,
+                "domain_risk",
+                lambda self: forged_risk,
+            )
+            monkeypatch.setattr(
+                BoundOrderRequest,
+                "fingerprint",
+                lambda self: forged_fingerprint,
+            )
+            return OrderProposal(
+                True,
+                (),
+                request.broker,
+                forged_intent,
+                forged_risk,
+                forged_fingerprint,
+            )
+
+    container = ServiceContainer(
+        proposal=_RequestMethodAttack(),
+        live_submission=harness.facade(),
+    )
+    result = CliRunner().invoke(build_app(lambda: container), _live_cli_args(harness))
+
+    assert result.exit_code != 0
+    assert harness.broker.submit_calls == 0
+    assert harness.event_count() == events_before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "accepted_int",
+        "accepted_string",
+        "accepted_with_denial",
+        "reasons_list",
+        "reason_bool",
+        "risk_approved_int",
+        "risk_reasons_list",
+        "intent_route_bool",
+    ),
+)
+def test_live_submit_deep_reconstructs_mutated_proposal_before_authority(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Only a deeply reconstructed exact proposal may reach confirmation issuance."""
+    harness = _LiveHarness(tmp_path)
+    events_before = harness.event_count()
+
+    class _MutatingProposal:
+        def propose(self, request: BoundOrderRequest) -> OrderProposal:
+            proposal = OrderProposal.accept(request)
+            if mutation == "accepted_int":
+                object.__setattr__(proposal, "accepted", 1)
+            elif mutation == "accepted_string":
+                object.__setattr__(proposal, "accepted", "true")
+            elif mutation == "accepted_with_denial":
+                object.__setattr__(proposal, "reason_codes", ("STRATEGY_DENIED",))
+            elif mutation == "reasons_list":
+                object.__setattr__(proposal, "reason_codes", [])
+            elif mutation == "reason_bool":
+                object.__setattr__(proposal, "reason_codes", (True,))
+            elif mutation == "risk_approved_int":
+                object.__setattr__(proposal.risk_decision, "approved", 1)
+            elif mutation == "risk_reasons_list":
+                object.__setattr__(proposal.risk_decision, "reason_codes", [])
+            else:
+                object.__setattr__(proposal.intent, "time_in_force", True)
+            return proposal
+
+    container = ServiceContainer(
+        proposal=_MutatingProposal(),
+        live_submission=harness.facade(),
+    )
+    result = CliRunner().invoke(build_app(lambda: container), _live_cli_args(harness))
+
+    assert result.exit_code == 30
+    assert result.stdout.strip() == '{"error":"PROPOSAL_RESPONSE_INVALID"}'
+    assert harness.broker.submit_calls == 0
+    assert harness.event_count() == events_before
+
+
+@pytest.mark.parametrize("mutation", ("risk_reasons", "intent_string"))
+def test_proposal_nested_bounds_run_before_model_dump(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """Oversized nested fields fail before Pydantic copies or hashes them."""
+    proposal = OrderProposal.accept(_LiveHarness(tmp_path).request)
+    dumps: list[str] = []
+    original_intent_dump = OrderIntent.model_dump
+    original_risk_dump = RiskDecision.model_dump
+
+    def intent_dump(self: OrderIntent, *args: object, **kwargs: object) -> object:
+        dumps.append("intent")
+        return original_intent_dump(self, *args, **kwargs)
+
+    def risk_dump(self: RiskDecision, *args: object, **kwargs: object) -> object:
+        dumps.append("risk")
+        return original_risk_dump(self, *args, **kwargs)
+
+    monkeypatch.setattr(OrderIntent, "model_dump", intent_dump)
+    monkeypatch.setattr(RiskDecision, "model_dump", risk_dump)
+    if mutation == "risk_reasons":
+        object.__setattr__(
+            proposal.risk_decision,
+            "reason_codes",
+            ("OVERSIZED",) * 100_000,
+        )
+    else:
+        object.__setattr__(proposal.intent, "time_in_force", "X" * 100_000)
+
+    with pytest.raises(ValueError, match="malformed"):
+        cli_module._reconstruct_order_proposal(proposal)
+
+    assert dumps == []
 
 
 @pytest.mark.parametrize("gate_name", ("confirmation", "preflight", "risk", "reconciliation"))
@@ -659,9 +1006,9 @@ def test_unknown_outcome_persists_and_blocks_next_cli_order_without_another_subm
     """A real Task 14 UNKNOWN result activates durable safety before the next CLI call."""
     harness = _LiveHarness(tmp_path)
     harness.broker.submit_error = TimeoutError("api_key=must-not-leak")
-    first = OrderProposal.accept(harness.request)
-    with pytest.raises(LiveOrderError, match="SUBMISSION_UNKNOWN"):
-        harness.facade().submit(first, CONFIRMATION_PHRASE)
+    first_result = _live_cli_result(harness)
+    assert first_result.exit_code == 30
+    assert first_result.stdout.strip() == '{"error":"LIVE_SUBMISSION_REJECTED"}'
     assert harness.broker.submit_calls == 1
     harness.broker.submit_error = None
     harness.request = harness.order_request("intent-2")
@@ -671,6 +1018,30 @@ def test_unknown_outcome_persists_and_blocks_next_cli_order_without_another_subm
     assert result.exit_code == 30
     assert harness.broker.submit_calls == 1
     assert "must-not-leak" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "secret_value",
+    (
+        "Authorization is Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+        "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+        "Cookie is session=live-cookie-value",
+        "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+    ),
+)
+def test_live_broker_order_output_rejects_natural_language_credentials(
+    tmp_path: Path,
+    secret_value: str,
+) -> None:
+    """Broker-controlled identifiers cannot emit Basic auth or cookie material."""
+    harness = _LiveHarness(tmp_path)
+    harness.broker.order_id = secret_value
+
+    result = _live_cli_result(harness)
+
+    assert result.exit_code == 30
+    assert result.stdout.strip() == '{"error":"LIVE_RESPONSE_INVALID"}'
+    assert secret_value not in result.stdout
 
 
 class _Calendar:
@@ -976,6 +1347,89 @@ def test_dashboard_reconstruction_bounds_nested_broker_gates_before_copying() ->
         dashboard_module._revalidated_dashboard_status(status)
 
 
+def test_dashboard_bounds_gate_names_before_hashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tampered exact gate must be rejected before an oversized name reaches set/hash."""
+    status = _dashboard_status()
+    object.__setattr__(status.brokers[0].gates[0], "name", "X" * 100_000)
+    hash_attempts: list[int] = []
+    builtin_set = set
+
+    def bounded_set(values: object) -> set[object]:
+        items = list(values)  # type: ignore[arg-type]
+        hash_attempts.extend(len(item) for item in items if type(item) is str)
+        return builtin_set(items)
+
+    monkeypatch.setattr(dashboard_module, "set", bounded_set, raising=False)
+
+    with pytest.raises(DashboardValidationError, match="DASHBOARD_BROKER_GATES_INVALID"):
+        dashboard_module._revalidated_dashboard_status(status)
+
+    assert hash_attempts == []
+
+
+def test_dashboard_uses_captured_immutable_broker_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider-time mutation of the imported manifest helper cannot redefine safety."""
+    status = _dashboard_status()
+    monkeypatch.setattr(
+        dashboard_module,
+        "required_gate_names",
+        lambda broker: {f"ATTACKER_{broker}"},
+    )
+
+    reconstructed = dashboard_module._revalidated_dashboard_status(status)
+
+    assert reconstructed.brokers[0].gates == status.brokers[0].gates
+
+
+def test_dashboard_rejects_rebound_captured_manifest_before_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider code cannot rebind the immutable manifest name to forge readiness."""
+    status = _dashboard_status()
+    object.__setattr__(
+        status.brokers[0],
+        "gates",
+        (GateResult(name="X", passed=True, reason_code="OK"),),
+    )
+    forged = MappingProxyType(
+        {
+            "alpaca": frozenset({"X"}),
+            "groww": frozenset({"X"}),
+            "ccxt": frozenset({"X"}),
+        }
+    )
+    monkeypatch.setattr(dashboard_module, "_CAPTURED_GATE_MANIFESTS", forged)
+
+    with pytest.raises(DashboardValidationError, match="DASHBOARD_STATUS_INVALID"):
+        export_dashboard(status, tmp_path / "forged-manifest.json")
+
+
+def test_dashboard_rejects_rebound_manifest_lookup_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A helper rebind cannot redefine the immutable broker gate manifest."""
+    status = _dashboard_status()
+    object.__setattr__(
+        status.brokers[0],
+        "gates",
+        (GateResult(name="X", passed=True, reason_code="OK"),),
+    )
+    monkeypatch.setattr(
+        dashboard_module,
+        "_captured_gate_manifest",
+        lambda broker, manifests=None: frozenset({"X"}),
+    )
+
+    with pytest.raises(DashboardValidationError, match="DASHBOARD_STATUS_INVALID"):
+        export_dashboard(status, tmp_path / "forged-helper.json")
+
+
 def test_dashboard_aspiration_bounds_decimals_before_fraction_arithmetic() -> None:
     """Huge finite exponents must fail before constructing unbounded Fractions."""
     huge = Decimal("1E+5000")
@@ -1016,6 +1470,15 @@ def test_dashboard_drops_camelcase_access_private_and_pem_secrets(tmp_path: Path
         "live-value",
     ):
         assert forbidden not in text
+
+
+def test_dashboard_redacts_standalone_basic_authorization_value() -> None:
+    """A free-text Basic authorization scheme is never serialized."""
+    prepared = safe_json_mapping(
+        {"note": "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="}
+    )
+
+    assert prepared == {"note": "[REDACTED]"}
 
 
 def test_safe_json_converts_surrogate_failures_to_context_free_validation() -> None:
@@ -1086,27 +1549,36 @@ def test_dashboard_blocks_parent_swap_inside_final_replace_window(
     destination = parent / "status.json"
     destination.write_text("old", encoding="utf-8")
     original_replace = os.replace
+    original_commit = dashboard_module._commit_open_temp
+    parent_moved = False
 
-    def swap_parent_then_replace(
-        source: str | os.PathLike[str],
-        target: str | os.PathLike[str],
-    ) -> None:
-        source_path = Path(source)
+    def swap_parent_then_commit(*args: object, **kwargs: object) -> object:
+        nonlocal parent_moved
         original_replace(parent, parked)
+        parent_moved = True
         parent.mkdir()
-        original_replace(parked / source_path.name, parent / source_path.name)
-        original_replace(parent / source_path.name, target)
+        return original_commit(*args, **kwargs)
 
-    monkeypatch.setattr(os, "replace", swap_parent_then_replace)
+    monkeypatch.setattr(
+        dashboard_module,
+        "_commit_open_temp",
+        swap_parent_then_commit,
+    )
 
     with pytest.raises(DashboardValidationError, match="DASHBOARD_WRITE_FAILED"):
         export_dashboard(_dashboard_status(), destination)
 
-    assert destination.read_text(encoding="utf-8") == "old"
-    assert not parked.exists()
+    if parent_moved:
+        assert not destination.exists()
+        assert (parked / "status.json").read_text(encoding="utf-8") == "old"
+        assert not list(parked.glob(".status.json.*.tmp"))
+    else:
+        assert destination.read_text(encoding="utf-8") == "old"
+        assert not parked.exists()
 
 
 @pytest.mark.parametrize("hook", ("after_write", "pre_replace"))
+@pytest.mark.skipif(os.name != "nt", reason="named-temp replacement is Windows-only")
 def test_dashboard_rejects_temp_name_swap_while_preserving_old_destination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1147,81 +1619,549 @@ def test_dashboard_rejects_temp_name_swap_while_preserving_old_destination(
         export_dashboard(_dashboard_status(), destination)
 
     assert destination.read_text(encoding="utf-8") == "old"
-    assert not parked.exists()
+    attacker_entry = next(tmp_path.glob(".status.json.*.tmp"))
+    assert attacker_entry.read_text(encoding="utf-8") == "attacker-content"
+    if parked.exists():
+        assert "attacker-content" not in parked.read_text(encoding="utf-8")
     assert "attacker-content" not in destination.read_text(encoding="utf-8")
 
 
-def test_posix_backup_uses_authoritative_parent_descriptor(
+@pytest.mark.skipif(os.name != "nt", reason="handle-bound replacement is Windows-only")
+def test_dashboard_commit_binds_open_temp_handle_after_final_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Rollback observation and linking must use the already-validated parent fd."""
-    destination_path = tmp_path / "status.json"
-    destination_path.write_text("old", encoding="utf-8")
-    destination = dashboard_module._validated_destination(destination_path)
-    details = destination_path.lstat()
-    observed: list[tuple[object, object, object]] = []
+    """A name swap after the last check must never become reader-visible at commit."""
+    destination = tmp_path / "status.json"
+    destination.write_text("old", encoding="utf-8")
+    parked = tmp_path / "parked-open-temp.tmp"
+    original_commit = dashboard_module._commit_open_temp
+    original_replaced_check = dashboard_module._require_replaced_identity
+    swapped = False
+    reader_observations: list[str] = []
 
-    def fd_stat(
-        path: object,
-        *,
-        dir_fd: object = None,
-        follow_symlinks: object = True,
-    ) -> os.stat_result:
-        observed.append((path, dir_fd, follow_symlinks))
-        return details
+    def swap_after_final_check(*args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            temporary = next(tmp_path.glob(".status.json.*.tmp"))
+            os.replace(temporary, parked)
+            temporary.write_text("attacker-content", encoding="utf-8")
+        return original_commit(*args, **kwargs)
 
-    def fd_link(
-        source: object,
-        target: object,
-        *,
-        src_dir_fd: object = None,
-        dst_dir_fd: object = None,
-        follow_symlinks: object = True,
+    def observe_immediate_commit(
+        descriptor: int,
+        target: Path,
+        expected: tuple[int, int, int],
+        guard: object,
     ) -> None:
-        assert follow_symlinks is False
-        observed.append((source, src_dir_fd, dst_dir_fd))
+        try:
+            reader_observations.append(target.read_text(encoding="utf-8"))
+        except PermissionError:
+            reader_observations.append("reader-blocked-by-open-commit-handle")
+        original_replaced_check(
+            descriptor,
+            target,
+            expected,
+            guard,  # type: ignore[arg-type]
+        )
 
-    monkeypatch.setattr(dashboard_module.os, "stat", fd_stat)
-    monkeypatch.setattr(dashboard_module.os, "link", fd_link)
-    guard = dashboard_module._DirectoryGuard(91)
-
-    backup = dashboard_module._backup_destination(destination, guard)
-
-    assert backup is not None
-    assert (destination_path.name, 91, False) in observed
-    assert any(item[1:] == (91, 91) for item in observed)
-
-
-def test_posix_identity_cleanup_enumerates_authoritative_parent_descriptor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Failure cleanup must not enumerate a lexical parent that may have been swapped."""
-    observed: list[object] = []
-
-    class _EmptyScandir:
-        def __enter__(self) -> _EmptyScandir:
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            del args
-
-        def __iter__(self) -> Iterator[object]:
-            return iter(())
-
-    def scandir(path: object) -> _EmptyScandir:
-        observed.append(path)
-        return _EmptyScandir()
-
-    monkeypatch.setattr(dashboard_module.os, "scandir", scandir)
-    dashboard_module._cleanup_file_identity(
-        tmp_path,
-        dashboard_module._DirectoryGuard(92),
-        (1, 2, 3),
+    monkeypatch.setattr(
+        dashboard_module,
+        "_commit_open_temp",
+        swap_after_final_check,
+    )
+    monkeypatch.setattr(
+        dashboard_module,
+        "_require_replaced_identity",
+        observe_immediate_commit,
     )
 
-    assert observed == [92]
+    export_dashboard(_dashboard_status(), destination)
+
+    assert swapped
+    assert reader_observations
+    assert all(value != "attacker-content" for value in reader_observations)
+    assert destination.read_text(encoding="utf-8") != "attacker-content"
+
+
+def test_posix_commit_directly_links_held_fd_to_absent_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POSIX create publishes the held fd directly with no intermediate source name."""
+    temporary = tmp_path / "source.tmp"
+    temporary.write_text("safe", encoding="utf-8")
+    destination = tmp_path / "status.json"
+    descriptor = os.open(temporary, os.O_RDONLY)
+    operations: list[str] = []
+
+    class _Guard:
+        parent_fd = 91
+
+        def lstat(self, path: Path) -> os.stat_result | None:
+            del path
+            operations.append("target-check")
+            return None
+
+        def replace(self, source: Path, target: Path) -> None:
+            del source, target
+            operations.append("replace")
+
+        def unlink(self, path: Path) -> None:
+            del path
+
+    monkeypatch.setattr(dashboard_module.os, "name", "posix")
+    monkeypatch.setattr(
+        dashboard_module,
+        "_link_open_file_at",
+        lambda fd, parent_fd, name: operations.append(f"link:{name}"),
+    )
+    try:
+        dashboard_module._commit_open_temp(
+            descriptor,
+            temporary,
+            destination,
+            _Guard(),  # type: ignore[arg-type]
+        )
+    finally:
+        os.close(descriptor)
+
+    assert operations == ["target-check", "link:status.json"]
+
+
+def test_posix_commit_refuses_to_replace_existing_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POSIX safe mode preserves an existing target instead of name-renaming over it."""
+    temporary = tmp_path / "source.tmp"
+    temporary.write_text("safe", encoding="utf-8")
+    destination = tmp_path / "status.json"
+    destination.write_text("old", encoding="utf-8")
+    descriptor = os.open(temporary, os.O_RDONLY)
+    link_names: list[str] = []
+
+    class _Guard:
+        parent_fd = 91
+
+        def lstat(self, path: Path) -> os.stat_result:
+            return os.lstat(path)
+
+    monkeypatch.setattr(dashboard_module.os, "name", "posix")
+    monkeypatch.setattr(
+        dashboard_module,
+        "_link_open_file_at",
+        lambda fd, parent_fd, name: link_names.append(name),
+    )
+    try:
+        with pytest.raises(
+            DashboardValidationError,
+            match="DASHBOARD_HANDLE_REPLACE_UNAVAILABLE",
+        ):
+            dashboard_module._commit_open_temp(
+                descriptor,
+                temporary,
+                destination,
+                _Guard(),  # type: ignore[arg-type]
+            )
+    finally:
+        os.close(descriptor)
+
+    assert destination.read_text(encoding="utf-8") == "old"
+    assert link_names == []
+
+
+def test_posix_concurrent_absent_destination_has_exactly_one_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct no-replace links make concurrent create attempts one-winner only."""
+    first = tmp_path / "first.tmp"
+    second = tmp_path / "second.tmp"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    destination = tmp_path / "status.json"
+    descriptors = (os.open(first, os.O_RDONLY), os.open(second, os.O_RDONLY))
+    ready = Event()
+    checked = 0
+    checked_lock = Lock()
+    published = False
+    published_lock = Lock()
+    outcomes: list[str] = []
+
+    class _Guard:
+        parent_fd = 91
+
+        def lstat(self, path: Path) -> None:
+            nonlocal checked
+            del path
+            with checked_lock:
+                checked += 1
+                if checked == 2:
+                    ready.set()
+            assert ready.wait(timeout=5)
+            return None
+
+    def exclusive_link(fd: int, parent_fd: int, name: str) -> None:
+        nonlocal published
+        del fd, parent_fd
+        assert name == destination.name
+        with published_lock:
+            if published:
+                raise FileExistsError(name)
+            published = True
+
+    def run(descriptor: int) -> None:
+        try:
+            dashboard_module._commit_open_temp(
+                descriptor,
+                first,
+                destination,
+                _Guard(),  # type: ignore[arg-type]
+            )
+        except (OSError, DashboardValidationError):
+            outcomes.append("failed")
+        else:
+            outcomes.append("created")
+
+    monkeypatch.setattr(dashboard_module.os, "name", "posix")
+    monkeypatch.setattr(dashboard_module, "_link_open_file_at", exclusive_link)
+    threads = [Thread(target=run, args=(descriptor,)) for descriptor in descriptors]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+    assert sorted(outcomes) == ["created", "failed"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="handle-bound replacement is Windows-only")
+def test_dashboard_postcommit_verification_failure_never_rolls_back_exact_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Returning from exact handle commit is irreversible even if a postcheck fails."""
+    destination = tmp_path / "status.json"
+    destination.write_text("old", encoding="utf-8")
+
+    calls = 0
+
+    def fail_first_postcheck(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        if calls == 1:
+            raise DashboardValidationError("DASHBOARD_REPLACE_CHANGED")
+
+    monkeypatch.setattr(
+        dashboard_module,
+        "_require_replaced_identity",
+        fail_first_postcheck,
+    )
+
+    with pytest.raises(DashboardValidationError, match="DASHBOARD_WRITE_FAILED"):
+        export_dashboard(_dashboard_status(), destination)
+
+    committed = destination.read_text(encoding="utf-8")
+    assert committed != "old"
+    assert json.loads(committed)["schema_version"] == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="handle-bound replacement is Windows-only")
+def test_dashboard_rollback_never_overwrites_a_newer_destination_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed writer must not restore stale backup over a changed destination inode."""
+    destination = tmp_path / "status.json"
+    destination.write_text("old", encoding="utf-8")
+    external = tmp_path / "external.json"
+    original_same_parent = dashboard_module._require_same_parent
+    calls = 0
+
+    def replace_after_commit(target: object) -> None:
+        nonlocal calls
+        calls += 1
+        original_same_parent(target)  # type: ignore[arg-type]
+        if calls == 4:
+            external.write_text("newer-external-writer", encoding="utf-8")
+            os.replace(external, destination)
+            raise DashboardValidationError("DASHBOARD_PATH_CHANGED")
+
+    monkeypatch.setattr(dashboard_module, "_require_same_parent", replace_after_commit)
+
+    with pytest.raises(DashboardValidationError, match="DASHBOARD_WRITE_FAILED"):
+        export_dashboard(_dashboard_status(), destination)
+
+    assert destination.read_text(encoding="utf-8") == "newer-external-writer"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="handle-bound replacement is Windows-only")
+def test_dashboard_committed_export_never_path_unlinks_generated_names(
+    tmp_path: Path,
+) -> None:
+    """After an exact commit, cleanup never acts through mutable generated pathnames."""
+    destination = tmp_path / "status.json"
+    destination.write_text("old", encoding="utf-8")
+
+    assert "unlink" not in dashboard_module._DirectoryGuard.__dict__
+    assert "replace" not in dashboard_module._DirectoryGuard.__dict__
+    assert "link" not in dashboard_module._DirectoryGuard.__dict__
+
+    export_dashboard(_dashboard_status(), destination)
+
+    assert json.loads(destination.read_text(encoding="utf-8"))["schema_version"] == 1
+
+
+def test_dashboard_failure_cleanup_does_not_enumerate_destination_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure cleanup touches only generated names and never scans an unbounded directory."""
+    destination = tmp_path / "status.json"
+    destination.write_text("old", encoding="utf-8")
+    observed: list[object] = []
+    parent_checks = 0
+
+    def scandir(path: object) -> Iterator[object]:
+        observed.append(path)
+        return iter(())
+
+    def fail_after_temp(target: object) -> None:
+        nonlocal parent_checks
+        parent_checks += 1
+        if parent_checks == 2:
+            raise DashboardValidationError("DASHBOARD_PATH_CHANGED")
+        original_same_parent(target)  # type: ignore[arg-type]
+
+    original_same_parent = dashboard_module._require_same_parent
+    monkeypatch.setattr(dashboard_module.os, "scandir", scandir)
+    monkeypatch.setattr(dashboard_module, "_require_same_parent", fail_after_temp)
+
+    with pytest.raises(DashboardValidationError, match="DASHBOARD_WRITE_FAILED"):
+        export_dashboard(_dashboard_status(), destination)
+
+    assert observed == []
+
+
+def test_posix_open_file_link_uses_unprivileged_procfd_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unprivileged AT_EMPTY_PATH denial falls back to the exact procfd symlink."""
+    calls: list[tuple[object, ...]] = []
+
+    class _LinkAt:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(self, *args: object) -> int:
+            calls.append(args)
+            return -1 if len(calls) == 1 else 0
+
+    class _LibC:
+        linkat = _LinkAt()
+
+    monkeypatch.setattr(dashboard_module.ctypes, "CDLL", lambda *args, **kwargs: _LibC())
+
+    dashboard_module._link_open_file_at(91, 92, "safe.commit")
+
+    assert calls == [
+        (91, b"", 92, b"safe.commit", 0x1000),
+        (-100, b"/proc/self/fd/91", 92, b"safe.commit", 0x400),
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="replacement serialization is Windows-only")
+def test_dashboard_serializes_concurrent_writers_per_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Writer B waits for A's commit and can never be rolled back to stale A/old data."""
+    destination = tmp_path / "status.json"
+    destination.write_text("old", encoding="utf-8")
+    writer_a = _dashboard_status(research=DashboardResearch("writer-a", True))
+    writer_b = _dashboard_status(research=DashboardResearch("writer-b", True))
+    original_commit = dashboard_module._commit_open_temp
+    entered = Event()
+    release = Event()
+    b_done = Event()
+    blocked_a = False
+    failures: list[BaseException] = []
+
+    def block_a_before_commit(*args: object, **kwargs: object) -> int:
+        nonlocal blocked_a
+        if current_thread().name == "dashboard-writer-a" and not blocked_a:
+            blocked_a = True
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test release timeout")
+        return original_commit(*args, **kwargs)
+
+    def run(status: DashboardStatus, done: Event | None = None) -> None:
+        try:
+            export_dashboard(status, destination)
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            if done is not None:
+                done.set()
+
+    monkeypatch.setattr(
+        dashboard_module,
+        "_commit_open_temp",
+        block_a_before_commit,
+    )
+    a_thread = Thread(
+        target=run,
+        args=(writer_a,),
+        name="dashboard-writer-a",
+    )
+    b_thread = Thread(
+        target=run,
+        args=(writer_b, b_done),
+        name="dashboard-writer-b",
+    )
+    a_thread.start()
+    assert entered.wait(timeout=5)
+    b_thread.start()
+    b_finished_while_a_blocked = b_done.wait(timeout=0.25)
+    release.set()
+    a_thread.join(timeout=5)
+    b_thread.join(timeout=5)
+
+    assert not a_thread.is_alive()
+    assert not b_thread.is_alive()
+    assert not failures
+    assert not b_finished_while_a_blocked
+    assert json.loads(destination.read_text(encoding="utf-8"))["research"]["version"] == "writer-b"
+
+
+def test_posix_temp_creation_uses_anonymous_held_parent_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POSIX staging has no mutable directory entry before direct publication."""
+    destination_path = tmp_path / "status.json"
+    parent_identity = dashboard_module._identity_tuple(os.lstat(tmp_path))
+    destination = dashboard_module._Destination(destination_path, parent_identity)
+    observed: list[tuple[object, int, int, object]] = []
+
+    def anonymous_open(
+        path: object,
+        flags: int,
+        mode: int,
+        *,
+        dir_fd: object = None,
+    ) -> int:
+        observed.append((path, flags, mode, dir_fd))
+        return 93
+
+    monkeypatch.setattr(dashboard_module.os, "name", "posix")
+    monkeypatch.setattr(dashboard_module.os, "O_TMPFILE", 0x400000, raising=False)
+    monkeypatch.setattr(dashboard_module.os, "open", anonymous_open)
+
+    descriptor, marker = dashboard_module._create_sibling_temp(
+        destination,
+        dashboard_module._DirectoryGuard(91),
+    )
+
+    assert descriptor == 93
+    assert marker.name.endswith(".anonymous")
+    assert observed == [(".", os.O_RDWR | 0x400000, 0o600, 91)]
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX O_TMPFILE integration",
+)
+def test_posix_export_end_to_end_directly_creates_fresh_destination(
+    tmp_path: Path,
+) -> None:
+    """Real POSIX export publishes one fresh path without visible staging names."""
+    _require_posix_otmpfile(tmp_path)
+    destination = tmp_path / "status-v1.json"
+
+    exported = export_dashboard(_dashboard_status(), destination)
+
+    assert exported == destination
+    assert json.loads(destination.read_text(encoding="utf-8"))["schema_version"] == 1
+    assert not list(tmp_path.glob(".status-v1.json.*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX create-once contract")
+def test_posix_export_end_to_end_refuses_and_preserves_existing_target(
+    tmp_path: Path,
+) -> None:
+    """Real POSIX safe mode never modifies an existing versioned destination."""
+    destination = tmp_path / "status-v1.json"
+    destination.write_text("old", encoding="utf-8")
+
+    with pytest.raises(DashboardValidationError, match="DASHBOARD_WRITE_FAILED"):
+        export_dashboard(_dashboard_status(), destination)
+
+    assert destination.read_text(encoding="utf-8") == "old"
+    assert not list(tmp_path.glob(".status-v1.json.*"))
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX O_TMPFILE integration",
+)
+def test_posix_export_end_to_end_concurrent_fresh_path_has_one_winner(
+    tmp_path: Path,
+) -> None:
+    """Real held-parent locking plus no-replace link gives exactly one publisher."""
+    _require_posix_otmpfile(tmp_path)
+    destination = tmp_path / "status-v1.json"
+    first = _dashboard_status(research=DashboardResearch("writer-a", True))
+    second = _dashboard_status(research=DashboardResearch("writer-b", True))
+    outcomes: list[str] = []
+    outcome_lock = Lock()
+
+    def run(status: DashboardStatus) -> None:
+        try:
+            export_dashboard(status, destination)
+        except DashboardValidationError:
+            outcome = "failed"
+        else:
+            outcome = "created"
+        with outcome_lock:
+            outcomes.append(outcome)
+
+    threads = [Thread(target=run, args=(status,)) for status in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(outcomes) == ["created", "failed"]
+    assert json.loads(destination.read_text(encoding="utf-8"))["research"]["version"] in {
+        "writer-a",
+        "writer-b",
+    }
+    assert not list(tmp_path.glob(".status-v1.json.*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX O_TMPFILE fail-closed contract")
+def test_posix_export_end_to_end_fails_closed_without_otmpfile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No anonymous-staging primitive means no destination publication."""
+    destination = tmp_path / "status-v1.json"
+    monkeypatch.setattr(dashboard_module.os, "O_TMPFILE", 0, raising=False)
+
+    with pytest.raises(DashboardValidationError, match="DASHBOARD_WRITE_FAILED"):
+        export_dashboard(_dashboard_status(), destination)
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".status-v1.json.*"))
 
 
 def test_dashboard_json_failure_is_context_free_and_preserves_old_target(

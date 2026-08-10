@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import importlib
 import json
 import os
 import re
 import secrets
 import stat
-import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
 from types import MappingProxyType
-from typing import cast
+from typing import Protocol, cast
 from urllib.parse import unquote_plus
 
 from market_sentinel.brokers.preflight import required_gate_names
@@ -30,6 +31,8 @@ _MAX_NODES = 4_096
 _MAX_COLLECTION = 512
 _MAX_STRING_BYTES = 4_096
 _MAX_PATH_CHARS = 2_048
+_MAX_GATE_NAME_BYTES = 128
+_MAX_GATE_REASON_BYTES = 64
 _REPARSE_POINT = 0x400
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:@-]{0,127}$")
@@ -37,6 +40,13 @@ _CURRENCY = re.compile(r"^[A-Z]{3,8}$")
 _REASON = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _OUTPUT_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 _PROMOTIONS = frozenset({"not_promoted", "research", "backtest", "paper", "live-small"})
+_CAPTURED_GATE_MANIFESTS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "alpaca": frozenset(required_gate_names("alpaca")),
+        "groww": frozenset(required_gate_names("groww")),
+        "ccxt": frozenset(required_gate_names("ccxt-spot")),
+    }
+)
 _SECRET_KEY_PARTS = (
     "apikey",
     "secret",
@@ -51,12 +61,18 @@ _SECRET_KEY_PARTS = (
     "exception",
 )
 _SECRET_VALUE = re.compile(
-    r"(?is)(?:\bbearer\s+\S+|\bsk-[a-z0-9_-]{8,}|\bgh[pousr]_[a-z0-9]{20,}|"
+    r"(?is)(?:\b(?:basic|bearer)\s+\S+|\bsk-[a-z0-9_-]{8,}|\bgh[pousr]_[a-z0-9]{20,}|"
+    r"\b(?:authorization|proxy[-_ ]authorization)\s+(?:is|was)\s+"
+    r"(?:basic|bearer)\s+\S+|"
     r"\bAKIA[A-Z0-9]{16}\b|-----BEGIN[^-]*(?:PRIVATE|SECRET)[^-]*-----|"
     r"[a-z0-9_-]{20,}\.[a-z0-9_-]{20,}\.[a-z0-9_-]{20,}|"
     r"\b(?:api[_-]?key|access[_-]?(?:key|token)|private[_-]?key|client[_-]?secret|"
     r"refresh[_-]?token|id[_-]?token|secret|token|password|credential|authorization|"
     r"cookie|set[_-]?cookie|session(?:id)?)\b[\"']?\s*[:=]\s*[\"']?[^\s&;,\"'}]+|"
+    r"\b(?:api[_ -]?key|access[_ -]?(?:key|token)|private[_ -]?key|"
+    r"client[_ -]?secret|refresh[_ -]?token|id[_ -]?token|secret|token|"
+    r"password|credential|authorization|cookie|set[_ -]?cookie|session(?:id)?)"
+    r"\s+(?:is|was)\s+(?:basic\s+|bearer\s+)?[^\s&;,\"'}]+|"
     r"\b(?:[a-z0-9]+[-_])?(?:real[-_])?(?:secret|token|password|credential|"
     r"private[-_]?key|access[-_]?key)(?:[-_](?:value|key|token))?[-_:]"
     r"[a-z0-9][a-z0-9_-]{7,}\b)"
@@ -66,6 +82,23 @@ _REDACTED = "[REDACTED]"
 
 class DashboardValidationError(ValueError):
     """A dashboard snapshot or destination failed its bounded safe contract."""
+
+
+class _FileLockModule(Protocol):
+    LOCK_EX: int
+    LOCK_UN: int
+
+    def flock(self, descriptor: int, operation: int, /) -> None: ...
+
+
+def _captured_gate_manifest(
+    broker: str,
+    manifests: Mapping[str, frozenset[str]] = _CAPTURED_GATE_MANIFESTS,
+) -> frozenset[str]:
+    try:
+        return manifests[broker]
+    except KeyError:
+        raise DashboardValidationError("DASHBOARD_BROKER_INVALID") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,23 +170,16 @@ class DashboardBroker:
     def __post_init__(self) -> None:
         if type(self.name) is not str or self.name not in {"alpaca", "groww", "ccxt"}:
             raise DashboardValidationError("DASHBOARD_BROKER_INVALID")
-        manifest_name = "ccxt-spot" if self.name == "ccxt" else self.name
-        required = required_gate_names(manifest_name)
+        try:
+            required = _CAPTURED_GATE_MANIFESTS[self.name]
+        except KeyError:
+            raise DashboardValidationError("DASHBOARD_BROKER_INVALID") from None
         if type(self.gates) is not tuple or len(self.gates) != len(required):
             raise DashboardValidationError("DASHBOARD_BROKER_GATES_INVALID")
         names: list[str] = []
         for gate in self.gates:
-            if (
-                type(gate) is not GateResult
-                or type(gate.name) is not str
-                or type(gate.passed) is not bool
-                or type(gate.reason_code) is not str
-                or _REASON.fullmatch(gate.reason_code) is None
-                or (gate.passed and gate.reason_code != "OK")
-                or (not gate.passed and gate.reason_code == "OK")
-            ):
-                raise DashboardValidationError("DASHBOARD_BROKER_GATES_INVALID")
-            names.append(gate.name)
+            name, _, _ = _validated_dashboard_gate(gate)
+            names.append(name)
         if set(names) != required:
             raise DashboardValidationError("DASHBOARD_BROKER_GATES_INVALID")
 
@@ -268,46 +294,8 @@ class _Destination:
 
 
 @dataclass(frozen=True, slots=True)
-class _Backup:
-    path: Path
-    identity: tuple[int, int, int]
-
-
-@dataclass(frozen=True, slots=True)
 class _DirectoryGuard:
     parent_fd: int | None
-
-    def replace(self, source: Path, destination: Path) -> None:
-        if self.parent_fd is None:
-            os.replace(source, destination)
-            return
-        os.replace(
-            source.name,
-            destination.name,
-            src_dir_fd=self.parent_fd,
-            dst_dir_fd=self.parent_fd,
-        )
-
-    def unlink(self, path: Path) -> None:
-        if self.parent_fd is None:
-            path.unlink(missing_ok=True)
-            return
-        try:
-            os.unlink(path.name, dir_fd=self.parent_fd)
-        except FileNotFoundError:
-            return
-
-    def link(self, source: Path, destination: Path) -> None:
-        if self.parent_fd is None:
-            os.link(source, destination, follow_symlinks=False)
-            return
-        os.link(
-            source.name,
-            destination.name,
-            src_dir_fd=self.parent_fd,
-            dst_dir_fd=self.parent_fd,
-            follow_symlinks=False,
-        )
 
     def lstat(self, path: Path) -> os.stat_result | None:
         if self.parent_fd is None:
@@ -338,13 +326,23 @@ def safe_json_mapping(value: Mapping[str, object]) -> dict[str, object]:
     return prepared
 
 
-def export_dashboard(status: DashboardStatus, destination: Path) -> Path:
-    """Convert exact schema v1, then atomically replace after repeated path checks."""
+def export_dashboard(
+    status: DashboardStatus,
+    destination: Path,
+    *,
+    _gate_manifests: Mapping[str, frozenset[str]] = _CAPTURED_GATE_MANIFESTS,
+) -> Path:
+    """Publish schema v1 by Windows handle-replace or POSIX absent-path direct link."""
     if type(status) is not DashboardStatus:
         raise DashboardValidationError("DASHBOARD_STATUS_INVALID")
     invalid = False
     try:
-        validated = _revalidated_dashboard_status(status)
+        if _CAPTURED_GATE_MANIFESTS is not _gate_manifests:
+            raise DashboardValidationError("DASHBOARD_BROKER_GATES_INVALID")
+        validated = _revalidated_dashboard_status(
+            status,
+            gate_manifests=_gate_manifests,
+        )
         prepared = safe_json_mapping(_dashboard_payload(validated))
     except Exception:
         invalid = True
@@ -368,7 +366,6 @@ def export_dashboard(status: DashboardStatus, destination: Path) -> Path:
         raise DashboardValidationError("DASHBOARD_SERIALIZATION_INVALID")
     target = _validated_destination(destination)
     temporary: Path | None = None
-    backup: _Backup | None = None
     descriptor: int | None = None
     temp_identity: tuple[int, int, int] | None = None
     replaced = False
@@ -397,41 +394,30 @@ def export_dashboard(status: DashboardStatus, destination: Path) -> Path:
                 if refreshed.parent_identity != target.parent_identity:
                     raise DashboardValidationError("DASHBOARD_PATH_CHANGED")
                 _require_temp_identity(descriptor, temporary, temp_identity, guard)
-                backup = _backup_destination(target, guard)
-                if backup is not None:
-                    _require_backup_identity(backup, guard)
-                guard.replace(temporary, target.path)
+                if os.name != "nt" and guard.lstat(target.path) is not None:
+                    raise DashboardValidationError("DASHBOARD_HANDLE_REPLACE_UNAVAILABLE")
+                descriptor = _commit_open_temp(
+                    descriptor,
+                    temporary,
+                    target.path,
+                    guard,
+                )
                 replaced = True
+                # Both platform commit primitives bind the exact open descriptor.
+                # Returning from that syscall is the irreversible commit point.
                 _require_replaced_identity(descriptor, target.path, temp_identity, guard)
+                os.close(descriptor)
+                descriptor = None
                 _require_same_parent(target)
-                if backup is not None:
-                    guard.unlink(backup.path)
-                    backup = None
                 temporary = None
             except (OSError, UnicodeError, ValueError):
-                if replaced:
-                    try:
-                        if backup is None:
-                            guard.unlink(target.path)
-                        else:
-                            _require_backup_identity(backup, guard)
-                            guard.replace(backup.path, target.path)
-                            backup = None
-                    except (OSError, ValueError):
-                        pass
-                elif backup is not None:
-                    with suppress(OSError):
-                        guard.unlink(backup.path)
-                    backup = None
-                if temp_identity is not None:
-                    _cleanup_file_identity(target.path.parent, guard, temp_identity)
                 if descriptor is not None:
+                    if os.name == "nt" and not replaced:
+                        with suppress(OSError, ValueError):
+                            _delete_windows_open_file(descriptor)
                     with suppress(OSError):
                         os.close(descriptor)
                     descriptor = None
-                if temporary is not None:
-                    with suppress(OSError):
-                        guard.unlink(temporary)
                 raise
             finally:
                 if descriptor is not None:
@@ -445,7 +431,11 @@ def export_dashboard(status: DashboardStatus, destination: Path) -> Path:
     return target.path
 
 
-def _revalidated_dashboard_status(status: object) -> DashboardStatus:
+def _revalidated_dashboard_status(
+    status: object,
+    *,
+    gate_manifests: Mapping[str, frozenset[str]] = _CAPTURED_GATE_MANIFESTS,
+) -> DashboardStatus:
     """Rebuild every schema-v1 record so frozen-object tampering is never trusted."""
     if type(status) is not DashboardStatus:
         raise DashboardValidationError("DASHBOARD_STATUS_INVALID")
@@ -492,23 +482,20 @@ def _revalidated_dashboard_status(status: object) -> DashboardStatus:
             "ccxt",
         }:
             raise DashboardValidationError("DASHBOARD_BROKER_INVALID")
-        manifest_name = "ccxt-spot" if broker.name == "ccxt" else broker.name
-        if len(broker.gates) != len(required_gate_names(manifest_name)):
+        try:
+            required = gate_manifests[broker.name]
+        except KeyError:
+            raise DashboardValidationError("DASHBOARD_BROKER_INVALID") from None
+        if len(broker.gates) != len(required):
             raise DashboardValidationError("DASHBOARD_BROKER_GATES_INVALID")
         gates: list[GateResult] = []
         for gate in broker.gates:
-            if (
-                type(gate) is not GateResult
-                or type(gate.name) is not str
-                or type(gate.passed) is not bool
-                or type(gate.reason_code) is not str
-            ):
-                raise DashboardValidationError("DASHBOARD_BROKER_GATES_INVALID")
+            name, passed, reason = _validated_dashboard_gate(gate)
             gates.append(
                 GateResult(
-                    name=gate.name,
-                    passed=gate.passed,
-                    reason_code=gate.reason_code,
+                    name=name,
+                    passed=passed,
+                    reason_code=reason,
                 )
             )
         brokers.append(DashboardBroker(broker.name, tuple(gates)))
@@ -569,6 +556,39 @@ def _revalidated_safety_states(
             raise DashboardValidationError(reason)
         result.append(DashboardSafetyState(item.active, item.reason_code))
     return tuple(result)
+
+
+def _validated_dashboard_gate(value: object) -> tuple[str, bool, str]:
+    if type(value) is not GateResult:
+        raise DashboardValidationError("DASHBOARD_BROKER_GATES_INVALID")
+    name = value.name
+    passed = value.passed
+    reason = value.reason_code
+    if (
+        type(name) is not str
+        or not name
+        or len(name) > _MAX_GATE_NAME_BYTES
+        or type(passed) is not bool
+        or type(reason) is not str
+        or not reason
+        or len(reason) > _MAX_GATE_REASON_BYTES
+    ):
+        raise DashboardValidationError("DASHBOARD_BROKER_GATES_INVALID")
+    try:
+        bounded = (
+            len(name.encode("utf-8")) <= _MAX_GATE_NAME_BYTES
+            and len(reason.encode("utf-8")) <= _MAX_GATE_REASON_BYTES
+        )
+    except UnicodeError:
+        bounded = False
+    if (
+        not bounded
+        or _REASON.fullmatch(reason) is None
+        or (passed and reason != "OK")
+        or (not passed and reason == "OK")
+    ):
+        raise DashboardValidationError("DASHBOARD_BROKER_GATES_INVALID")
+    return name, passed, reason
 
 
 def _dashboard_payload(status: DashboardStatus) -> dict[str, object]:
@@ -783,6 +803,14 @@ def _require_temp_identity(
     guard: _DirectoryGuard,
 ) -> None:
     handle_details = os.fstat(descriptor)
+    if _is_anonymous_posix_temp(path, guard):
+        if (
+            _identity_tuple(handle_details) != expected
+            or not stat.S_ISREG(handle_details.st_mode)
+            or _is_reparse(handle_details)
+        ):
+            raise DashboardValidationError("DASHBOARD_TEMP_CHANGED")
+        return
     entry_details = guard.lstat(path)
     if (
         _identity_tuple(handle_details) != expected
@@ -794,91 +822,156 @@ def _require_temp_identity(
         raise DashboardValidationError("DASHBOARD_TEMP_CHANGED")
 
 
+def _is_anonymous_posix_temp(path: Path, guard: _DirectoryGuard) -> bool:
+    return (
+        os.name != "nt"
+        and guard.parent_fd is not None
+        and path.name.endswith(".anonymous")
+    )
+
+
 def _require_replaced_identity(
-    descriptor: int,
+    descriptor: int | None,
     destination: Path,
     expected: tuple[int, int, int],
     guard: _DirectoryGuard,
 ) -> None:
-    handle_details = os.fstat(descriptor)
     entry_details = guard.lstat(destination)
     if (
-        _identity_tuple(handle_details) != expected
-        or entry_details is None
+        entry_details is None
         or not stat.S_ISREG(entry_details.st_mode)
         or _is_reparse(entry_details)
         or _identity_tuple(entry_details) != expected
     ):
         raise DashboardValidationError("DASHBOARD_REPLACE_CHANGED")
+    if descriptor is not None and _identity_tuple(os.fstat(descriptor)) != expected:
+        raise DashboardValidationError("DASHBOARD_REPLACE_CHANGED")
 
 
-def _backup_destination(
-    destination: _Destination,
+def _commit_open_temp(
+    descriptor: int,
+    temporary: Path,
+    destination: Path,
     guard: _DirectoryGuard,
-) -> _Backup | None:
-    details = guard.lstat(destination.path)
-    if details is None:
-        return None
-    if not stat.S_ISREG(details.st_mode) or _is_reparse(details):
-        raise DashboardValidationError("DASHBOARD_PATH_CHANGED")
-    for _ in range(16):
-        backup = destination.path.parent / (
-            f".{destination.path.name}.{secrets.token_hex(12)}.rollback"
-        )
-        try:
-            guard.link(destination.path, backup)
-        except FileExistsError:
-            continue
-        linked = guard.lstat(backup)
-        identity = _identity_tuple(details)
-        if (
-            linked is None
-            or not stat.S_ISREG(linked.st_mode)
-            or _is_reparse(linked)
-            or _identity_tuple(linked) != identity
-        ):
-            with suppress(OSError):
-                guard.unlink(backup)
-            raise DashboardValidationError("DASHBOARD_BACKUP_INVALID")
-        return _Backup(backup, identity)
-    raise DashboardValidationError("DASHBOARD_BACKUP_UNAVAILABLE")
+) -> int:
+    """Commit the exact open file, never the last occupant of its temporary name."""
+    if os.name == "nt":
+        _rename_windows_open_file(descriptor, destination)
+        return descriptor
+    if guard.parent_fd is None:
+        raise DashboardValidationError("DASHBOARD_HANDLE_COMMIT_UNAVAILABLE")
+    if guard.lstat(destination) is not None:
+        raise DashboardValidationError("DASHBOARD_HANDLE_REPLACE_UNAVAILABLE")
+    _link_open_file_at(descriptor, guard.parent_fd, destination.name)
+    return descriptor
 
 
-def _require_backup_identity(backup: _Backup, guard: _DirectoryGuard) -> None:
-    details = guard.lstat(backup.path)
+def _link_open_file_at(descriptor: int, parent_fd: int, name: str) -> None:
+    """Bind an exact open POSIX file into its held parent, or fail closed."""
     if (
-        details is None
-        or not stat.S_ISREG(details.st_mode)
-        or _is_reparse(details)
-        or _identity_tuple(details) != backup.identity
+        type(name) is not str
+        or not name
+        or "/" in name
+        or "\\" in name
+        or len(name) > 255
     ):
-        raise DashboardValidationError("DASHBOARD_BACKUP_CHANGED")
-
-
-def _cleanup_file_identity(
-    parent: Path,
-    guard: _DirectoryGuard,
-    expected: tuple[int, int, int],
-) -> None:
+        raise DashboardValidationError("DASHBOARD_HANDLE_COMMIT_INVALID")
     try:
-        entries = os.scandir(parent if guard.parent_fd is None else guard.parent_fd)
-    except OSError:
-        return
-    with entries:
-        for entry in entries:
-            try:
-                details = guard.lstat(parent / entry.name)
-            except DashboardValidationError:
-                continue
-            if details is None:
-                continue
-            if (
-                stat.S_ISREG(details.st_mode)
-                and not _is_reparse(details)
-                and _identity_tuple(details) == expected
-            ):
-                with suppress(OSError):
-                    guard.unlink(parent / entry.name)
+        encoded = name.encode("utf-8")
+        libc = ctypes.CDLL(None, use_errno=True)
+        linkat = libc.linkat
+        linkat.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+        )
+        linkat.restype = ctypes.c_int
+        linked = linkat(descriptor, b"", parent_fd, encoded, 0x1000)
+        if linked != 0:
+            procfd = f"/proc/self/fd/{descriptor}".encode("ascii")
+            linked = linkat(-100, procfd, parent_fd, encoded, 0x400)
+    except Exception:
+        raise DashboardValidationError("DASHBOARD_HANDLE_COMMIT_UNAVAILABLE") from None
+    if linked != 0:
+        raise DashboardValidationError("DASHBOARD_HANDLE_COMMIT_UNAVAILABLE")
+
+
+def _rename_windows_open_file(descriptor: int, destination: Path) -> None:
+    import msvcrt
+    from ctypes import wintypes
+
+    filename = str(destination)
+    encoded_filename = filename.encode("utf-16-le")
+
+    class _FileRenameInfo(ctypes.Structure):
+        _fields_ = (
+            ("replace_if_exists", wintypes.BOOLEAN),
+            ("root_directory", wintypes.HANDLE),
+            ("filename_length", wintypes.DWORD),
+            ("filename", wintypes.WCHAR * 1),
+        )
+
+    filename_offset = _FileRenameInfo.filename.offset
+    information_size = filename_offset + len(encoded_filename) + ctypes.sizeof(
+        wintypes.WCHAR
+    )
+    information_buffer = ctypes.create_string_buffer(information_size)
+    information = _FileRenameInfo.from_buffer(information_buffer)
+    information.replace_if_exists = 1
+    information.root_directory = None
+    information.filename_length = len(encoded_filename)
+    ctypes.memmove(
+        ctypes.addressof(information_buffer) + filename_offset,
+        encoded_filename,
+        len(encoded_filename),
+    )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    prototype = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    set_information = prototype(("SetFileInformationByHandle", kernel32))
+    succeeded = set_information(
+        msvcrt.get_osfhandle(descriptor),
+        3,
+        information_buffer,
+        information_size,
+    )
+    if not succeeded:
+        raise DashboardValidationError("DASHBOARD_HANDLE_COMMIT_FAILED")
+
+
+def _delete_windows_open_file(descriptor: int) -> None:
+    """Mark the exact still-open Windows temporary for deletion on close."""
+    import msvcrt
+    from ctypes import wintypes
+
+    class _FileDispositionInfo(ctypes.Structure):
+        _fields_ = (("delete_file", wintypes.BOOLEAN),)
+
+    information = _FileDispositionInfo(True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    prototype = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    set_information = prototype(("SetFileInformationByHandle", kernel32))
+    succeeded = set_information(
+        msvcrt.get_osfhandle(descriptor),
+        4,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    )
+    if not succeeded:
+        raise DashboardValidationError("DASHBOARD_TEMP_CLEANUP_UNAVAILABLE")
 
 
 @contextmanager
@@ -886,24 +979,87 @@ def _locked_destination(destination: _Destination) -> Iterator[_DirectoryGuard]:
     if os.name != "nt":
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(destination.path.parent, flags)
+        lock_descriptor: int | None = None
         try:
             if _identity_tuple(os.fstat(descriptor)) != destination.parent_identity:
                 raise DashboardValidationError("DASHBOARD_PATH_CHANGED")
+            lock_descriptor = _lock_posix_destination(descriptor, destination.path.name)
             _require_same_parent(destination)
             yield _DirectoryGuard(descriptor)
         finally:
+            if lock_descriptor is not None:
+                _unlock_posix_destination(lock_descriptor)
             os.close(descriptor)
         return
 
-    handles: list[int] = []
+    with _windows_destination_mutex(destination.path):
+        handles: list[int] = []
+        try:
+            for component in _directory_components(destination.path.parent):
+                handles.append(_lock_windows_directory(component))
+            _require_same_parent(destination)
+            yield _DirectoryGuard(None)
+        finally:
+            for handle in reversed(handles):
+                _close_windows_handle(handle)
+
+
+def _lock_posix_destination(parent_fd: int, name: str) -> int:
+    fcntl = cast(_FileLockModule, importlib.import_module("fcntl"))
+
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()
+    lock_name = f".market-sentinel-dashboard-{digest}.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_name, flags, 0o600, dir_fd=parent_fd)
     try:
-        for component in _directory_components(destination.path.parent):
-            handles.append(_lock_windows_directory(component))
-        _require_same_parent(destination)
-        yield _DirectoryGuard(None)
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or _is_reparse(details):
+            raise DashboardValidationError("DASHBOARD_LOCK_INVALID")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _unlock_posix_destination(descriptor: int) -> None:
+    fcntl = cast(_FileLockModule, importlib.import_module("fcntl"))
+
+    with suppress(OSError):
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    os.close(descriptor)
+
+
+@contextmanager
+def _windows_destination_mutex(destination: Path) -> Iterator[None]:
+    from ctypes import wintypes
+
+    digest = hashlib.sha256(str(destination).casefold().encode("utf-8")).hexdigest()
+    name = f"Local\\OmnimarketSentinelDashboard-{digest}"
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_prototype = ctypes.WINFUNCTYPE(
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    )
+    create_mutex = create_prototype(("CreateMutexW", kernel32))
+    handle = create_mutex(None, False, name)
+    if handle is None:
+        raise DashboardValidationError("DASHBOARD_LOCK_UNAVAILABLE")
+    wait_prototype = ctypes.WINFUNCTYPE(wintypes.DWORD, wintypes.HANDLE, wintypes.DWORD)
+    wait = wait_prototype(("WaitForSingleObject", kernel32))
+    release_prototype = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HANDLE)
+    release = release_prototype(("ReleaseMutex", kernel32))
+    acquired = wait(handle, 30_000)
+    if acquired not in {0, 0x00000080}:
+        _close_windows_handle(int(handle))
+        raise DashboardValidationError("DASHBOARD_LOCK_UNAVAILABLE")
+    try:
+        yield
     finally:
-        for handle in reversed(handles):
-            _close_windows_handle(handle)
+        release(handle)
+        _close_windows_handle(int(handle))
 
 
 def _create_sibling_temp(
@@ -913,25 +1069,23 @@ def _create_sibling_temp(
     if guard.parent_fd is None:
         if os.name == "nt":
             return _create_windows_sibling_temp(destination)
-        descriptor, name = tempfile.mkstemp(
-            prefix=f".{destination.path.name}.",
-            suffix=".tmp",
-            dir=destination.path.parent,
+        raise DashboardValidationError("DASHBOARD_TEMP_UNAVAILABLE")
+    anonymous_flag = getattr(os, "O_TMPFILE", 0)
+    if not anonymous_flag:
+        raise DashboardValidationError("DASHBOARD_TEMP_UNAVAILABLE")
+    try:
+        descriptor = os.open(
+            ".",
+            os.O_RDWR | anonymous_flag,
+            0o600,
+            dir_fd=guard.parent_fd,
         )
-        return descriptor, Path(name)
-    for _ in range(16):
-        name = f".{destination.path.name}.{secrets.token_hex(12)}.tmp"
-        try:
-            descriptor = os.open(
-                name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-                dir_fd=guard.parent_fd,
-            )
-        except FileExistsError:
-            continue
-        return descriptor, destination.path.parent / name
-    raise DashboardValidationError("DASHBOARD_TEMP_UNAVAILABLE")
+    except OSError:
+        raise DashboardValidationError("DASHBOARD_TEMP_UNAVAILABLE") from None
+    marker = destination.path.parent / (
+        f".{destination.path.name}.{secrets.token_hex(12)}.anonymous"
+    )
+    return descriptor, marker
 
 
 def _create_windows_sibling_temp(destination: _Destination) -> tuple[int, Path]:
@@ -956,7 +1110,7 @@ def _create_windows_sibling_temp(destination: _Destination) -> tuple[int, Path]:
         )
         handle = create_file(
             str(path),
-            0x80000000 | 0x40000000,
+            0x80000000 | 0x40000000 | 0x00010000,
             0x00000001 | 0x00000002 | 0x00000004,
             None,
             1,

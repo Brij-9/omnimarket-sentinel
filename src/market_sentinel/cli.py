@@ -25,7 +25,11 @@ from market_sentinel.domain.models import (
     OrderIntent,
     RiskDecision,
 )
-from market_sentinel.execution.approval import ApprovalService, risk_decision_hash
+from market_sentinel.execution.approval import (
+    ApprovalService,
+    OrderConfirmation,
+    risk_decision_hash,
+)
 from market_sentinel.execution.canonical import CanonicalEncodingError, canonical_decimal
 from market_sentinel.execution.live import LiveOrderService
 from market_sentinel.execution.reconcile import ReconciliationReport
@@ -52,9 +56,25 @@ _HASH = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SAFE_ROUTE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _REASON = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_MAX_PROPOSAL_REASONS = 32
+_MAX_PREFLIGHT_GATES = 64
+_MAX_GATE_NAME_CHARS = 128
+_MAX_GATE_REASON_CHARS = 64
+_CAPTURED_PREFLIGHT_MANIFESTS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "alpaca": frozenset(required_gate_names("alpaca")),
+        "groww": frozenset(required_gate_names("groww")),
+        "ccxt-spot": frozenset(required_gate_names("ccxt-spot")),
+    }
+)
+_APPROVAL_CREATE_IMPLEMENTATION = ApprovalService.create
+_LIVE_SUBMIT_IMPLEMENTATION = LiveOrderService.submit_confirmed
 _SECRET_TEXT = re.compile(
-    r"(?i)(?:bearer\s+|-----BEGIN|private.?key|access.?key|api.?key|"
-    r"secret|password|credential|gh[pousr]_|sk-[a-z0-9_-]{8,})"
+    r"(?i)(?:\b(?:basic|bearer)\s+\S+|"
+    r"\b(?:authorization|proxy[-_ ]authorization|cookie|set[-_ ]cookie)"
+    r"\s*(?::|=|is\s|was\s)\s*(?:basic\s+|bearer\s+)?\S+|"
+    r"-----BEGIN|private.?key|access.?key|api.?key|secret|password|credential|"
+    r"gh[pousr]_|sk-[a-z0-9_-]{8,})"
 )
 
 
@@ -235,6 +255,17 @@ class BoundOrderRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class _ExpectedProposal:
+    """Immutable request evidence captured before any injected provider runs."""
+
+    broker: str
+    intent: OrderIntent
+    risk_decision: RiskDecision
+    request_fingerprint: str
+    safe_items: tuple[tuple[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class OrderProposal:
     """One exact typed proposal; a caller echo is never approval evidence."""
 
@@ -249,8 +280,11 @@ class OrderProposal:
         if (
             type(self.accepted) is not bool
             or type(self.reason_codes) is not tuple
+            or len(self.reason_codes) > _MAX_PROPOSAL_REASONS
             or not all(
-                type(reason) is str and _REASON.fullmatch(reason)
+                type(reason) is str
+                and _REASON.fullmatch(reason)
+                and not _secret_shaped(reason)
                 for reason in self.reason_codes
             )
             or self.broker not in _BROKERS
@@ -281,7 +315,7 @@ class OrderProposal:
 
 
 class Task14CliLiveFacade:
-    """Factory-registered zero-state identity for the exact Task 14 live bridge."""
+    """Factory-registered zero-state marker for the exact Task 14 live bridge."""
 
     __slots__ = ("__weakref__",)
 
@@ -303,37 +337,6 @@ class Task14CliLiveFacade:
         del protocol
         raise TypeError("live CLI facades cannot be serialized")
 
-    def submit(self, proposal: OrderProposal, confirmation_phrase: str) -> BrokerOrder:
-        """Durably issue confirmation, then delegate every live gate to Task 14."""
-        binding = _live_facade_binding(self)
-        if type(proposal) is not OrderProposal or not proposal.accepted:
-            raise ValueError("live order requires an accepted exact proposal")
-        intent = OrderIntent.model_validate(proposal.intent.model_dump(mode="python"))
-        risk_decision = RiskDecision.model_validate(
-            proposal.risk_decision.model_dump(mode="python")
-        )
-        if intent != proposal.intent or risk_decision != proposal.risk_decision:
-            raise ValueError("live proposal did not survive exact domain revalidation")
-        internal_broker = "ccxt-spot" if proposal.broker == "ccxt" else proposal.broker
-        if internal_broker != binding.live_order_service.broker_name:
-            raise ValueError("proposal broker does not match live service")
-        if binding.snapshot.instrument_id != intent.instrument_id:
-            raise ValueError("proposal snapshot does not match live service")
-        confirmation = binding.approval_service.create(
-            intent,
-            risk_decision,
-            phrase=confirmation_phrase,
-            broker=internal_broker,
-        )
-        return binding.live_order_service.submit_confirmed(
-            intent=intent,
-            risk_decision=risk_decision,
-            snapshot=binding.snapshot,
-            confirmation=confirmation,
-            preflight=binding.preflight,
-            reconciliation=binding.reconciliation,
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class _Task14CliLiveBinding:
@@ -348,6 +351,14 @@ class _Task14CliLiveBinding:
 _LIVE_FACADE_BINDINGS: WeakKeyDictionary[Task14CliLiveFacade, _Task14CliLiveBinding] = (
     WeakKeyDictionary()
 )
+
+
+class _LiveDispatch(Protocol):
+    def __call__(
+        self,
+        proposal: OrderProposal,
+        confirmation_phrase: str,
+    ) -> BrokerOrder: ...
 
 
 def _live_facade_binding(handle: Task14CliLiveFacade) -> _Task14CliLiveBinding:
@@ -375,6 +386,123 @@ def _live_facade_binding(handle: Task14CliLiveFacade) -> _Task14CliLiveBinding:
     ):
         raise ValueError("live CLI facade safety binding is invalid")
     return binding
+
+
+def _resolve_live_dispatch(
+    handle: Task14CliLiveFacade,
+) -> tuple[
+    _Task14CliLiveBinding,
+    _LiveDispatch,
+    Callable[..., BrokerOrder],
+    Callable[..., OrderConfirmation],
+    Callable[..., BrokerOrder],
+    Callable[[object], OrderProposal],
+]:
+    """Resolve one registered marker into a callback-private fixed Task 14 dispatch."""
+    binding = _live_facade_binding(handle)
+    snapshot = MarketSnapshot.model_validate(
+        binding.snapshot.model_dump(mode="python", warnings="error"),
+        strict=True,
+    )
+    preflight = _clone_preflight(binding.preflight)
+    reconciliation = ReconciliationReport(
+        report_id=binding.reconciliation.report_id,
+        broker=binding.reconciliation.broker,
+        healthy=binding.reconciliation.healthy,
+        reason_codes=binding.reconciliation.reason_codes,
+        broker_hash=binding.reconciliation.broker_hash,
+        ledger_hash=binding.reconciliation.ledger_hash,
+        checked_at=binding.reconciliation.checked_at,
+        sequence=binding.reconciliation.sequence,
+    )
+    implementation = _submit_task14_order
+    approval_service = binding.approval_service
+    live_order_service = binding.live_order_service
+    approval_create_implementation = _APPROVAL_CREATE_IMPLEMENTATION
+    live_submit_implementation = _LIVE_SUBMIT_IMPLEMENTATION
+    proposal_reconstructor = _reconstruct_order_proposal
+    approval_create = approval_create_implementation.__get__(
+        approval_service,
+        ApprovalService,
+    )
+    live_submit = live_submit_implementation.__get__(
+        live_order_service,
+        LiveOrderService,
+    )
+
+    def dispatch(
+        proposal: OrderProposal,
+        confirmation_phrase: str,
+        *,
+        _implementation: Callable[..., BrokerOrder] = implementation,
+        _approval_service: ApprovalService = approval_service,
+        _live_order_service: LiveOrderService = live_order_service,
+        _snapshot: MarketSnapshot = snapshot,
+        _preflight: PreflightReport = preflight,
+        _reconciliation: ReconciliationReport = reconciliation,
+        _approval_create: Callable[..., OrderConfirmation] = approval_create,
+        _live_submit: Callable[..., BrokerOrder] = live_submit,
+        _proposal_reconstructor: Callable[[object], OrderProposal] = proposal_reconstructor,
+    ) -> BrokerOrder:
+        return _implementation(
+            approval_service=_approval_service,
+            live_order_service=_live_order_service,
+            snapshot=_snapshot,
+            preflight=_preflight,
+            reconciliation=_reconciliation,
+            approval_create=_approval_create,
+            live_submit=_live_submit,
+            proposal_reconstructor=_proposal_reconstructor,
+            proposal=proposal,
+            confirmation_phrase=confirmation_phrase,
+        )
+
+    return (
+        binding,
+        dispatch,
+        implementation,
+        approval_create_implementation,
+        live_submit_implementation,
+        proposal_reconstructor,
+    )
+
+
+def _submit_task14_order(
+    *,
+    approval_service: ApprovalService,
+    live_order_service: LiveOrderService,
+    snapshot: MarketSnapshot,
+    preflight: PreflightReport,
+    reconciliation: ReconciliationReport,
+    approval_create: Callable[..., OrderConfirmation],
+    live_submit: Callable[..., BrokerOrder],
+    proposal_reconstructor: Callable[[object], OrderProposal],
+    proposal: OrderProposal,
+    confirmation_phrase: str,
+) -> BrokerOrder:
+    """Issue one confirmation and invoke only the captured exact Task 14 services."""
+    exact = proposal_reconstructor(proposal)
+    if not exact.accepted:
+        raise ValueError("live order requires an accepted exact proposal")
+    internal_broker = "ccxt-spot" if exact.broker == "ccxt" else exact.broker
+    if internal_broker != live_order_service.broker_name:
+        raise ValueError("proposal broker does not match live service")
+    if snapshot.instrument_id != exact.intent.instrument_id:
+        raise ValueError("proposal snapshot does not match live service")
+    confirmation = approval_create(
+        exact.intent,
+        exact.risk_decision,
+        phrase=confirmation_phrase,
+        broker=internal_broker,
+    )
+    return live_submit(
+        intent=exact.intent,
+        risk_decision=exact.risk_decision,
+        snapshot=snapshot,
+        confirmation=confirmation,
+        preflight=preflight,
+        reconciliation=reconciliation,
+    )
 
 
 def create_task14_cli_live_facade(
@@ -449,7 +577,7 @@ class _OfflinePreflight:
             normalized,
             tuple(
                 gate(name, False, "GATE_NOT_SATISFIED")
-                for name in sorted(required_gate_names(normalized))
+                for name in sorted(_CAPTURED_PREFLIGHT_MANIFESTS[normalized])
             ),
         )
 
@@ -476,7 +604,7 @@ def _default_dashboard(broker: str) -> DashboardStatus:
                 broker,
                 tuple(
                     GateResult(name=name, passed=False, reason_code="GATE_NOT_SATISFIED")
-                    for name in sorted(required_gate_names(manifest_broker))
+                    for name in sorted(_CAPTURED_PREFLIGHT_MANIFESTS[manifest_broker])
                 ),
             ),
         ),
@@ -504,6 +632,24 @@ def build_app(
 ) -> typer.Typer:
     """Build a CLI whose effectful services are supplied explicitly."""
     factory = _default_container if container_factory is None else container_factory
+    facade_type = Task14CliLiveFacade
+    facade_registry = _LIVE_FACADE_BINDINGS
+    binding_resolver = _live_facade_binding
+    dispatch_resolver = _resolve_live_dispatch
+    dispatch_implementation = _submit_task14_order
+    approval_service_type = ApprovalService
+    live_order_service_type = LiveOrderService
+    approval_create_implementation = _APPROVAL_CREATE_IMPLEMENTATION
+    live_submit_implementation = _LIVE_SUBMIT_IMPLEMENTATION
+    proposal_reconstructor = _reconstruct_order_proposal
+    proposal_validator = _validated_proposal
+    proposal_matcher = _proposal_matches_request
+    broker_order_emitter = _emit_broker_order
+    secret_detector = _secret_shaped
+    mapping_emitter = _emit
+    preflight_manifests = _CAPTURED_PREFLIGHT_MANIFESTS
+    preflight_validator = _validated_preflight
+    preflight_gate_validator = _valid_gate_fields
     application = typer.Typer(no_args_is_help=True, add_completion=False)
 
     @application.command("status", hidden=True)
@@ -544,7 +690,18 @@ def build_app(
             report = None
         if preflight_failed:
             _error("PREFLIGHT_UNAVAILABLE", 20)
-        manifest = _validated_preflight(report, normalized)
+        if (
+            _CAPTURED_PREFLIGHT_MANIFESTS is not preflight_manifests
+            or _validated_preflight is not preflight_validator
+            or _valid_gate_fields is not preflight_gate_validator
+        ):
+            _error("PREFLIGHT_INVALID", 20)
+        manifest = preflight_validator(
+            report,
+            normalized,
+            manifests=preflight_manifests,
+            gate_validator=preflight_gate_validator,
+        )
         if manifest is None:
             _error("PREFLIGHT_INVALID", 20)
         missing_gates, ready = manifest
@@ -583,6 +740,7 @@ def build_app(
         risk_expires_at: str | None = typer.Option(None),
     ) -> None:
         request = _order_request(locals())
+        expected = _expected_proposal(request)
         container = _get_container(factory)
         if container.proposal is None:
             _error("PROPOSAL_SERVICE_UNAVAILABLE", 30)
@@ -594,14 +752,24 @@ def build_app(
             result = None
         if proposal_failed:
             _error("PROPOSAL_FAILED", 30)
-        if type(result) is not OrderProposal:
+        if (
+            _reconstruct_order_proposal is not proposal_reconstructor
+            or _validated_proposal is not proposal_validator
+            or _proposal_matches_request is not proposal_matcher
+        ):
             _error("PROPOSAL_RESPONSE_INVALID", 30)
-        if not _proposal_matches_request(result, request):
+        proposal = proposal_validator(
+            result,
+            expected,
+            reconstructor=proposal_reconstructor,
+            matcher=proposal_matcher,
+        )
+        if proposal is None:
             _error("PROPOSAL_RESPONSE_INVALID", 30)
-        if not result.accepted:
-            _emit({"accepted": False, "reason_codes": list(result.reason_codes)})
+        if not proposal.accepted:
+            _emit({"accepted": False, "reason_codes": list(proposal.reason_codes)})
             raise typer.Exit(30)
-        _emit(_proposal_mapping(result, request))
+        _emit(_proposal_mapping(proposal, expected))
 
     @application.command("submit-confirmed-order")
     def submit_confirmed_order(
@@ -633,39 +801,83 @@ def build_app(
             _emit({"error": "CONFIRMATION_PHRASE_REQUIRED", "required_phrase": CONFIRMATION_PHRASE})
             raise typer.Exit(21)
         request = _order_request(locals())
+        expected = _expected_proposal(request)
+        exact_proposal = OrderProposal(
+            True,
+            (),
+            expected.broker,
+            expected.intent,
+            expected.risk_decision,
+            expected.request_fingerprint,
+        )
         container = _get_container(factory)
+        if container.proposal is not None:
+            _error("PROPOSAL_RESPONSE_INVALID", 30)
         live_facade = container.live_submission
         if live_facade is None:
             _error("LIVE_SERVICE_UNAVAILABLE", 30)
         try:
-            _live_facade_binding(live_facade)
-        except (TypeError, ValueError):
-            _error("LIVE_SERVICE_INVALID", 30)
-        if container.proposal is None:
-            _error("PROPOSAL_SERVICE_UNAVAILABLE", 30)
-        proposal_failed = False
-        try:
-            proposal = container.proposal.propose(request)
+            (
+                binding,
+                live_dispatch,
+                resolved_implementation,
+                resolved_approval_create,
+                resolved_live_submit,
+                resolved_proposal_reconstructor,
+            ) = dispatch_resolver(live_facade)
         except Exception:
-            proposal_failed = True
-            proposal = None
-        if proposal_failed:
-            _error("PROPOSAL_FAILED", 30)
-        if (
-            type(proposal) is not OrderProposal
-            or not proposal.accepted
-            or not _proposal_matches_request(proposal, request)
-        ):
-            _error("PROPOSAL_RESPONSE_INVALID", 30)
-        if container.live_submission is not live_facade:
             _error("LIVE_SERVICE_INVALID", 30)
-        try:
-            _live_facade_binding(live_facade)
-        except (TypeError, ValueError):
+        approval_service = binding.approval_service
+        live_order_service = binding.live_order_service
+        snapshot = binding.snapshot
+        preflight = binding.preflight
+        reconciliation = binding.reconciliation
+        store_identity = binding.store_identity
+        def binding_is_intact() -> bool:
+            try:
+                return bool(
+                container.live_submission is live_facade
+                and Task14CliLiveFacade is facade_type
+                and "submit" not in facade_type.__dict__
+                and _LIVE_FACADE_BINDINGS is facade_registry
+                and _live_facade_binding is binding_resolver
+                and _resolve_live_dispatch is dispatch_resolver
+                and _submit_task14_order is dispatch_implementation
+                and resolved_implementation is dispatch_implementation
+                and ApprovalService is approval_service_type
+                and LiveOrderService is live_order_service_type
+                and _APPROVAL_CREATE_IMPLEMENTATION is approval_create_implementation
+                and _LIVE_SUBMIT_IMPLEMENTATION is live_submit_implementation
+                and approval_service_type.create is approval_create_implementation
+                and live_order_service_type.submit_confirmed is live_submit_implementation
+                and resolved_approval_create is approval_create_implementation
+                and resolved_live_submit is live_submit_implementation
+                and _reconstruct_order_proposal is proposal_reconstructor
+                and _validated_proposal is proposal_validator
+                and _proposal_matches_request is proposal_matcher
+                and resolved_proposal_reconstructor is proposal_reconstructor
+                and _emit_broker_order is broker_order_emitter
+                and _secret_shaped is secret_detector
+                and _emit is mapping_emitter
+                and facade_registry.get(live_facade) is binding
+                and binding.approval_service is approval_service
+                and binding.live_order_service is live_order_service
+                and binding.snapshot is snapshot
+                and binding.preflight is preflight
+                and binding.reconciliation is reconciliation
+                and binding.store_identity is store_identity
+                and live_order_service._approval is approval_service
+                and approval_service.safety_store_identity is store_identity
+                and live_order_service.safety_store_identity is store_identity
+                )
+            except Exception:
+                return False
+
+        if not binding_is_intact():
             _error("LIVE_SERVICE_INVALID", 30)
         submission_failed = False
         try:
-            result = live_facade.submit(proposal, confirm_real_money)
+            result = live_dispatch(exact_proposal, confirm_real_money)
         except Exception:
             submission_failed = True
             result = None
@@ -673,7 +885,13 @@ def build_app(
             _error("LIVE_SUBMISSION_REJECTED", 30)
         if type(result) is not BrokerOrder:
             _error("LIVE_RESPONSE_INVALID", 30)
-        _emit_broker_order(result)
+        if not binding_is_intact():
+            _error("LIVE_RESPONSE_INVALID", 30)
+        broker_order_emitter(
+            result,
+            secret_detector=secret_detector,
+            emit=mapping_emitter,
+        )
 
     @application.command("export-dashboard")
     def export_dashboard(
@@ -856,23 +1074,140 @@ def _require_broker(value: object) -> str:
     return value
 
 
-def _proposal_matches_request(proposal: OrderProposal, request: BoundOrderRequest) -> bool:
-    try:
-        return (
-            proposal.broker == request.broker
-            and proposal.intent == request.domain_intent()
-            and proposal.risk_decision == request.domain_risk()
-            and proposal.request_fingerprint == request.fingerprint()
+def _reconstruct_order_proposal(value: object) -> OrderProposal:
+    """Deeply reconstruct one exact proposal without trusting frozen object state."""
+    if (
+        type(value) is not OrderProposal
+        or type(value.accepted) is not bool
+        or type(value.reason_codes) is not tuple
+        or len(value.reason_codes) > _MAX_PROPOSAL_REASONS
+        or any(
+            type(reason) is not str
+            or len(reason) > 64
+            or _REASON.fullmatch(reason) is None
+            or _secret_shaped(reason)
+            for reason in value.reason_codes
         )
-    except (TypeError, ValueError, CanonicalEncodingError):
+        or value.accepted is not (not value.reason_codes)
+        or type(value.broker) is not str
+        or value.broker not in _BROKERS
+        or type(value.intent) is not OrderIntent
+        or type(value.risk_decision) is not RiskDecision
+        or type(value.request_fingerprint) is not str
+        or _HASH.fullmatch(value.request_fingerprint) is None
+    ):
+        raise ValueError("order proposal is malformed")
+    intent_strings = (
+        value.intent.intent_id,
+        value.intent.instrument_id,
+        value.intent.time_in_force,
+        value.intent.product,
+        value.intent.session,
+        value.intent.snapshot_hash,
+    )
+    risk_reasons = value.risk_decision.reason_codes
+    if (
+        any(not _bounded_model_text(item, 256) for item in intent_strings)
+        or type(value.risk_decision.approved) is not bool
+        or type(risk_reasons) is not tuple
+        or len(risk_reasons) > _MAX_PROPOSAL_REASONS
+        or any(
+            not _bounded_model_text(reason, 64)
+            or _REASON.fullmatch(reason) is None
+            for reason in risk_reasons
+        )
+        or not _bounded_model_text(value.risk_decision.portfolio_hash, 128)
+    ):
+        raise ValueError("order proposal is malformed")
+    intent = OrderIntent.model_validate(
+        value.intent.model_dump(mode="python", warnings="error"),
+        strict=True,
+    )
+    risk_decision = RiskDecision.model_validate(
+        value.risk_decision.model_dump(mode="python", warnings="error"),
+        strict=True,
+    )
+    return OrderProposal(
+        accepted=value.accepted,
+        reason_codes=tuple(value.reason_codes),
+        broker=value.broker,
+        intent=intent,
+        risk_decision=risk_decision,
+        request_fingerprint=value.request_fingerprint,
+    )
+
+
+def _bounded_model_text(value: object, limit: int) -> bool:
+    if type(value) is not str or not value or len(value) > limit:
         return False
+    try:
+        return len(value.encode("utf-8")) <= limit
+    except UnicodeError:
+        return False
+
+
+def _validated_proposal(
+    value: object,
+    expected: _ExpectedProposal,
+    *,
+    reconstructor: Callable[[object], OrderProposal],
+    matcher: Callable[[OrderProposal, _ExpectedProposal], bool],
+) -> OrderProposal | None:
+    try:
+        proposal = reconstructor(value)
+        matches = matcher(proposal, expected)
+    except Exception:
+        return None
+    return proposal if matches else None
+
+
+def _proposal_matches_request(proposal: OrderProposal, expected: _ExpectedProposal) -> bool:
+    return bool(
+        proposal.broker == expected.broker
+        and proposal.intent == expected.intent
+        and proposal.risk_decision == expected.risk_decision
+        and proposal.request_fingerprint == expected.request_fingerprint
+    )
+
+
+def _expected_proposal(request: BoundOrderRequest) -> _ExpectedProposal:
+    """Freeze every request-derived value before calling injected proposal code."""
+    return _ExpectedProposal(
+        broker=request.broker,
+        intent=request.domain_intent(),
+        risk_decision=request.domain_risk(),
+        request_fingerprint=request.fingerprint(),
+        safe_items=tuple(request.safe_mapping().items()),
+    )
+
+
+def _clone_preflight(report: PreflightReport) -> PreflightReport:
+    if (
+        type(report) is not PreflightReport
+        or type(report.broker) is not str
+        or type(report.gates) is not tuple
+        or len(report.gates) > _MAX_PREFLIGHT_GATES
+    ):
+        raise ValueError("preflight report is malformed")
+    gates: list[GateResult] = []
+    for item in report.gates:
+        if not _valid_gate_fields(item):
+            raise ValueError("preflight report is malformed")
+        gates.append(
+            GateResult(
+                name=item.name,
+                passed=item.passed,
+                reason_code=item.reason_code,
+            )
+        )
+    return PreflightReport(report.broker, tuple(gates))
 
 
 def _proposal_mapping(
     proposal: OrderProposal,
-    request: BoundOrderRequest,
+    expected: _ExpectedProposal,
 ) -> dict[str, object]:
-    mapping = request.safe_mapping()
+    mapping = dict(expected.safe_items)
     mapping.update(
         {
             "accepted": True,
@@ -889,13 +1224,18 @@ def _proposal_mapping(
     return mapping
 
 
-def _emit_broker_order(order: BrokerOrder) -> None:
+def _emit_broker_order(
+    order: BrokerOrder,
+    *,
+    secret_detector: Callable[[object], bool],
+    emit: Callable[[Mapping[str, object]], None],
+) -> None:
     if any(
-        _secret_shaped(value)
+        secret_detector(value)
         for value in (order.order_id, order.client_order_id, order.broker, order.instrument_id)
     ):
         _error("LIVE_RESPONSE_INVALID", 30)
-    _emit(
+    emit(
         {
             "order_id": order.order_id,
             "client_order_id": order.client_order_id,
@@ -950,7 +1290,11 @@ def _secret_shaped(value: object) -> bool:
 def _validated_preflight(
     report: object,
     broker: str,
+    *,
+    manifests: Mapping[str, frozenset[str]] = _CAPTURED_PREFLIGHT_MANIFESTS,
+    gate_validator: Callable[[object], bool] | None = None,
 ) -> tuple[list[str], bool] | None:
+    validator = _valid_gate_fields if gate_validator is None else gate_validator
     expected_broker = "ccxt-spot" if broker == "ccxt" else broker
     if (
         type(report) is not PreflightReport
@@ -958,27 +1302,53 @@ def _validated_preflight(
         or type(report.gates) is not tuple
     ):
         return None
-    required = required_gate_names(expected_broker)
+    required = manifests.get(expected_broker)
+    if required is None:
+        return None
+    if (
+        len(report.gates) > _MAX_PREFLIGHT_GATES
+        or len(report.gates) != len(required)
+    ):
+        return None
     names: list[str] = []
     missing: list[str] = []
     for gate_result in report.gates:
-        if (
-            type(gate_result) is not GateResult
-            or type(gate_result.name) is not str
-            or not gate_result.name
-            or type(gate_result.passed) is not bool
-            or type(gate_result.reason_code) is not str
-            or _REASON.fullmatch(gate_result.reason_code) is None
-            or (gate_result.passed and gate_result.reason_code != "OK")
-            or (not gate_result.passed and gate_result.reason_code == "OK")
-        ):
+        if not validator(gate_result):
             return None
         names.append(gate_result.name)
         if not gate_result.passed:
             missing.append(gate_result.name)
-    if len(names) != len(required) or set(names) != required:
+    if set(names) != required:
         return None
     return sorted(missing), not missing
+
+
+def _valid_gate_fields(value: object) -> bool:
+    if type(value) is not GateResult:
+        return False
+    name = value.name
+    reason = value.reason_code
+    if (
+        type(name) is not str
+        or not name
+        or len(name) > _MAX_GATE_NAME_CHARS
+        or type(reason) is not str
+        or len(reason) > _MAX_GATE_REASON_CHARS
+        or type(value.passed) is not bool
+    ):
+        return False
+    try:
+        if len(name.encode("utf-8")) > _MAX_GATE_NAME_CHARS:
+            return False
+        if len(reason.encode("utf-8")) > _MAX_GATE_REASON_CHARS:
+            return False
+    except UnicodeError:
+        return False
+    return bool(
+        _REASON.fullmatch(reason)
+        and (not value.passed or reason == "OK")
+        and (value.passed or reason != "OK")
+    )
 
 
 def _require_instrument(value: object) -> None:

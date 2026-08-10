@@ -1,10 +1,19 @@
+<#
+.SYNOPSIS
+Exports a local redacted dashboard snapshot.
+
+.NOTES
+Windows supports handle-bound replacement of an existing destination. On POSIX,
+use a fresh unique/versioned .json path for every export: safe mode atomically
+creates an absent destination and refuses to replace an existing path.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('groww', 'alpaca', 'ccxt')]
     [string]$Broker,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, HelpMessage = 'Use a fresh unique/versioned .json path on POSIX.')]
     [ValidateNotNullOrEmpty()]
     [string]$Path
 )
