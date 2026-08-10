@@ -35,6 +35,7 @@ _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:@-]{0,127}$")
 _CURRENCY = re.compile(r"^[A-Z]{3,8}$")
 _REASON = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_OUTPUT_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 _PROMOTIONS = frozenset({"not_promoted", "research", "backtest", "paper", "live-small"})
 _SECRET_KEY_PARTS = (
     "apikey",
@@ -55,7 +56,10 @@ _SECRET_VALUE = re.compile(
     r"[a-z0-9_-]{20,}\.[a-z0-9_-]{20,}\.[a-z0-9_-]{20,}|"
     r"\b(?:api[_-]?key|access[_-]?(?:key|token)|private[_-]?key|client[_-]?secret|"
     r"refresh[_-]?token|id[_-]?token|secret|token|password|credential|authorization|"
-    r"cookie|set[_-]?cookie|session(?:id)?)\b[\"']?\s*[:=]\s*[\"']?[^\s&;,\"'}]+)"
+    r"cookie|set[_-]?cookie|session(?:id)?)\b[\"']?\s*[:=]\s*[\"']?[^\s&;,\"'}]+|"
+    r"\b(?:[a-z0-9]+[-_])?(?:real[-_])?(?:secret|token|password|credential|"
+    r"private[-_]?key|access[-_]?key)(?:[-_](?:value|key|token))?[-_:]"
+    r"[a-z0-9][a-z0-9_-]{7,}\b)"
 )
 _REDACTED = "[REDACTED]"
 
@@ -145,6 +149,8 @@ class DashboardBroker:
                 or type(gate.passed) is not bool
                 or type(gate.reason_code) is not str
                 or _REASON.fullmatch(gate.reason_code) is None
+                or (gate.passed and gate.reason_code != "OK")
+                or (not gate.passed and gate.reason_code == "OK")
             ):
                 raise DashboardValidationError("DASHBOARD_BROKER_GATES_INVALID")
             names.append(gate.name)
@@ -231,6 +237,8 @@ class DashboardStatus:
         if type(self.portfolio) is not DashboardPortfolio or type(self.risk) is not DashboardRisk:
             raise DashboardValidationError("DASHBOARD_PORTFOLIO_INVALID")
         _nonempty_exact_tuple(self.brokers, DashboardBroker, "DASHBOARD_BROKER_INVALID")
+        if type(self.orders) is tuple and len(self.orders) > _MAX_COLLECTION:
+            raise DashboardValidationError("DASHBOARD_VALUE_BOUNDS_EXCEEDED")
         if type(self.orders) is not tuple or not all(
             type(item) is DashboardOrder for item in self.orders
         ):
@@ -260,6 +268,12 @@ class _Destination:
 
 
 @dataclass(frozen=True, slots=True)
+class _Backup:
+    path: Path
+    identity: tuple[int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
 class _DirectoryGuard:
     parent_fd: int | None
 
@@ -283,14 +297,43 @@ class _DirectoryGuard:
         except FileNotFoundError:
             return
 
+    def link(self, source: Path, destination: Path) -> None:
+        if self.parent_fd is None:
+            os.link(source, destination, follow_symlinks=False)
+            return
+        os.link(
+            source.name,
+            destination.name,
+            src_dir_fd=self.parent_fd,
+            dst_dir_fd=self.parent_fd,
+            follow_symlinks=False,
+        )
+
+    def lstat(self, path: Path) -> os.stat_result | None:
+        if self.parent_fd is None:
+            return _safe_lstat(path)
+        try:
+            return os.stat(path.name, dir_fd=self.parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise DashboardValidationError("DASHBOARD_PATH_CHANGED") from None
+
 
 def safe_json_mapping(value: Mapping[str, object]) -> dict[str, object]:
     """Return bounded built-in JSON data with credential fields removed."""
-    if type(value) not in (dict, MappingProxyType):
-        raise DashboardValidationError("DASHBOARD_VALUE_INVALID")
-    budget = _Budget()
-    prepared = _safe_value(value, depth=0, budget=budget)
-    if type(prepared) is not dict:
+    invalid = False
+    try:
+        if type(value) not in (dict, MappingProxyType):
+            raise DashboardValidationError("DASHBOARD_VALUE_INVALID")
+        budget = _Budget()
+        prepared = _safe_value(value, depth=0, budget=budget)
+        if type(prepared) is not dict:
+            raise DashboardValidationError("DASHBOARD_VALUE_INVALID")
+    except Exception:
+        invalid = True
+        prepared = None
+    if invalid or type(prepared) is not dict:
         raise DashboardValidationError("DASHBOARD_VALUE_INVALID")
     return prepared
 
@@ -301,55 +344,231 @@ def export_dashboard(status: DashboardStatus, destination: Path) -> Path:
         raise DashboardValidationError("DASHBOARD_STATUS_INVALID")
     invalid = False
     try:
-        status.__post_init__()
-        prepared = safe_json_mapping(_dashboard_payload(status))
+        validated = _revalidated_dashboard_status(status)
+        prepared = safe_json_mapping(_dashboard_payload(validated))
     except Exception:
         invalid = True
         prepared = None
     if invalid or prepared is None:
         raise DashboardValidationError("DASHBOARD_STATUS_INVALID")
+    serialization_failed = False
+    try:
+        text = json.dumps(
+            prepared,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ) + "\n"
+        text.encode("utf-8")
+    except Exception:
+        serialization_failed = True
+        text = ""
+    if serialization_failed:
+        raise DashboardValidationError("DASHBOARD_SERIALIZATION_INVALID")
     target = _validated_destination(destination)
-    text = json.dumps(
-        prepared,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ) + "\n"
     temporary: Path | None = None
+    backup: _Backup | None = None
     descriptor: int | None = None
+    temp_identity: tuple[int, int, int] | None = None
+    replaced = False
     write_failed = False
     try:
         with _locked_destination(target) as guard:
             try:
                 descriptor, temporary = _create_sibling_temp(target, guard)
-                _require_regular_local_file(temporary)
+                temp_identity = _identity_tuple(os.fstat(descriptor))
+                _require_temp_identity(descriptor, temporary, temp_identity, guard)
                 _require_same_parent(target)
-                stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
-                descriptor = None
+                stream = os.fdopen(
+                    descriptor,
+                    "w",
+                    encoding="utf-8",
+                    newline="\n",
+                    closefd=False,
+                )
                 with stream:
                     stream.write(text)
                     stream.flush()
                     os.fsync(stream.fileno())
                 _require_same_parent(target)
+                _require_temp_identity(descriptor, temporary, temp_identity, guard)
                 refreshed = _validated_destination(target.path)
                 if refreshed.parent_identity != target.parent_identity:
                     raise DashboardValidationError("DASHBOARD_PATH_CHANGED")
+                _require_temp_identity(descriptor, temporary, temp_identity, guard)
+                backup = _backup_destination(target, guard)
+                if backup is not None:
+                    _require_backup_identity(backup, guard)
                 guard.replace(temporary, target.path)
+                replaced = True
+                _require_replaced_identity(descriptor, target.path, temp_identity, guard)
+                _require_same_parent(target)
+                if backup is not None:
+                    guard.unlink(backup.path)
+                    backup = None
                 temporary = None
             except (OSError, UnicodeError, ValueError):
+                if replaced:
+                    try:
+                        if backup is None:
+                            guard.unlink(target.path)
+                        else:
+                            _require_backup_identity(backup, guard)
+                            guard.replace(backup.path, target.path)
+                            backup = None
+                    except (OSError, ValueError):
+                        pass
+                elif backup is not None:
+                    with suppress(OSError):
+                        guard.unlink(backup.path)
+                    backup = None
+                if temp_identity is not None:
+                    _cleanup_file_identity(target.path.parent, guard, temp_identity)
                 if descriptor is not None:
                     with suppress(OSError):
                         os.close(descriptor)
+                    descriptor = None
                 if temporary is not None:
                     with suppress(OSError):
                         guard.unlink(temporary)
                 raise
+            finally:
+                if descriptor is not None:
+                    with suppress(OSError):
+                        os.close(descriptor)
+                    descriptor = None
     except (OSError, UnicodeError, ValueError):
         write_failed = True
     if write_failed:
         raise DashboardValidationError("DASHBOARD_WRITE_FAILED")
     return target.path
+
+
+def _revalidated_dashboard_status(status: object) -> DashboardStatus:
+    """Rebuild every schema-v1 record so frozen-object tampering is never trusted."""
+    if type(status) is not DashboardStatus:
+        raise DashboardValidationError("DASHBOARD_STATUS_INVALID")
+    if type(status.research) is not DashboardResearch:
+        raise DashboardValidationError("DASHBOARD_RESEARCH_INVALID")
+    research = DashboardResearch(status.research.version, status.research.fresh)
+    if type(status.strategies) is tuple and len(status.strategies) > _MAX_COLLECTION:
+        raise DashboardValidationError("DASHBOARD_VALUE_BOUNDS_EXCEEDED")
+    if type(status.strategies) is not tuple:
+        raise DashboardValidationError("DASHBOARD_STRATEGY_INVALID")
+    strategies: list[DashboardStrategy] = []
+    for item in status.strategies:
+        if type(item) is not DashboardStrategy:
+            raise DashboardValidationError("DASHBOARD_STRATEGY_INVALID")
+        strategies.append(DashboardStrategy(item.strategy_id, item.version))
+    if type(status.promotion) is not DashboardPromotion:
+        raise DashboardValidationError("DASHBOARD_PROMOTION_INVALID")
+    promotion = DashboardPromotion(status.promotion.status)
+    if type(status.portfolio) is not DashboardPortfolio:
+        raise DashboardValidationError("DASHBOARD_PORTFOLIO_INVALID")
+    portfolio = DashboardPortfolio(status.portfolio.currency, status.portfolio.equity)
+    if type(status.risk) is not DashboardRisk:
+        raise DashboardValidationError("DASHBOARD_RISK_INVALID")
+    risk = DashboardRisk(
+        status.risk.max_trade_risk_fraction,
+        status.risk.max_position_fraction,
+        status.risk.max_gross_exposure_fraction,
+        status.risk.max_daily_loss_fraction,
+        status.risk.max_drawdown_fraction,
+    )
+    if type(status.brokers) is tuple and len(status.brokers) > _MAX_COLLECTION:
+        raise DashboardValidationError("DASHBOARD_VALUE_BOUNDS_EXCEEDED")
+    if type(status.brokers) is not tuple:
+        raise DashboardValidationError("DASHBOARD_BROKER_INVALID")
+    brokers: list[DashboardBroker] = []
+    for broker in status.brokers:
+        if type(broker) is not DashboardBroker or type(broker.gates) is not tuple:
+            raise DashboardValidationError("DASHBOARD_BROKER_INVALID")
+        if len(broker.gates) > _MAX_COLLECTION:
+            raise DashboardValidationError("DASHBOARD_VALUE_BOUNDS_EXCEEDED")
+        if type(broker.name) is not str or broker.name not in {
+            "alpaca",
+            "groww",
+            "ccxt",
+        }:
+            raise DashboardValidationError("DASHBOARD_BROKER_INVALID")
+        manifest_name = "ccxt-spot" if broker.name == "ccxt" else broker.name
+        if len(broker.gates) != len(required_gate_names(manifest_name)):
+            raise DashboardValidationError("DASHBOARD_BROKER_GATES_INVALID")
+        gates: list[GateResult] = []
+        for gate in broker.gates:
+            if (
+                type(gate) is not GateResult
+                or type(gate.name) is not str
+                or type(gate.passed) is not bool
+                or type(gate.reason_code) is not str
+            ):
+                raise DashboardValidationError("DASHBOARD_BROKER_GATES_INVALID")
+            gates.append(
+                GateResult(
+                    name=gate.name,
+                    passed=gate.passed,
+                    reason_code=gate.reason_code,
+                )
+            )
+        brokers.append(DashboardBroker(broker.name, tuple(gates)))
+    if type(status.orders) is tuple and len(status.orders) > _MAX_COLLECTION:
+        raise DashboardValidationError("DASHBOARD_VALUE_BOUNDS_EXCEEDED")
+    if type(status.orders) is not tuple:
+        raise DashboardValidationError("DASHBOARD_ORDER_INVALID")
+    orders: list[DashboardOrder] = []
+    for order in status.orders:
+        if type(order) is not DashboardOrder or type(order.status) is not OrderStatus:
+            raise DashboardValidationError("DASHBOARD_ORDER_INVALID")
+        orders.append(DashboardOrder(order.order_id, order.status))
+    kill_switches = _revalidated_safety_states(
+        status.kill_switches, "DASHBOARD_KILL_SWITCH_INVALID"
+    )
+    interlocks = _revalidated_safety_states(
+        status.interlocks, "DASHBOARD_INTERLOCK_INVALID"
+    )
+    aspiration_value = status.aspirational_target
+    if type(aspiration_value) is not DashboardAspiration:
+        raise DashboardValidationError("DASHBOARD_ASPIRATION_INVALID")
+    aspiration = DashboardAspiration(
+        aspiration_value.starting_capital,
+        aspiration_value.current_equity,
+        aspiration_value.target,
+        aspiration_value.required_multiple,
+        aspiration_value.achieved_multiple,
+        aspiration_value.remaining_gap,
+        aspiration_value.reporting_only,
+    )
+    return DashboardStatus(
+        generated_at=status.generated_at,
+        data_as_of=status.data_as_of,
+        research=research,
+        strategies=tuple(strategies),
+        promotion=promotion,
+        portfolio=portfolio,
+        risk=risk,
+        brokers=tuple(brokers),
+        orders=tuple(orders),
+        kill_switches=kill_switches,
+        interlocks=interlocks,
+        aspirational_target=aspiration,
+    )
+
+
+def _revalidated_safety_states(
+    value: object,
+    reason: str,
+) -> tuple[DashboardSafetyState, ...]:
+    if type(value) is tuple and len(value) > _MAX_COLLECTION:
+        raise DashboardValidationError("DASHBOARD_VALUE_BOUNDS_EXCEEDED")
+    if type(value) is not tuple:
+        raise DashboardValidationError(reason)
+    result: list[DashboardSafetyState] = []
+    for item in value:
+        if type(item) is not DashboardSafetyState:
+            raise DashboardValidationError(reason)
+        result.append(DashboardSafetyState(item.active, item.reason_code))
+    return tuple(result)
 
 
 def _dashboard_payload(status: DashboardStatus) -> dict[str, object]:
@@ -431,6 +650,8 @@ def _safe_value(value: object, *, depth: int, budget: _Budget) -> object:
         except CanonicalEncodingError:
             raise DashboardValidationError("DASHBOARD_DECIMAL_INVALID") from None
     if type(value) is str:
+        if len(value) > _MAX_STRING_BYTES:
+            raise DashboardValidationError("DASHBOARD_STRING_INVALID")
         if len(value.encode("utf-8")) > _MAX_STRING_BYTES or any(
             ord(character) < 32 and character not in "\t\n\r" for character in value
         ):
@@ -442,7 +663,12 @@ def _safe_value(value: object, *, depth: int, budget: _Budget) -> object:
             raise DashboardValidationError("DASHBOARD_VALUE_BOUNDS_EXCEEDED")
         result: dict[str, object] = {}
         for key, item in value.items():
-            if type(key) is not str or len(key.encode("utf-8")) > _MAX_STRING_BYTES:
+            if (
+                type(key) is not str
+                or len(key) > 64
+                or _OUTPUT_KEY.fullmatch(key) is None
+                or len(key.encode("utf-8")) > _MAX_STRING_BYTES
+            ):
                 raise DashboardValidationError("DASHBOARD_KEY_INVALID")
             normalized = "".join(character for character in key.casefold() if character.isalnum())
             if any(part in normalized for part in _SECRET_KEY_PARTS):
@@ -550,6 +776,111 @@ def _require_regular_local_file(path: Path) -> None:
         raise DashboardValidationError("DASHBOARD_PATH_INVALID")
 
 
+def _require_temp_identity(
+    descriptor: int,
+    path: Path,
+    expected: tuple[int, int, int],
+    guard: _DirectoryGuard,
+) -> None:
+    handle_details = os.fstat(descriptor)
+    entry_details = guard.lstat(path)
+    if (
+        _identity_tuple(handle_details) != expected
+        or entry_details is None
+        or not stat.S_ISREG(entry_details.st_mode)
+        or _is_reparse(entry_details)
+        or _identity_tuple(entry_details) != expected
+    ):
+        raise DashboardValidationError("DASHBOARD_TEMP_CHANGED")
+
+
+def _require_replaced_identity(
+    descriptor: int,
+    destination: Path,
+    expected: tuple[int, int, int],
+    guard: _DirectoryGuard,
+) -> None:
+    handle_details = os.fstat(descriptor)
+    entry_details = guard.lstat(destination)
+    if (
+        _identity_tuple(handle_details) != expected
+        or entry_details is None
+        or not stat.S_ISREG(entry_details.st_mode)
+        or _is_reparse(entry_details)
+        or _identity_tuple(entry_details) != expected
+    ):
+        raise DashboardValidationError("DASHBOARD_REPLACE_CHANGED")
+
+
+def _backup_destination(
+    destination: _Destination,
+    guard: _DirectoryGuard,
+) -> _Backup | None:
+    details = guard.lstat(destination.path)
+    if details is None:
+        return None
+    if not stat.S_ISREG(details.st_mode) or _is_reparse(details):
+        raise DashboardValidationError("DASHBOARD_PATH_CHANGED")
+    for _ in range(16):
+        backup = destination.path.parent / (
+            f".{destination.path.name}.{secrets.token_hex(12)}.rollback"
+        )
+        try:
+            guard.link(destination.path, backup)
+        except FileExistsError:
+            continue
+        linked = guard.lstat(backup)
+        identity = _identity_tuple(details)
+        if (
+            linked is None
+            or not stat.S_ISREG(linked.st_mode)
+            or _is_reparse(linked)
+            or _identity_tuple(linked) != identity
+        ):
+            with suppress(OSError):
+                guard.unlink(backup)
+            raise DashboardValidationError("DASHBOARD_BACKUP_INVALID")
+        return _Backup(backup, identity)
+    raise DashboardValidationError("DASHBOARD_BACKUP_UNAVAILABLE")
+
+
+def _require_backup_identity(backup: _Backup, guard: _DirectoryGuard) -> None:
+    details = guard.lstat(backup.path)
+    if (
+        details is None
+        or not stat.S_ISREG(details.st_mode)
+        or _is_reparse(details)
+        or _identity_tuple(details) != backup.identity
+    ):
+        raise DashboardValidationError("DASHBOARD_BACKUP_CHANGED")
+
+
+def _cleanup_file_identity(
+    parent: Path,
+    guard: _DirectoryGuard,
+    expected: tuple[int, int, int],
+) -> None:
+    try:
+        entries = os.scandir(parent if guard.parent_fd is None else guard.parent_fd)
+    except OSError:
+        return
+    with entries:
+        for entry in entries:
+            try:
+                details = guard.lstat(parent / entry.name)
+            except DashboardValidationError:
+                continue
+            if details is None:
+                continue
+            if (
+                stat.S_ISREG(details.st_mode)
+                and not _is_reparse(details)
+                and _identity_tuple(details) == expected
+            ):
+                with suppress(OSError):
+                    guard.unlink(parent / entry.name)
+
+
 @contextmanager
 def _locked_destination(destination: _Destination) -> Iterator[_DirectoryGuard]:
     if os.name != "nt":
@@ -580,6 +911,8 @@ def _create_sibling_temp(
     guard: _DirectoryGuard,
 ) -> tuple[int, Path]:
     if guard.parent_fd is None:
+        if os.name == "nt":
+            return _create_windows_sibling_temp(destination)
         descriptor, name = tempfile.mkstemp(
             prefix=f".{destination.path.name}.",
             suffix=".tmp",
@@ -598,6 +931,49 @@ def _create_sibling_temp(
         except FileExistsError:
             continue
         return descriptor, destination.path.parent / name
+    raise DashboardValidationError("DASHBOARD_TEMP_UNAVAILABLE")
+
+
+def _create_windows_sibling_temp(destination: _Destination) -> tuple[int, Path]:
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    prototype = ctypes.WINFUNCTYPE(
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    create_file = prototype(("CreateFileW", kernel32))
+    invalid = ctypes.c_void_p(-1).value
+    for _ in range(16):
+        path = destination.path.parent / (
+            f".{destination.path.name}.{secrets.token_hex(12)}.tmp"
+        )
+        handle = create_file(
+            str(path),
+            0x80000000 | 0x40000000,
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            1,
+            0x00000080 | 0x00000100,
+            None,
+        )
+        if handle is not None and handle != invalid:
+            try:
+                descriptor = msvcrt.open_osfhandle(
+                    int(handle), os.O_RDWR | getattr(os, "O_BINARY", 0)
+                )
+            except OSError:
+                _close_windows_handle(int(handle))
+                raise
+            return descriptor, path
+        if ctypes.get_last_error() != 80:
+            raise DashboardValidationError("DASHBOARD_TEMP_UNAVAILABLE")
     raise DashboardValidationError("DASHBOARD_TEMP_UNAVAILABLE")
 
 
@@ -665,6 +1041,10 @@ def _exact_bool(value: object) -> bool:
 def _finite_decimal(value: object) -> Decimal:
     if type(value) is not Decimal or not value.is_finite():
         raise DashboardValidationError("DASHBOARD_DECIMAL_INVALID")
+    try:
+        canonical_decimal(value)
+    except CanonicalEncodingError:
+        raise DashboardValidationError("DASHBOARD_DECIMAL_INVALID") from None
     return value
 
 
@@ -685,6 +1065,7 @@ def _nonnegative_decimal(value: object) -> Decimal:
 def _identity(value: object) -> str:
     if (
         type(value) is not str
+        or len(value) > 128
         or _IDENTITY.fullmatch(value) is None
         or _secret_value(value)
     ):
@@ -695,6 +1076,7 @@ def _identity(value: object) -> str:
 def _version(value: object) -> str:
     if (
         type(value) is not str
+        or len(value) > 64
         or _VERSION.fullmatch(value) is None
         or _secret_value(value)
     ):
@@ -703,6 +1085,8 @@ def _version(value: object) -> str:
 
 
 def _nonempty_exact_tuple(value: object, item_type: type[object], reason: str) -> None:
+    if type(value) is tuple and len(value) > _MAX_COLLECTION:
+        raise DashboardValidationError("DASHBOARD_VALUE_BOUNDS_EXCEEDED")
     if type(value) is not tuple or not value or not all(type(item) is item_type for item in value):
         raise DashboardValidationError(reason)
 

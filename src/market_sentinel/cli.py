@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Annotated, Never, Protocol, cast
+from types import MappingProxyType
+from typing import Annotated, Never, NoReturn, Protocol, SupportsIndex, cast
+from weakref import WeakKeyDictionary
 
 import typer
 
@@ -37,7 +39,6 @@ from market_sentinel.operations.dashboard import (
     DashboardSafetyState,
     DashboardStatus,
     DashboardStrategy,
-    DashboardValidationError,
     safe_json_mapping,
 )
 from market_sentinel.operations.dashboard import (
@@ -280,35 +281,31 @@ class OrderProposal:
 
 
 class Task14CliLiveFacade:
-    """Exact CLI bridge that can only call the real authenticated Task 14 service."""
+    """Factory-registered zero-state identity for the exact Task 14 live bridge."""
 
-    def __init__(
-        self,
-        *,
-        approval_service: ApprovalService,
-        live_order_service: LiveOrderService,
-        snapshot: MarketSnapshot,
-        preflight: PreflightReport,
-        reconciliation: ReconciliationReport,
-    ) -> None:
-        if (
-            type(approval_service) is not ApprovalService
-            or type(live_order_service) is not LiveOrderService
-            or type(snapshot) is not MarketSnapshot
-            or type(preflight) is not PreflightReport
-            or type(reconciliation) is not ReconciliationReport
-            or approval_service.safety_store_identity
-            is not live_order_service.safety_store_identity
-        ):
-            raise ValueError("live CLI facade requires exact shared Task 14 services")
-        self._approval = approval_service
-        self._live = live_order_service
-        self._snapshot = snapshot
-        self._preflight = preflight
-        self._reconciliation = reconciliation
+    __slots__ = ("__weakref__",)
+
+    def __init__(self) -> None:
+        pass
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("live CLI facade is immutable")
+
+    def __copy__(self) -> Task14CliLiveFacade:
+        raise TypeError("live CLI facades cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> Task14CliLiveFacade:
+        del memo
+        raise TypeError("live CLI facades cannot be copied")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise TypeError("live CLI facades cannot be serialized")
 
     def submit(self, proposal: OrderProposal, confirmation_phrase: str) -> BrokerOrder:
         """Durably issue confirmation, then delegate every live gate to Task 14."""
+        binding = _live_facade_binding(self)
         if type(proposal) is not OrderProposal or not proposal.accepted:
             raise ValueError("live order requires an accepted exact proposal")
         intent = OrderIntent.model_validate(proposal.intent.model_dump(mode="python"))
@@ -317,24 +314,110 @@ class Task14CliLiveFacade:
         )
         if intent != proposal.intent or risk_decision != proposal.risk_decision:
             raise ValueError("live proposal did not survive exact domain revalidation")
-        if proposal.broker != self._live.broker_name:
+        internal_broker = "ccxt-spot" if proposal.broker == "ccxt" else proposal.broker
+        if internal_broker != binding.live_order_service.broker_name:
             raise ValueError("proposal broker does not match live service")
-        if self._snapshot.instrument_id != intent.instrument_id:
+        if binding.snapshot.instrument_id != intent.instrument_id:
             raise ValueError("proposal snapshot does not match live service")
-        confirmation = self._approval.create(
+        confirmation = binding.approval_service.create(
             intent,
             risk_decision,
             phrase=confirmation_phrase,
-            broker=proposal.broker,
+            broker=internal_broker,
         )
-        return self._live.submit_confirmed(
+        return binding.live_order_service.submit_confirmed(
             intent=intent,
             risk_decision=risk_decision,
-            snapshot=self._snapshot,
+            snapshot=binding.snapshot,
             confirmation=confirmation,
-            preflight=self._preflight,
-            reconciliation=self._reconciliation,
+            preflight=binding.preflight,
+            reconciliation=binding.reconciliation,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _Task14CliLiveBinding:
+    approval_service: ApprovalService
+    live_order_service: LiveOrderService
+    snapshot: MarketSnapshot
+    preflight: PreflightReport
+    reconciliation: ReconciliationReport
+    store_identity: object
+
+
+_LIVE_FACADE_BINDINGS: WeakKeyDictionary[Task14CliLiveFacade, _Task14CliLiveBinding] = (
+    WeakKeyDictionary()
+)
+
+
+def _live_facade_binding(handle: Task14CliLiveFacade) -> _Task14CliLiveBinding:
+    if type(handle) is not Task14CliLiveFacade:
+        raise ValueError("live CLI facade is not factory registered")
+    binding = _LIVE_FACADE_BINDINGS.get(handle)
+    if (
+        type(binding) is not _Task14CliLiveBinding
+        or type(binding.approval_service) is not ApprovalService
+        or type(binding.live_order_service) is not LiveOrderService
+        or type(binding.snapshot) is not MarketSnapshot
+        or type(binding.preflight) is not PreflightReport
+        or type(binding.reconciliation) is not ReconciliationReport
+        or binding.live_order_service._approval is not binding.approval_service
+    ):
+        raise ValueError("live CLI facade is not factory registered")
+    try:
+        approval_identity = binding.approval_service.safety_store_identity
+        live_identity = binding.live_order_service.safety_store_identity
+    except Exception:
+        raise ValueError("live CLI facade safety binding is invalid") from None
+    if (
+        approval_identity is not binding.store_identity
+        or live_identity is not binding.store_identity
+    ):
+        raise ValueError("live CLI facade safety binding is invalid")
+    return binding
+
+
+def create_task14_cli_live_facade(
+    *,
+    approval_service: ApprovalService,
+    live_order_service: LiveOrderService,
+    snapshot: MarketSnapshot,
+    preflight: PreflightReport,
+    reconciliation: ReconciliationReport,
+) -> Task14CliLiveFacade:
+    """Register one opaque facade around exact, shared Task 14 safety services."""
+    if (
+        type(approval_service) is not ApprovalService
+        or type(live_order_service) is not LiveOrderService
+        or type(snapshot) is not MarketSnapshot
+        or type(preflight) is not PreflightReport
+        or type(reconciliation) is not ReconciliationReport
+        or live_order_service._approval is not approval_service
+    ):
+        raise ValueError("live CLI facade requires exact shared Task 14 services")
+    try:
+        store_identity = approval_service.safety_store_identity
+        live_store_identity = live_order_service.safety_store_identity
+    except Exception:
+        raise ValueError("live CLI facade requires exact shared Task 14 services") from None
+    if store_identity is not live_store_identity:
+        raise ValueError("live CLI facade requires exact shared Task 14 services")
+    expected_broker = live_order_service.broker_name
+    external_broker = "ccxt" if expected_broker == "ccxt-spot" else expected_broker
+    if expected_broker not in _BROKERS and expected_broker != "ccxt-spot":
+        raise ValueError("live CLI facade broker is invalid")
+    if _validated_preflight(preflight, external_broker) is None:
+        raise ValueError("live CLI facade preflight is invalid")
+    handle = Task14CliLiveFacade()
+    _LIVE_FACADE_BINDINGS[handle] = _Task14CliLiveBinding(
+        approval_service,
+        live_order_service,
+        snapshot,
+        preflight,
+        reconciliation,
+        store_identity,
+    )
+    return handle
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,11 +433,13 @@ class ServiceContainer:
     dashboard: Callable[[str], DashboardStatus] | None = None
 
     def __post_init__(self) -> None:
-        if (
-            self.live_submission is not None
-            and type(self.live_submission) is not Task14CliLiveFacade
-        ):
-            raise ValueError("live submission requires the exact Task 14 facade")
+        if self.live_submission is not None:
+            try:
+                _live_facade_binding(self.live_submission)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "live submission requires the exact Task 14 facade that is factory registered"
+                ) from None
 
 
 class _OfflinePreflight:
@@ -549,9 +634,12 @@ def build_app(
             raise typer.Exit(21)
         request = _order_request(locals())
         container = _get_container(factory)
-        if container.live_submission is None:
+        live_facade = container.live_submission
+        if live_facade is None:
             _error("LIVE_SERVICE_UNAVAILABLE", 30)
-        if type(container.live_submission) is not Task14CliLiveFacade:
+        try:
+            _live_facade_binding(live_facade)
+        except (TypeError, ValueError):
             _error("LIVE_SERVICE_INVALID", 30)
         if container.proposal is None:
             _error("PROPOSAL_SERVICE_UNAVAILABLE", 30)
@@ -569,9 +657,15 @@ def build_app(
             or not _proposal_matches_request(proposal, request)
         ):
             _error("PROPOSAL_RESPONSE_INVALID", 30)
+        if container.live_submission is not live_facade:
+            _error("LIVE_SERVICE_INVALID", 30)
+        try:
+            _live_facade_binding(live_facade)
+        except (TypeError, ValueError):
+            _error("LIVE_SERVICE_INVALID", 30)
         submission_failed = False
         try:
-            result = container.live_submission.submit(proposal, confirm_real_money)
+            result = live_facade.submit(proposal, confirm_real_money)
         except Exception:
             submission_failed = True
             result = None
@@ -714,16 +808,21 @@ def _get_container(factory: Callable[[], ServiceContainer]) -> ServiceContainer:
         _error("SERVICE_CONTAINER_UNAVAILABLE", 50)
     if type(container) is not ServiceContainer:
         _error("SERVICE_CONTAINER_INVALID", 50)
+    if container.live_submission is not None:
+        try:
+            _live_facade_binding(container.live_submission)
+        except (TypeError, ValueError):
+            _error("SERVICE_CONTAINER_INVALID", 50)
     return container
 
 
 def _emit_service_result(result: object) -> None:
-    if not isinstance(result, Mapping):
+    if type(result) not in {dict, MappingProxyType}:
         _error("SERVICE_RESPONSE_INVALID", 50)
     invalid = False
     try:
         prepared = safe_json_mapping(cast(Mapping[str, object], result))
-    except DashboardValidationError:
+    except Exception:
         invalid = True
         prepared = None
     if invalid or prepared is None:
@@ -732,7 +831,18 @@ def _emit_service_result(result: object) -> None:
 
 
 def _emit(payload: Mapping[str, object]) -> None:
-    typer.echo(json.dumps(dict(payload), allow_nan=False, separators=(",", ":"), sort_keys=True))
+    failed = False
+    try:
+        text = json.dumps(
+            dict(payload), allow_nan=False, separators=(",", ":"), sort_keys=True
+        )
+    except Exception:
+        failed = True
+        text = ""
+    if failed:
+        typer.echo('{"error":"OUTPUT_SERIALIZATION_FAILED"}')
+        raise typer.Exit(50)
+    typer.echo(text)
 
 
 def _error(reason_code: str, status: int) -> Never:
@@ -858,7 +968,9 @@ def _validated_preflight(
             or not gate_result.name
             or type(gate_result.passed) is not bool
             or type(gate_result.reason_code) is not str
-            or not gate_result.reason_code
+            or _REASON.fullmatch(gate_result.reason_code) is None
+            or (gate_result.passed and gate_result.reason_code != "OK")
+            or (not gate_result.passed and gate_result.reason_code == "OK")
         ):
             return None
         names.append(gate_result.name)

@@ -9,9 +9,11 @@ from decimal import Decimal
 from pathlib import Path
 
 import click
+import pytest
 from typer.main import get_command
 from typer.testing import CliRunner
 
+import market_sentinel.cli as cli_module
 from market_sentinel.brokers.preflight import PreflightReport, gate, required_gate_names
 from market_sentinel.cli import (
     CONFIRMATION_PHRASE,
@@ -64,7 +66,14 @@ class _SecretShapedWorkflow:
             "header": "Authorization: Bearer header-value",
             "query": "https://local.invalid/?credential=live-value",
             "encoded": "https://local.invalid/?api%5Fkey=encoded-value",
+            "provider_text": "groww-real-secret-value-1234567890",
         }
+
+
+class _SurrogateWorkflow:
+    def run(self, request: WorkflowRequest) -> Mapping[str, object]:
+        del request
+        return {"innocent": "\ud800"}
 
 
 class _Preflight:
@@ -236,6 +245,36 @@ def test_preflight_rejects_unknown_or_incomplete_gate_manifests() -> None:
     assert "traceback" not in hostile_result.stdout.lower()
 
 
+def test_preflight_rejects_pass_reason_contradictions() -> None:
+    """Only passed/OK and failed/non-OK gate pairs are coherent readiness evidence."""
+
+    class _Contradictory:
+        def __init__(self, *, passed: bool, reason: str) -> None:
+            self.passed = passed
+            self.reason = reason
+
+        def run(self, broker: str) -> PreflightReport:
+            return PreflightReport(
+                broker,
+                tuple(
+                    GateResult(name=name, passed=self.passed, reason_code=self.reason)
+                    for name in sorted(required_gate_names(broker))
+                ),
+            )
+
+    for passed, reason in ((True, "NOT_OK"), (False, "OK")):
+        result = CliRunner().invoke(
+            build_app(
+                lambda passed=passed, reason=reason: ServiceContainer(
+                    preflight=_Contradictory(passed=passed, reason=reason)
+                )
+            ),
+            ["live-preflight", "--broker", "alpaca"],
+        )
+        assert result.exit_code == 20
+        assert result.stdout.strip() == '{"error":"PREFLIGHT_INVALID"}'
+
+
 def test_workflows_require_canonical_instrument_and_aware_dates_without_traceback() -> None:
     """Malformed instruments and naive dates must stop before injected work runs."""
     app = build_app(lambda: _container())
@@ -310,10 +349,67 @@ def test_workflow_output_redacts_assignment_query_header_and_encoded_secrets() -
         "assignment": "[REDACTED]",
         "encoded": "[REDACTED]",
         "header": "[REDACTED]",
+        "provider_text": "[REDACTED]",
         "query": "[REDACTED]",
     }
-    for forbidden in ("secret-token-123", "header-value", "live-value", "encoded-value"):
+    for forbidden in (
+        "secret-token-123",
+        "header-value",
+        "live-value",
+        "encoded-value",
+        "groww-real-secret-value-1234567890",
+    ):
         assert forbidden not in result.stdout
+
+
+def test_workflow_surrogate_output_fails_with_zero_exception_context() -> None:
+    """Invalid UTF-8 provider output becomes one stable secret-free CLI failure."""
+    result = CliRunner().invoke(
+        build_app(lambda: ServiceContainer(research=_SurrogateWorkflow())),
+        [
+            "research",
+            "--instrument",
+            "AAPL@alpaca",
+            "--as-of",
+            "2026-08-09T10:00:00+00:00",
+        ],
+    )
+
+    assert result.exit_code == 50
+    assert result.stdout.strip() == '{"error":"SERVICE_RESPONSE_INVALID"}'
+    exception = result.exception
+    while exception is not None:
+        assert "surrogate" not in str(exception).lower()
+        exception = exception.__cause__ or exception.__context__
+
+
+def test_cli_json_failure_has_stable_output_and_zero_exception_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A JSON encoder failure must not escape through any workflow command."""
+
+    def fail_json(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        raise UnicodeError("json-provider-secret")
+
+    monkeypatch.setattr(cli_module.json, "dumps", fail_json)
+    result = CliRunner().invoke(
+        build_app(lambda: ServiceContainer(research=_Workflow())),
+        [
+            "research",
+            "--instrument",
+            "AAPL@alpaca",
+            "--as-of",
+            "2026-08-09T10:00:00+00:00",
+        ],
+    )
+
+    assert result.exit_code == 50
+    assert result.stdout.strip() == '{"error":"OUTPUT_SERIALIZATION_FAILED"}'
+    exception = result.exception
+    while exception is not None:
+        assert "json-provider-secret" not in str(exception)
+        exception = exception.__cause__ or exception.__context__
 
 
 def test_submit_requires_all_bound_fields_and_exact_phrase_before_service() -> None:

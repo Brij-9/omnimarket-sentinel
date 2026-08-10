@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import copy
+import gc
 import json
 import os
+import pickle
 import subprocess
 import tarfile
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -16,8 +19,10 @@ from pathlib import Path
 from threading import Lock, Thread
 
 import pytest
+from sqlalchemy import func, select
 from typer.testing import CliRunner
 
+import market_sentinel.cli as cli_module
 import market_sentinel.operations.dashboard as dashboard_module
 from market_sentinel.brokers.preflight import PreflightReport, gate, required_gate_names
 from market_sentinel.cli import (
@@ -27,6 +32,7 @@ from market_sentinel.cli import (
     ServiceContainer,
     Task14CliLiveFacade,
     build_app,
+    create_task14_cli_live_facade,
 )
 from market_sentinel.domain.clock import FrozenClock
 from market_sentinel.domain.enums import AssetClass, OrderStatus, OrderType
@@ -57,7 +63,7 @@ from market_sentinel.operations.dashboard import (
 )
 from market_sentinel.operations.scheduler import ScheduledJob, Scheduler
 from market_sentinel.portfolio.ledger import PortfolioLedger
-from market_sentinel.storage.db import create_engine_and_schema
+from market_sentinel.storage.db import create_engine_and_schema, events
 from market_sentinel.storage.events import EventStore
 from tests.factories import snapshot
 
@@ -153,6 +159,125 @@ def test_structural_live_service_cannot_report_live_success() -> None:
         )
 
 
+def test_unregistered_exact_live_facade_cannot_be_shadowed_or_substituted(
+    tmp_path: Path,
+) -> None:
+    """An exact-class object.__new__ forgery must remain inert and container-ineligible."""
+    harness = _LiveHarness(tmp_path)
+    events_before = harness.event_count()
+    forged = object.__new__(Task14CliLiveFacade)
+    with pytest.raises(AttributeError):
+        object.__setattr__(
+            forged,
+            "submit",
+            lambda proposal, phrase: harness.broker.submit(proposal.intent, snapshot()),
+        )
+
+    result = _live_cli_result(harness, facade=forged)
+
+    assert result.exit_code != 0
+    assert harness.broker.submit_calls == 0
+    assert harness.event_count() == events_before
+    assert not hasattr(forged, "__dict__")
+
+
+def test_live_container_revalidates_registry_after_frozen_state_tampering(
+    tmp_path: Path,
+) -> None:
+    """Retrieval must reject an exact-class forgery substituted after construction."""
+    harness = _LiveHarness(tmp_path)
+    events_before = harness.event_count()
+    container = ServiceContainer(
+        proposal=_TypedProposal(), live_submission=harness.facade()
+    )
+    forged = object.__new__(Task14CliLiveFacade)
+    object.__setattr__(container, "live_submission", forged)
+
+    result = CliRunner().invoke(
+        build_app(lambda: container),
+        _live_cli_args(harness),
+    )
+
+    assert result.exit_code != 0
+    assert harness.broker.submit_calls == 0
+    assert harness.event_count() == events_before
+
+
+def test_public_live_facade_constructor_is_unregistered_zero_state() -> None:
+    """Direct construction must create only an immutable unregistered inert identity."""
+    facade = Task14CliLiveFacade()
+
+    assert not hasattr(facade, "__dict__")
+    with pytest.raises(AttributeError):
+        facade.submit = lambda proposal, phrase: None  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="registered"):
+        ServiceContainer(live_submission=facade)
+
+
+def test_genuine_live_facade_rejects_copy_deepcopy_and_pickle(tmp_path: Path) -> None:
+    """Opaque live authority cannot be cloned or serialized into another identity."""
+    facade = _LiveHarness(tmp_path).facade()
+
+    with pytest.raises(TypeError, match="cannot be copied"):
+        copy.copy(facade)
+    with pytest.raises(TypeError, match="cannot be copied"):
+        copy.deepcopy(facade)
+    with pytest.raises(TypeError, match="cannot be serialized"):
+        pickle.dumps(facade)
+
+
+def test_live_facade_factory_rejects_cross_store_reuse_and_gc_is_independent(
+    tmp_path: Path,
+) -> None:
+    """Bindings require one safety store and one handle GC must not revoke another."""
+    first_path = tmp_path / "first"
+    second_path = tmp_path / "second"
+    first_path.mkdir()
+    second_path.mkdir()
+    first = _LiveHarness(first_path)
+    second = _LiveHarness(second_path)
+    factory = getattr(cli_module, "create_task14_cli_live_facade", None)
+    assert callable(factory)
+    with pytest.raises(ValueError, match="shared Task 14"):
+        factory(
+            approval_service=first.approval,
+            live_order_service=second.live,
+            snapshot=snapshot(),
+            preflight=_ready_report(),
+            reconciliation=second.report,
+        )
+    alternate_approval = ApprovalService(
+        clock=first.clock,
+        safety_capability=first.approval_capability,
+    )
+    with pytest.raises(ValueError, match="shared Task 14"):
+        factory(
+            approval_service=alternate_approval,
+            live_order_service=first.live,
+            snapshot=snapshot(),
+            preflight=_ready_report(),
+            reconciliation=first.report,
+        )
+    survivor = factory(
+        approval_service=first.approval,
+        live_order_service=first.live,
+        snapshot=snapshot(),
+        preflight=_ready_report(),
+        reconciliation=first.report,
+    )
+    discarded = factory(
+        approval_service=first.approval,
+        live_order_service=first.live,
+        snapshot=snapshot(),
+        preflight=_ready_report(),
+        reconciliation=first.report,
+    )
+    del discarded
+    gc.collect()
+
+    ServiceContainer(live_submission=survivor)
+
+
 def test_mapping_proposal_cannot_turn_caller_echo_into_approval() -> None:
     """A structural Mapping response must not be rendered as an accepted proposal."""
     result = CliRunner().invoke(
@@ -182,19 +307,18 @@ def test_side_aware_stop_limit_order_is_validated_by_domain_model() -> None:
 class _LocalLiveBroker:
     """Offline provider-boundary fake behind the real Task 14 composition."""
 
-    broker_name = "alpaca"
-
-    def __init__(self) -> None:
+    def __init__(self, broker_name: str = "alpaca") -> None:
+        self.broker_name = broker_name
         self.submit_calls = 0
         self.query_calls = 0
         self.submit_error: BaseException | None = None
 
     def preflight(self) -> PreflightReport:
-        return _ready_report()
+        return _ready_report(self.broker_name)
 
     def capabilities(self) -> BrokerCapabilities:
         return BrokerCapabilities(
-            broker="alpaca",
+            broker=self.broker_name,
             supported_asset_classes=frozenset({AssetClass.EQUITY}),
             supported_order_types=frozenset(OrderType),
             supports_fractional_quantity=True,
@@ -215,7 +339,7 @@ class _LocalLiveBroker:
         return BrokerOrder(
             order_id="broker-order-1",
             client_order_id=intent.intent_id,
-            broker="alpaca",
+            broker=self.broker_name,
             instrument_id=intent.instrument_id,
             status=OrderStatus.ACKNOWLEDGED,
             requested_quantity=intent.quantity,
@@ -233,10 +357,22 @@ class _LocalLiveBroker:
 
 
 class _LiveHarness:
-    def __init__(self, tmp_path: Path) -> None:
-        engine = create_engine_and_schema(f"sqlite+pysqlite:///{tmp_path / 'live-cli.db'}")
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        broker_name: str = "alpaca",
+        external_broker: str = "alpaca",
+        instrument_id: str = "AAPL@alpaca",
+    ) -> None:
+        self.engine = create_engine_and_schema(
+            f"sqlite+pysqlite:///{tmp_path / 'live-cli.db'}"
+        )
         self.clock = FrozenClock(AT)
-        self.store = EventStore(engine)
+        self.broker_name = broker_name
+        self.external_broker = external_broker
+        self.instrument_id = instrument_id
+        self.store = EventStore(self.engine)
         nonces = count(1)
         nonce_lock = Lock()
 
@@ -244,7 +380,7 @@ class _LiveHarness:
             with nonce_lock:
                 return next(nonces).to_bytes(32, "big")
 
-        approval_capability, reconciliation_capability, self.live_capability = (
+        self.approval_capability, reconciliation_capability, self.live_capability = (
             create_safety_capabilities(
                 audit_log=AuditLog(self.store, self.clock),
                 key=b"offline-task-15-live-cli-key-material",
@@ -254,14 +390,14 @@ class _LiveHarness:
         self.ledger = PortfolioLedger(starting_cash=Decimal("100"), currency="USD")
         self.approval = ApprovalService(
             clock=self.clock,
-            safety_capability=approval_capability,
+            safety_capability=self.approval_capability,
         )
         self.reconciler = Reconciler(
             safety_capability=reconciliation_capability,
             clock=self.clock,
         )
         self.report = self.healthy_report()
-        self.broker = _LocalLiveBroker()
+        self.broker = _LocalLiveBroker(broker_name)
         self.live = LiveOrderService(
             broker=self.broker,
             approval_service=self.approval,
@@ -272,10 +408,14 @@ class _LiveHarness:
         )
         self.request = self.order_request("intent-1")
 
+    def event_count(self) -> int:
+        with self.engine.connect() as connection:
+            return int(connection.scalar(select(func.count()).select_from(events)) or 0)
+
     def healthy_report(self) -> ReconciliationReport:
         return self.reconciler.compare(
             BrokerReconciliationSnapshot(
-                broker="alpaca",
+                broker=self.broker_name,
                 currency="USD",
                 cash=Decimal("100"),
                 positions=(),
@@ -289,9 +429,9 @@ class _LiveHarness:
     def order_request(self, intent_id: str) -> BoundOrderRequest:
         position_hash = self.ledger.position_hash()
         return BoundOrderRequest(
-            broker="alpaca",
+            broker=self.external_broker,
             intent_id=intent_id,
-            instrument_id="AAPL@alpaca",
+            instrument_id=self.instrument_id,
             side="buy",
             quantity=Decimal("0.1"),
             notional=None,
@@ -319,24 +459,26 @@ class _LiveHarness:
         report: ReconciliationReport | None = None,
         preflight: PreflightReport | None = None,
     ) -> Task14CliLiveFacade:
-        return Task14CliLiveFacade(
+        return create_task14_cli_live_facade(
             approval_service=self.approval,
             live_order_service=self.live,
-            snapshot=snapshot(),
-            preflight=_ready_report() if preflight is None else preflight,
+            snapshot=snapshot(instrument_id=self.instrument_id),
+            preflight=_ready_report(self.broker_name) if preflight is None else preflight,
             reconciliation=self.report if report is None else report,
         )
 
 
-def _ready_report() -> PreflightReport:
+def _ready_report(broker: str = "alpaca") -> PreflightReport:
     return PreflightReport(
-        "alpaca",
-        tuple(gate(name, True) for name in sorted(required_gate_names("alpaca"))),
+        broker,
+        tuple(gate(name, True) for name in sorted(required_gate_names(broker))),
     )
 
 
 def _live_cli_args(harness: _LiveHarness, *, phrase: str = CONFIRMATION_PHRASE) -> list[str]:
     arguments = _order_args("submit-confirmed-order")
+    arguments[arguments.index("--broker") + 1] = harness.external_broker
+    arguments[arguments.index("--instrument") + 1] = harness.instrument_id
     position_hash = harness.ledger.position_hash()
     arguments[arguments.index("--snapshot-hash") + 1] = position_hash
     arguments[arguments.index("--portfolio-hash") + 1] = position_hash
@@ -371,6 +513,58 @@ def test_real_task14_cli_facade_submits_one_exact_typed_order(tmp_path: Path) ->
     assert harness.broker.submit_calls == 1
     assert json.loads(result.stdout)["status"] == "acknowledged"
     assert harness.broker.query_calls == 0
+
+
+def test_real_task14_cli_facade_normalizes_ccxt_external_broker_alias(tmp_path: Path) -> None:
+    """External ccxt requests must bind to the internal ccxt-spot Task 14 identity."""
+    harness = _LiveHarness(
+        tmp_path,
+        broker_name="ccxt-spot",
+        external_broker="ccxt",
+        instrument_id="BTC/USD@ccxt",
+    )
+
+    result = _live_cli_result(harness)
+
+    assert result.exit_code == 0
+    assert harness.broker.submit_calls == 1
+    assert json.loads(result.stdout)["broker"] == "ccxt-spot"
+
+
+def test_live_submit_captures_registry_validated_facade_across_proposal_call(
+    tmp_path: Path,
+) -> None:
+    """A proposal service cannot swap the frozen container's live authority mid-command."""
+    harness = _LiveHarness(tmp_path)
+    events_before = harness.event_count()
+
+    class _BrokerCallingFake:
+        def submit(self, proposal: OrderProposal, phrase: str) -> BrokerOrder:
+            del phrase
+            return harness.broker.submit(
+                proposal.intent,
+                snapshot(instrument_id=harness.instrument_id),
+            )
+
+    class _SwappingProposal:
+        container: ServiceContainer
+
+        def propose(self, request: BoundOrderRequest) -> OrderProposal:
+            object.__setattr__(self.container, "live_submission", _BrokerCallingFake())
+            return OrderProposal.accept(request)
+
+    proposal = _SwappingProposal()
+    container = ServiceContainer(
+        proposal=proposal,
+        live_submission=harness.facade(),
+    )
+    proposal.container = container
+
+    result = CliRunner().invoke(build_app(lambda: container), _live_cli_args(harness))
+
+    assert result.exit_code != 0
+    assert harness.broker.submit_calls == 0
+    assert harness.event_count() == events_before
 
 
 @pytest.mark.parametrize("gate_name", ("confirmation", "preflight", "risk", "reconciliation"))
@@ -676,6 +870,72 @@ def test_dashboard_requires_nonempty_explicit_safety_sections_and_arithmetic(
             _dashboard_status(brokers=(), kill_switches=(), interlocks=()),
             tmp_path / "empty.json",
         )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "research",
+        "strategy",
+        "promotion",
+        "portfolio",
+        "risk",
+        "broker",
+        "order",
+        "kill_switch",
+        "interlock",
+        "aspiration_reporting",
+        "aspiration_arithmetic",
+    ),
+)
+def test_dashboard_reconstructs_every_nested_record_before_export(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """object.__setattr__ must not bypass any nested schema-v1 validator."""
+    status = _dashboard_status()
+    if mutation == "research":
+        object.__setattr__(status.research, "fresh", 1)
+    elif mutation == "strategy":
+        object.__setattr__(status.strategies[0], "version", "bad secret value")
+    elif mutation == "promotion":
+        object.__setattr__(status.promotion, "status", "live-unbounded")
+    elif mutation == "portfolio":
+        object.__setattr__(status.portfolio, "currency", "usd")
+    elif mutation == "risk":
+        object.__setattr__(status.risk, "max_position_fraction", Decimal("2"))
+    elif mutation == "broker":
+        object.__setattr__(status.brokers[0].gates[0], "reason_code", "NOT_OK")
+    elif mutation == "order":
+        mutated_order = dashboard_module.DashboardOrder("order-1", OrderStatus.PROPOSED)
+        object.__setattr__(mutated_order, "status", "proposed")
+        object.__setattr__(status, "orders", (mutated_order,))
+    elif mutation == "kill_switch":
+        object.__setattr__(status.kill_switches[0], "active", 1)
+    elif mutation == "interlock":
+        object.__setattr__(status.interlocks[0], "reason_code", "not_stable")
+    elif mutation == "aspiration_reporting":
+        object.__setattr__(status.aspirational_target, "reporting_only", False)
+    else:
+        object.__setattr__(status.aspirational_target, "required_multiple", Decimal("2"))
+    destination = tmp_path / f"{mutation}.json"
+
+    with pytest.raises(DashboardValidationError, match="DASHBOARD_STATUS_INVALID") as failure:
+        export_dashboard(status, destination)
+
+    assert failure.value.__cause__ is None
+    assert failure.value.__context__ is None
+    assert not destination.exists()
+
+
+def test_dashboard_rejects_contradictory_broker_gate_coherence(tmp_path: Path) -> None:
+    """Passed/non-OK and failed/OK gates must never enter dashboard output."""
+    for passed, reason in ((True, "NOT_OK"), (False, "OK")):
+        status = _dashboard_status()
+        object.__setattr__(status.brokers[0].gates[0], "passed", passed)
+        object.__setattr__(status.brokers[0].gates[0], "reason_code", reason)
+        with pytest.raises(DashboardValidationError, match="DASHBOARD_STATUS_INVALID"):
+            export_dashboard(status, tmp_path / f"coherence-{passed}.json")
     with pytest.raises(DashboardValidationError):
         _dashboard_status(
             aspirational_target=DashboardAspiration(
@@ -687,6 +947,48 @@ def test_dashboard_requires_nonempty_explicit_safety_sections_and_arithmetic(
                 Decimal("999990"),
                 True,
             )
+        )
+
+
+def test_dashboard_reconstruction_bounds_collections_before_copying() -> None:
+    """Schema reconstruction must reject oversized tuples before traversing them."""
+    status = _dashboard_status()
+    object.__setattr__(
+        status,
+        "strategies",
+        (status.strategies[0],) * (dashboard_module._MAX_COLLECTION + 1),
+    )
+
+    with pytest.raises(DashboardValidationError, match="DASHBOARD_VALUE_BOUNDS_EXCEEDED"):
+        dashboard_module._revalidated_dashboard_status(status)
+
+
+def test_dashboard_reconstruction_bounds_nested_broker_gates_before_copying() -> None:
+    """A tampered exact broker cannot force traversal of an oversized gate tuple."""
+    status = _dashboard_status()
+    object.__setattr__(
+        status.brokers[0],
+        "gates",
+        (status.brokers[0].gates[0],) * (dashboard_module._MAX_COLLECTION + 1),
+    )
+
+    with pytest.raises(DashboardValidationError, match="DASHBOARD_VALUE_BOUNDS_EXCEEDED"):
+        dashboard_module._revalidated_dashboard_status(status)
+
+
+def test_dashboard_aspiration_bounds_decimals_before_fraction_arithmetic() -> None:
+    """Huge finite exponents must fail before constructing unbounded Fractions."""
+    huge = Decimal("1E+5000")
+
+    with pytest.raises(DashboardValidationError, match="DASHBOARD_DECIMAL_INVALID"):
+        DashboardAspiration(
+            Decimal("1"),
+            Decimal("0"),
+            huge,
+            huge,
+            Decimal("0"),
+            huge,
+            True,
         )
 
 
@@ -714,6 +1016,22 @@ def test_dashboard_drops_camelcase_access_private_and_pem_secrets(tmp_path: Path
         "live-value",
     ):
         assert forbidden not in text
+
+
+def test_safe_json_converts_surrogate_failures_to_context_free_validation() -> None:
+    """Hostile UTF-8 keys and values must never escape raw Unicode exceptions."""
+    for payload in ({"safe": "\ud800"}, {"bad\ud800": "safe"}):
+        with pytest.raises(DashboardValidationError) as failure:
+            safe_json_mapping(payload)
+        assert failure.value.__cause__ is None
+        assert failure.value.__context__ is None
+
+
+def test_safe_json_redacts_unassigned_provider_secret_free_text() -> None:
+    """Secret-bearing provider text is unsafe even without an assignment delimiter."""
+    prepared = safe_json_mapping({"note": "groww-real-secret-value-1234567890"})
+
+    assert prepared == {"note": "[REDACTED]"}
 
 
 def test_dashboard_rejects_parent_symlink_and_preserves_target(tmp_path: Path) -> None:
@@ -786,6 +1104,145 @@ def test_dashboard_blocks_parent_swap_inside_final_replace_window(
 
     assert destination.read_text(encoding="utf-8") == "old"
     assert not parked.exists()
+
+
+@pytest.mark.parametrize("hook", ("after_write", "pre_replace"))
+def test_dashboard_rejects_temp_name_swap_while_preserving_old_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hook: str,
+) -> None:
+    """A swapped temp directory entry must never place attacker bytes at destination."""
+    destination = tmp_path / "status.json"
+    destination.write_text("old", encoding="utf-8")
+    parked = tmp_path / "parked-original.tmp"
+    original_same_parent = dashboard_module._require_same_parent
+    original_validated = dashboard_module._validated_destination
+    same_parent_calls = 0
+    validated_calls = 0
+
+    def swap_temp() -> None:
+        temporary = next(tmp_path.glob(".status.json.*.tmp"))
+        os.replace(temporary, parked)
+        temporary.write_text("attacker-content", encoding="utf-8")
+
+    def same_parent(target: object) -> None:
+        nonlocal same_parent_calls
+        same_parent_calls += 1
+        if hook == "after_write" and same_parent_calls == 3:
+            swap_temp()
+        original_same_parent(target)  # type: ignore[arg-type]
+
+    def validated(target: object) -> object:
+        nonlocal validated_calls
+        validated_calls += 1
+        if hook == "pre_replace" and validated_calls == 2:
+            swap_temp()
+        return original_validated(target)
+
+    monkeypatch.setattr(dashboard_module, "_require_same_parent", same_parent)
+    monkeypatch.setattr(dashboard_module, "_validated_destination", validated)
+
+    with pytest.raises(DashboardValidationError, match="DASHBOARD_WRITE_FAILED"):
+        export_dashboard(_dashboard_status(), destination)
+
+    assert destination.read_text(encoding="utf-8") == "old"
+    assert not parked.exists()
+    assert "attacker-content" not in destination.read_text(encoding="utf-8")
+
+
+def test_posix_backup_uses_authoritative_parent_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollback observation and linking must use the already-validated parent fd."""
+    destination_path = tmp_path / "status.json"
+    destination_path.write_text("old", encoding="utf-8")
+    destination = dashboard_module._validated_destination(destination_path)
+    details = destination_path.lstat()
+    observed: list[tuple[object, object, object]] = []
+
+    def fd_stat(
+        path: object,
+        *,
+        dir_fd: object = None,
+        follow_symlinks: object = True,
+    ) -> os.stat_result:
+        observed.append((path, dir_fd, follow_symlinks))
+        return details
+
+    def fd_link(
+        source: object,
+        target: object,
+        *,
+        src_dir_fd: object = None,
+        dst_dir_fd: object = None,
+        follow_symlinks: object = True,
+    ) -> None:
+        assert follow_symlinks is False
+        observed.append((source, src_dir_fd, dst_dir_fd))
+
+    monkeypatch.setattr(dashboard_module.os, "stat", fd_stat)
+    monkeypatch.setattr(dashboard_module.os, "link", fd_link)
+    guard = dashboard_module._DirectoryGuard(91)
+
+    backup = dashboard_module._backup_destination(destination, guard)
+
+    assert backup is not None
+    assert (destination_path.name, 91, False) in observed
+    assert any(item[1:] == (91, 91) for item in observed)
+
+
+def test_posix_identity_cleanup_enumerates_authoritative_parent_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure cleanup must not enumerate a lexical parent that may have been swapped."""
+    observed: list[object] = []
+
+    class _EmptyScandir:
+        def __enter__(self) -> _EmptyScandir:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def __iter__(self) -> Iterator[object]:
+            return iter(())
+
+    def scandir(path: object) -> _EmptyScandir:
+        observed.append(path)
+        return _EmptyScandir()
+
+    monkeypatch.setattr(dashboard_module.os, "scandir", scandir)
+    dashboard_module._cleanup_file_identity(
+        tmp_path,
+        dashboard_module._DirectoryGuard(92),
+        (1, 2, 3),
+    )
+
+    assert observed == [92]
+
+
+def test_dashboard_json_failure_is_context_free_and_preserves_old_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JSON encoder failures must become stable validation without filesystem mutation."""
+    destination = tmp_path / "status.json"
+    destination.write_text("old", encoding="utf-8")
+
+    def fail_json(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        raise UnicodeError("json-surrogate-secret")
+
+    monkeypatch.setattr(dashboard_module.json, "dumps", fail_json)
+    with pytest.raises(DashboardValidationError) as failure:
+        export_dashboard(_dashboard_status(), destination)
+
+    assert failure.value.__cause__ is None
+    assert failure.value.__context__ is None
+    assert destination.read_text(encoding="utf-8") == "old"
 
 
 def test_dashboard_rejects_mapped_network_destination_before_temp_creation(
