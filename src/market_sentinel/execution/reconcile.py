@@ -142,6 +142,12 @@ class Reconciler:
     def __init__(self, *, safety_capability: ReconciliationSafetyCapability, clock: Clock) -> None:
         if type(safety_capability) is not ReconciliationSafetyCapability:
             raise ValueError("reconciliation requires its exact safety capability")
+        try:
+            _store_identity = safety_capability.store_identity
+        except SafetyIntegrityError:
+            raise ValueError(
+                "reconciliation requires a factory-registered safety capability"
+            ) from None
         self._safety = safety_capability
         self._clock = clock
 

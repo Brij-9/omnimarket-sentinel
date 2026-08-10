@@ -1039,3 +1039,49 @@ def test_wrong_safety_key_restart_blocks_live_submission(tmp_path: Path) -> None
     with pytest.raises(LiveOrderError, match="RECONCILIATION_NOT_CURRENT"):
         _submit(restarted, order_intent, risk, confirmation, report, ready)
     assert broker.submit_calls == 0
+
+
+def test_fabricated_live_handle_cannot_bypass_durable_claim_and_interlock() -> None:
+    """Injected no-op callbacks plus a genuine store identity must never authorize submit."""
+    data = _setup()
+    with pytest.raises(TypeError):
+        LiveSafetyCapability(
+            claim=lambda **_kwargs: None,  # type: ignore[call-arg]
+            acknowledge=lambda **_kwargs: None,
+            unknown=lambda **_kwargs: None,
+            store_identity=data.service._safety.store_identity,
+        )
+    for forged in (LiveSafetyCapability(), object.__new__(LiveSafetyCapability)):
+        with pytest.raises(ValueError, match="factory-registered"):
+            LiveOrderService(
+                broker=data.broker,
+                approval_service=data.service._approval,
+                reconciler=data.reconciler,
+                safety_capability=forged,
+                clock=data.clock,
+                ledger=data.service._ledger,
+            )
+
+    assert data.broker.submit_calls == 0
+    confirmation_rows = tuple(
+        data.store.stream(f"live-confirmation:{data.confirmation.confirmation_id}")
+    )
+    assert [row.kind for row in confirmation_rows] == ["confirmation.issued"]
+    assert tuple(data.store.stream("live-submission-interlock")) == ()
+
+
+def test_approval_and_reconciliation_handles_cannot_substitute_for_live() -> None:
+    """An exact registered handle from another role is still rejected before broker access."""
+    data = _setup()
+    for wrong_role in (data.service._approval._safety, data.reconciler._safety):
+        with pytest.raises(ValueError, match="exact safety capability"):
+            LiveOrderService(
+                broker=data.broker,
+                approval_service=data.service._approval,
+                reconciler=data.reconciler,
+                safety_capability=wrong_role,  # type: ignore[arg-type]
+                clock=data.clock,
+                ledger=data.service._ledger,
+            )
+    assert data.broker.submit_calls == 0
+    assert tuple(data.store.stream("live-submission-interlock")) == ()

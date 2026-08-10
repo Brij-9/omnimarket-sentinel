@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import gc
+import pickle
+from copy import copy, deepcopy
 from datetime import timedelta
 from inspect import signature
 from itertools import count
+from weakref import ref
 
 import pytest
 
@@ -94,7 +98,10 @@ def test_public_api_and_capability_graph_expose_no_generic_signing_path() -> Non
         assert not hasattr(capability, "record_many")
         assert not hasattr(capability, "stream_verified")
         for slot in capability.__slots__:
-            value = object.__getattribute__(capability, slot)
+            try:
+                value = object.__getattribute__(capability, slot)
+            except AttributeError:
+                continue
             assert type(value).__name__ not in {
                 "_SafetyAuthority",
                 "_SafetyMac",
@@ -128,13 +135,51 @@ def test_capability_class_swap_cannot_confuse_roles() -> None:
     _clock, _audit, approval, reconciliation, _live = _authority()
     with pytest.raises((AttributeError, TypeError)):
         approval.__class__ = type(reconciliation)  # type: ignore[assignment]
-    with pytest.raises(ValueError, match="cannot be constructed"):
-        ApprovalSafetyCapability(
-            token=object(),
-            issue=reconciliation.persist_report,  # type: ignore[arg-type]
-            read=reconciliation.reconciliation_events,  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        ApprovalSafetyCapability(  # type: ignore[call-arg]
+            issue=reconciliation.persist_report,
+            read=reconciliation.reconciliation_events,
             store_identity=reconciliation.store_identity,
         )
+
+
+@pytest.mark.parametrize(
+    "capability_type",
+    [ApprovalSafetyCapability, ReconciliationSafetyCapability, LiveSafetyCapability],
+)
+def test_public_and_object_new_handles_are_unregistered(capability_type: type[object]) -> None:
+    """Only exact identities registered by the authority factory have any role or store access."""
+    for handle in (capability_type(), object.__new__(capability_type)):
+        with pytest.raises((SafetyIntegrityError, ValueError)):
+            object.__getattribute__(handle, "store_identity")
+
+
+@pytest.mark.parametrize("copier", [copy, deepcopy, pickle.dumps])
+def test_genuine_handles_cannot_be_copied_or_serialized(copier: object) -> None:
+    """Copy, deepcopy, and pickle cannot reconstruct registered safety authority."""
+    _clock, _audit, _approval, _reconciliation, live = _authority()
+    with pytest.raises((TypeError, ValueError, SafetyIntegrityError, pickle.PickleError)):
+        copier(live)  # type: ignore[operator]
+
+
+def test_registry_cleanup_of_one_handle_does_not_break_remaining_roles() -> None:
+    """Weak per-role cleanup cannot prematurely discard the shared authority of live handles."""
+    _clock, _audit, approval, reconciliation, live = _authority()
+    approval_reference = ref(approval)
+    identity = live.store_identity
+    del approval
+    gc.collect()
+
+    assert approval_reference() is None
+    assert live.store_identity is identity
+    report = reconciliation.persist_report(
+        broker="alpaca",
+        broker_hash="a" * 64,
+        ledger_hash="b" * 64,
+        reason_codes=(),
+        checked_at=DEFAULT_INSTANT,
+    )
+    assert report.kind == "reconciliation.healthy"
 
 
 def test_live_claim_rejects_unhealthy_reconciliation_without_started_row() -> None:

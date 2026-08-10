@@ -72,9 +72,15 @@ class LiveOrderService:
             raise ValueError("live execution requires the exact reconciler")
         if type(safety_capability) is not LiveSafetyCapability:
             raise ValueError("live execution requires its exact safety capability")
+        try:
+            live_store_identity = safety_capability.store_identity
+        except SafetyIntegrityError:
+            raise ValueError(
+                "live execution requires a factory-registered safety capability"
+            ) from None
         if (
-            safety_capability.store_identity is not reconciler.safety_store_identity
-            or safety_capability.store_identity is not approval_service.safety_store_identity
+            live_store_identity is not reconciler.safety_store_identity
+            or live_store_identity is not approval_service.safety_store_identity
         ):
             raise ValueError("live safety services must share one EventStore")
         if type(ledger) is not PortfolioLedger:

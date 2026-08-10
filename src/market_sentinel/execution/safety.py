@@ -9,9 +9,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
-from typing import Final
+from typing import Final, NoReturn, SupportsIndex
 from uuid import uuid4
-from weakref import finalize
+from weakref import WeakKeyDictionary, finalize
 
 from market_sentinel.operations.audit import AuditEvent, AuditLog
 from market_sentinel.security import redact_mapping
@@ -627,7 +627,7 @@ class _LiveRole(_InternalRole):
         )
 
 
-_HANDLE_TOKEN = object()
+_CALLBACK_HANDLE_TOKEN = object()
 _APPROVAL_ROLE_VAULT: dict[str, _ApprovalRole] = {}
 _RECONCILIATION_ROLE_VAULT: dict[str, _ReconciliationRole] = {}
 _LIVE_ROLE_VAULT: dict[str, _LiveRole] = {}
@@ -645,7 +645,7 @@ def _release_role_vault(authority_id: str) -> None:
     _LIVE_ROLE_VAULT.pop(authority_id, None)
 
 
-class ApprovalSafetyCapability:
+class _CallbackApprovalSafetyCapability:
     """Frozen approval-only handle containing fixed-purpose closure entry points."""
 
     __slots__ = ("_approval_issue", "_approval_read", "_approval_store_identity", "__weakref__")
@@ -661,7 +661,7 @@ class ApprovalSafetyCapability:
         read: Callable[[str], tuple[EventRecord, ...]],
         store_identity: object,
     ) -> None:
-        if token is not _HANDLE_TOKEN or not callable(issue) or not callable(read):
+        if token is not _CALLBACK_HANDLE_TOKEN or not callable(issue) or not callable(read):
             raise ValueError("approval safety handle cannot be constructed directly")
         object.__setattr__(self, "_approval_issue", issue)
         object.__setattr__(self, "_approval_read", read)
@@ -698,7 +698,7 @@ class ApprovalSafetyCapability:
         return self._approval_read(confirmation_id)
 
 
-class ReconciliationSafetyCapability:
+class _CallbackReconciliationSafetyCapability:
     """Frozen reconciliation-only handle with no generic signing or live route."""
 
     __slots__ = (
@@ -728,7 +728,7 @@ class ReconciliationSafetyCapability:
         interlocks: Callable[[], tuple[EventRecord, ...]],
         store_identity: object,
     ) -> None:
-        if token is not _HANDLE_TOKEN or not all(
+        if token is not _CALLBACK_HANDLE_TOKEN or not all(
             callable(item) for item in (persist, clear, read, kills, interlocks)
         ):
             raise ValueError("reconciliation safety handle cannot be constructed directly")
@@ -777,7 +777,7 @@ class ReconciliationSafetyCapability:
         return self._reconciliation_interlocks()
 
 
-class LiveSafetyCapability:
+class _CallbackLiveSafetyCapability:
     """Frozen live-only handle with fixed claim, acknowledgement, and UNKNOWN routes."""
 
     __slots__ = (
@@ -801,7 +801,7 @@ class LiveSafetyCapability:
         unknown: Callable[..., None],
         store_identity: object,
     ) -> None:
-        if token is not _HANDLE_TOKEN or not all(
+        if token is not _CALLBACK_HANDLE_TOKEN or not all(
             callable(item) for item in (claim, acknowledge, unknown)
         ):
             raise ValueError("live safety handle cannot be constructed directly")
@@ -870,12 +870,16 @@ class LiveSafetyCapability:
         )
 
 
-def create_safety_capabilities(
+def _create_callback_safety_capabilities(
     *,
     audit_log: AuditLog,
     key: bytes,
     nonce_source: Callable[[], bytes],
-) -> tuple[ApprovalSafetyCapability, ReconciliationSafetyCapability, LiveSafetyCapability]:
+) -> tuple[
+    _CallbackApprovalSafetyCapability,
+    _CallbackReconciliationSafetyCapability,
+    _CallbackLiveSafetyCapability,
+]:
     """Consume local key material once and return only three narrow immutable handles."""
     authority = _SafetyAuthority(
         audit_log=audit_log,
@@ -991,14 +995,14 @@ def create_safety_capabilities(
         )
 
     identity = authority.event_store_identity
-    approval = ApprovalSafetyCapability(
-        token=_HANDLE_TOKEN,
+    approval = _CallbackApprovalSafetyCapability(
+        token=_CALLBACK_HANDLE_TOKEN,
         issue=issue_confirmation,
         read=confirmation_events,
         store_identity=identity,
     )
-    reconciliation = ReconciliationSafetyCapability(
-        token=_HANDLE_TOKEN,
+    reconciliation = _CallbackReconciliationSafetyCapability(
+        token=_CALLBACK_HANDLE_TOKEN,
         persist=persist_report,
         clear=clear_kill_switch,
         read=reconciliation_events,
@@ -1006,8 +1010,8 @@ def create_safety_capabilities(
         interlocks=interlock_events,
         store_identity=identity,
     )
-    live = LiveSafetyCapability(
-        token=_HANDLE_TOKEN,
+    live = _CallbackLiveSafetyCapability(
+        token=_CALLBACK_HANDLE_TOKEN,
         claim=claim_and_start,
         acknowledge=record_acknowledgement,
         unknown=record_unknown,
@@ -1016,6 +1020,245 @@ def create_safety_capabilities(
     finalize(approval, _release_role_vault, authority_id)
     finalize(reconciliation, _release_role_vault, authority_id)
     finalize(live, _release_role_vault, authority_id)
+    return approval, reconciliation, live
+
+
+class ApprovalSafetyCapability:
+    """Factory-registered, approval-only opaque identity."""
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self) -> None:
+        pass
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("approval safety handle is immutable")
+
+    def __copy__(self) -> ApprovalSafetyCapability:
+        raise TypeError("approval safety handles cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> ApprovalSafetyCapability:
+        del memo
+        raise TypeError("approval safety handles cannot be copied")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise TypeError("approval safety handles cannot be serialized")
+
+    @property
+    def store_identity(self) -> object:
+        return _approval_binding(self).store_identity
+
+    def issue_confirmation(
+        self,
+        *,
+        phrase: str,
+        broker: str,
+        created_at: datetime,
+        expires_at: datetime,
+        fingerprint: str,
+        risk_decision_hash: str,
+    ) -> tuple[str, str, str]:
+        return _approval_binding(self).issue_confirmation(
+            phrase=phrase,
+            broker=broker,
+            created_at=created_at,
+            expires_at=expires_at,
+            fingerprint=fingerprint,
+            risk_decision_hash=risk_decision_hash,
+        )
+
+    def confirmation_events(self, confirmation_id: str) -> tuple[EventRecord, ...]:
+        return _approval_binding(self).confirmation_events(confirmation_id)
+
+
+class ReconciliationSafetyCapability:
+    """Factory-registered, reconciliation-only opaque identity."""
+
+    __slots__ = ("_reconciliation_layout", "__weakref__")
+
+    def __init__(self) -> None:
+        pass
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("reconciliation safety handle is immutable")
+
+    def __copy__(self) -> ReconciliationSafetyCapability:
+        raise TypeError("reconciliation safety handles cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> ReconciliationSafetyCapability:
+        del memo
+        raise TypeError("reconciliation safety handles cannot be copied")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise TypeError("reconciliation safety handles cannot be serialized")
+
+    @property
+    def store_identity(self) -> object:
+        return _reconciliation_binding(self).store_identity
+
+    def persist_report(
+        self,
+        *,
+        broker: str,
+        broker_hash: str,
+        ledger_hash: str,
+        reason_codes: tuple[str, ...],
+        checked_at: datetime,
+    ) -> EventRecord:
+        return _reconciliation_binding(self).persist_report(
+            broker=broker,
+            broker_hash=broker_hash,
+            ledger_hash=ledger_hash,
+            reason_codes=reason_codes,
+            checked_at=checked_at,
+        )
+
+    def clear_kill_switch(self, *, acknowledgement: str, now: datetime) -> None:
+        _reconciliation_binding(self).clear_kill_switch(
+            acknowledgement=acknowledgement,
+            now=now,
+        )
+
+    def reconciliation_events(self) -> tuple[EventRecord, ...]:
+        return _reconciliation_binding(self).reconciliation_events()
+
+    def kill_switch_events(self) -> tuple[EventRecord, ...]:
+        return _reconciliation_binding(self).kill_switch_events()
+
+    def interlock_events(self) -> tuple[EventRecord, ...]:
+        return _reconciliation_binding(self).interlock_events()
+
+
+class LiveSafetyCapability:
+    """Factory-registered, live-only opaque identity."""
+
+    __slots__ = ("_live_layout_a", "_live_layout_b", "__weakref__")
+
+    def __init__(self) -> None:
+        pass
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("live safety handle is immutable")
+
+    def __copy__(self) -> LiveSafetyCapability:
+        raise TypeError("live safety handles cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> LiveSafetyCapability:
+        del memo
+        raise TypeError("live safety handles cannot be copied")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise TypeError("live safety handles cannot be serialized")
+
+    @property
+    def store_identity(self) -> object:
+        return _live_binding(self).store_identity
+
+    def claim_and_start(
+        self,
+        *,
+        intent_id: str,
+        broker: str,
+        confirmation_id: str,
+        fingerprint: str,
+        expires_at: datetime,
+        reconciliation_head: str,
+        kill_switch_head: str | None,
+        interlock_head: str | None,
+        occurred_at: datetime,
+    ) -> None:
+        _live_binding(self).claim_and_start(
+            intent_id=intent_id,
+            broker=broker,
+            confirmation_id=confirmation_id,
+            fingerprint=fingerprint,
+            expires_at=expires_at,
+            reconciliation_head=reconciliation_head,
+            kill_switch_head=kill_switch_head,
+            interlock_head=interlock_head,
+            occurred_at=occurred_at,
+        )
+
+    def record_acknowledgement(
+        self,
+        *,
+        intent_id: str,
+        broker: str,
+        broker_order_id: str,
+        status: str,
+        submission_id: str,
+        occurred_at: datetime,
+    ) -> None:
+        _live_binding(self).record_acknowledgement(
+            intent_id=intent_id,
+            broker=broker,
+            broker_order_id=broker_order_id,
+            status=status,
+            submission_id=submission_id,
+            occurred_at=occurred_at,
+        )
+
+    def record_unknown(self, *, intent_id: str, submission_id: str, occurred_at: datetime) -> None:
+        _live_binding(self).record_unknown(
+            intent_id=intent_id,
+            submission_id=submission_id,
+            occurred_at=occurred_at,
+        )
+
+
+_APPROVAL_BINDINGS: WeakKeyDictionary[ApprovalSafetyCapability, _ApprovalRole] = WeakKeyDictionary()
+_RECONCILIATION_BINDINGS: WeakKeyDictionary[ReconciliationSafetyCapability, _ReconciliationRole] = (
+    WeakKeyDictionary()
+)
+_LIVE_BINDINGS: WeakKeyDictionary[LiveSafetyCapability, _LiveRole] = WeakKeyDictionary()
+
+
+def _approval_binding(handle: ApprovalSafetyCapability) -> _ApprovalRole:
+    binding = _APPROVAL_BINDINGS.get(handle)
+    if type(binding) is not _ApprovalRole:
+        raise SafetyIntegrityError("approval safety handle is not factory registered")
+    return binding
+
+
+def _reconciliation_binding(
+    handle: ReconciliationSafetyCapability,
+) -> _ReconciliationRole:
+    binding = _RECONCILIATION_BINDINGS.get(handle)
+    if type(binding) is not _ReconciliationRole:
+        raise SafetyIntegrityError("reconciliation safety handle is not factory registered")
+    return binding
+
+
+def _live_binding(handle: LiveSafetyCapability) -> _LiveRole:
+    binding = _LIVE_BINDINGS.get(handle)
+    if type(binding) is not _LiveRole:
+        raise SafetyIntegrityError("live safety handle is not factory registered")
+    return binding
+
+
+def create_safety_capabilities(
+    *,
+    audit_log: AuditLog,
+    key: bytes,
+    nonce_source: Callable[[], bytes],
+) -> tuple[ApprovalSafetyCapability, ReconciliationSafetyCapability, LiveSafetyCapability]:
+    """Consume key material once and register three zero-state opaque role identities."""
+    authority = _SafetyAuthority(
+        audit_log=audit_log,
+        authenticator=_SafetyMac(key=key, nonce_source=nonce_source),
+    )
+    approval = ApprovalSafetyCapability()
+    reconciliation = ReconciliationSafetyCapability()
+    live = LiveSafetyCapability()
+    _APPROVAL_BINDINGS[approval] = _ApprovalRole._from_repository(authority)
+    _RECONCILIATION_BINDINGS[reconciliation] = _ReconciliationRole._from_repository(authority)
+    _LIVE_BINDINGS[live] = _LiveRole._from_repository(authority)
     return approval, reconciliation, live
 
 

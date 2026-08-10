@@ -71,6 +71,10 @@ def test_services_reject_a_capability_for_another_role() -> None:
         ApprovalService(clock=clock, safety_capability=reconciliation)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="exact safety capability"):
         Reconciler(safety_capability=approval, clock=clock)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="factory-registered"):
+        ApprovalService(clock=clock, safety_capability=ApprovalSafetyCapability())
+    with pytest.raises(ValueError, match="factory-registered"):
+        Reconciler(safety_capability=ReconciliationSafetyCapability(), clock=clock)
 
 
 def test_narrow_capabilities_recheck_transition_prerequisites() -> None:

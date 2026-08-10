@@ -46,6 +46,10 @@ class ApprovalService:
     def __init__(self, *, clock: Clock, safety_capability: ApprovalSafetyCapability) -> None:
         if type(safety_capability) is not ApprovalSafetyCapability:
             raise ValueError("approval requires its exact safety capability")
+        try:
+            _store_identity = safety_capability.store_identity
+        except SafetyIntegrityError:
+            raise ValueError("approval requires a factory-registered safety capability") from None
         self._clock = clock
         self._safety = safety_capability
 
