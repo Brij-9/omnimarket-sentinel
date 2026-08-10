@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping
@@ -14,10 +15,28 @@ from typing import Annotated, Never, Protocol, cast
 import typer
 
 from market_sentinel.brokers.preflight import PreflightReport, gate, required_gate_names
-from market_sentinel.domain.models import GateResult
+from market_sentinel.domain.enums import OrderType, Side
+from market_sentinel.domain.models import (
+    BrokerOrder,
+    GateResult,
+    MarketSnapshot,
+    OrderIntent,
+    RiskDecision,
+)
+from market_sentinel.execution.approval import ApprovalService, risk_decision_hash
 from market_sentinel.execution.canonical import CanonicalEncodingError, canonical_decimal
+from market_sentinel.execution.live import LiveOrderService
+from market_sentinel.execution.reconcile import ReconciliationReport
 from market_sentinel.operations.dashboard import (
+    DashboardAspiration,
+    DashboardBroker,
+    DashboardPortfolio,
+    DashboardPromotion,
+    DashboardResearch,
+    DashboardRisk,
+    DashboardSafetyState,
     DashboardStatus,
+    DashboardStrategy,
     DashboardValidationError,
     safe_json_mapping,
 )
@@ -29,6 +48,13 @@ CONFIRMATION_PHRASE = "I_CONFIRM_REAL_MONEY_ORDER"
 _BROKERS = ("alpaca", "groww", "ccxt")
 _INSTRUMENT = re.compile(r"^[A-Z0-9][A-Z0-9._/-]{0,31}@[a-z0-9][a-z0-9-]{0,31}$")
 _HASH = re.compile(r"^[0-9a-f]{64}$")
+_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_SAFE_ROUTE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_REASON = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_SECRET_TEXT = re.compile(
+    r"(?i)(?:bearer\s+|-----BEGIN|private.?key|access.?key|api.?key|"
+    r"secret|password|credential|gh[pousr]_|sk-[a-z0-9_-]{8,})"
+)
 
 
 class WorkflowService(Protocol):
@@ -40,17 +66,7 @@ class PreflightService(Protocol):
 
 
 class ProposalService(Protocol):
-    def propose(self, request: BoundOrderRequest) -> Mapping[str, object]: ...
-
-
-class LiveSubmissionService(Protocol):
-    """Injected facade that must own the authenticated Task 14 live flow."""
-
-    def submit(
-        self,
-        request: BoundOrderRequest,
-        confirmation_phrase: str,
-    ) -> Mapping[str, object]: ...
+    def propose(self, request: BoundOrderRequest) -> OrderProposal: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +114,11 @@ class BoundOrderRequest:
     risk_expires_at: datetime
 
     def __post_init__(self) -> None:
-        if self.broker not in _BROKERS or not self.intent_id or len(self.intent_id) > 128:
+        if (
+            self.broker not in _BROKERS
+            or not _SAFE_ID.fullmatch(self.intent_id)
+            or _secret_shaped(self.intent_id)
+        ):
             raise ValueError("order identity is invalid")
         _require_instrument(self.instrument_id)
         if self.side not in {"buy", "sell"} or self.order_type not in {
@@ -109,11 +129,13 @@ class BoundOrderRequest:
         }:
             raise ValueError("order direction or type is invalid")
         _require_exact_size(self.quantity, self.notional)
-        _require_exact_size(self.risk_approved_quantity, self.risk_approved_notional)
-        if (
-            self.quantity != self.risk_approved_quantity
-            or self.notional != self.risk_approved_notional
-        ):
+        if self.risk_approved_quantity is None or self.risk_approved_notional is None:
+            raise ValueError("risk decision requires exact quantity and notional")
+        _positive_decimal(self.risk_approved_quantity)
+        _positive_decimal(self.risk_approved_notional)
+        if self.quantity is not None and self.quantity != self.risk_approved_quantity:
+            raise ValueError("risk size is not exactly bound")
+        if self.notional is not None and self.notional != self.risk_approved_notional:
             raise ValueError("risk size is not exactly bound")
         for value in (self.limit_price, self.trigger_price, self.stop_loss, self.take_profit):
             if value is not None:
@@ -127,7 +149,7 @@ class BoundOrderRequest:
         if (self.limit_price is not None, self.trigger_price is not None) != expected:
             raise ValueError("order price fields do not match order type")
         if not all(
-            type(item) is str and 0 < len(item) <= 64
+            type(item) is str and _SAFE_ROUTE.fullmatch(item) and not _secret_shaped(item)
             for item in (self.time_in_force, self.product, self.session)
         ):
             raise ValueError("order routing fields are invalid")
@@ -139,6 +161,49 @@ class BoundOrderRequest:
         risk_expires = _aware_utc(self.risk_expires_at)
         if not (created < expires and decided < risk_expires and risk_expires <= expires):
             raise ValueError("order or risk expiry is invalid")
+        venue = self.instrument_id.rsplit("@", 1)[1]
+        expected_venues = {"ccxt": {"ccxt", "ccxt-spot"}}.get(self.broker, {self.broker})
+        if venue not in expected_venues:
+            raise ValueError("broker and instrument venue do not match")
+        self.domain_intent()
+        self.domain_risk()
+
+    def domain_intent(self) -> OrderIntent:
+        """Construct the exact Task 14 domain intent and run its validators."""
+        return OrderIntent(
+            intent_id=self.intent_id,
+            instrument_id=self.instrument_id,
+            side=Side(self.side),
+            quantity=self.quantity,
+            notional=self.notional,
+            order_type=OrderType(self.order_type),
+            limit_price=self.limit_price,
+            trigger_price=self.trigger_price,
+            stop_loss=self.stop_loss,
+            take_profit=self.take_profit,
+            time_in_force=self.time_in_force,
+            product=self.product,
+            session=self.session,
+            snapshot_hash=self.snapshot_hash,
+            created_at=self.created_at,
+            expires_at=self.expires_at,
+        )
+
+    def domain_risk(self) -> RiskDecision:
+        """Construct the exact approved Task 14 risk record."""
+        return RiskDecision(
+            approved=True,
+            reason_codes=(),
+            approved_quantity=self.risk_approved_quantity,
+            approved_notional=self.risk_approved_notional,
+            portfolio_hash=self.portfolio_hash,
+            decided_at=self.risk_decided_at,
+            expires_at=self.risk_expires_at,
+        )
+
+    def fingerprint(self) -> str:
+        """Hash the exact typed domain request with a domain-separated canonical form."""
+        return _proposal_fingerprint(self.broker, self.domain_intent(), self.domain_risk())
 
     def safe_mapping(self) -> dict[str, object]:
         """Return every bound field in exact canonical, non-authorizing form."""
@@ -169,6 +234,110 @@ class BoundOrderRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class OrderProposal:
+    """One exact typed proposal; a caller echo is never approval evidence."""
+
+    accepted: bool
+    reason_codes: tuple[str, ...]
+    broker: str
+    intent: OrderIntent
+    risk_decision: RiskDecision
+    request_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.accepted) is not bool
+            or type(self.reason_codes) is not tuple
+            or not all(
+                type(reason) is str and _REASON.fullmatch(reason)
+                for reason in self.reason_codes
+            )
+            or self.broker not in _BROKERS
+            or type(self.intent) is not OrderIntent
+            or type(self.risk_decision) is not RiskDecision
+            or self.request_fingerprint
+            != _proposal_fingerprint(self.broker, self.intent, self.risk_decision)
+        ):
+            raise ValueError("order proposal is malformed")
+        if self.accepted:
+            if (
+                self.reason_codes
+                or not self.risk_decision.approved
+                or self.risk_decision.reason_codes
+            ):
+                raise ValueError("accepted proposal is inconsistent")
+        elif not self.reason_codes:
+            raise ValueError("denied proposal requires stable reasons")
+
+    @classmethod
+    def accept(cls, request: BoundOrderRequest) -> OrderProposal:
+        """Create an accepted exact proposal from a validated request."""
+        if type(request) is not BoundOrderRequest:
+            raise ValueError("proposal request is malformed")
+        intent = request.domain_intent()
+        risk = request.domain_risk()
+        return cls(True, (), request.broker, intent, risk, request.fingerprint())
+
+
+class Task14CliLiveFacade:
+    """Exact CLI bridge that can only call the real authenticated Task 14 service."""
+
+    def __init__(
+        self,
+        *,
+        approval_service: ApprovalService,
+        live_order_service: LiveOrderService,
+        snapshot: MarketSnapshot,
+        preflight: PreflightReport,
+        reconciliation: ReconciliationReport,
+    ) -> None:
+        if (
+            type(approval_service) is not ApprovalService
+            or type(live_order_service) is not LiveOrderService
+            or type(snapshot) is not MarketSnapshot
+            or type(preflight) is not PreflightReport
+            or type(reconciliation) is not ReconciliationReport
+            or approval_service.safety_store_identity
+            is not live_order_service.safety_store_identity
+        ):
+            raise ValueError("live CLI facade requires exact shared Task 14 services")
+        self._approval = approval_service
+        self._live = live_order_service
+        self._snapshot = snapshot
+        self._preflight = preflight
+        self._reconciliation = reconciliation
+
+    def submit(self, proposal: OrderProposal, confirmation_phrase: str) -> BrokerOrder:
+        """Durably issue confirmation, then delegate every live gate to Task 14."""
+        if type(proposal) is not OrderProposal or not proposal.accepted:
+            raise ValueError("live order requires an accepted exact proposal")
+        intent = OrderIntent.model_validate(proposal.intent.model_dump(mode="python"))
+        risk_decision = RiskDecision.model_validate(
+            proposal.risk_decision.model_dump(mode="python")
+        )
+        if intent != proposal.intent or risk_decision != proposal.risk_decision:
+            raise ValueError("live proposal did not survive exact domain revalidation")
+        if proposal.broker != self._live.broker_name:
+            raise ValueError("proposal broker does not match live service")
+        if self._snapshot.instrument_id != intent.instrument_id:
+            raise ValueError("proposal snapshot does not match live service")
+        confirmation = self._approval.create(
+            intent,
+            risk_decision,
+            phrase=confirmation_phrase,
+            broker=proposal.broker,
+        )
+        return self._live.submit_confirmed(
+            intent=intent,
+            risk_decision=risk_decision,
+            snapshot=self._snapshot,
+            confirmation=confirmation,
+            preflight=self._preflight,
+            reconciliation=self._reconciliation,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ServiceContainer:
     """All potentially effectful behavior supplied at one explicit local boundary."""
 
@@ -177,8 +346,15 @@ class ServiceContainer:
     paper: WorkflowService | None = None
     preflight: PreflightService | None = None
     proposal: ProposalService | None = None
-    live_submission: LiveSubmissionService | None = None
+    live_submission: Task14CliLiveFacade | None = None
     dashboard: Callable[[str], DashboardStatus] | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.live_submission is not None
+            and type(self.live_submission) is not Task14CliLiveFacade
+        ):
+            raise ValueError("live submission requires the exact Task 14 facade")
 
 
 class _OfflinePreflight:
@@ -199,34 +375,38 @@ def _default_dashboard(broker: str) -> DashboardStatus:
     return DashboardStatus(
         generated_at=now,
         data_as_of=now,
-        research={"status": "unavailable", "fresh": False},
-        strategies=(),
-        promotion={"status": "not_promoted"},
-        portfolio={"currency": "USD", "equity": Decimal("10")},
-        risk={
-            "max_trade_risk_fraction": Decimal("0.005"),
-            "max_position_fraction": Decimal("0.10"),
-            "max_gross_exposure_fraction": Decimal("0.50"),
-            "max_daily_loss_fraction": Decimal("0.02"),
-            "max_drawdown_fraction": Decimal("0.10"),
-        },
+        research=DashboardResearch(version="unavailable", fresh=False),
+        strategies=(DashboardStrategy("unavailable", "unavailable"),),
+        promotion=DashboardPromotion("not_promoted"),
+        portfolio=DashboardPortfolio("USD", Decimal("10")),
+        risk=DashboardRisk(
+            Decimal("0.005"),
+            Decimal("0.10"),
+            Decimal("0.50"),
+            Decimal("0.02"),
+            Decimal("0.10"),
+        ),
         brokers=(
-            {
-                "name": broker,
-                "missing_gates": tuple(sorted(required_gate_names(manifest_broker))),
-                "ready": False,
-            },
+            DashboardBroker(
+                broker,
+                tuple(
+                    GateResult(name=name, passed=False, reason_code="GATE_NOT_SATISFIED")
+                    for name in sorted(required_gate_names(manifest_broker))
+                ),
+            ),
         ),
         orders=(),
-        kill_switches=({"active": True, "reason_code": "LIVE_SERVICE_UNAVAILABLE"},),
-        interlocks=({"active": True, "reason_code": "LIVE_SERVICE_UNAVAILABLE"},),
-        aspirational_target={
-            "starting_capital": Decimal("10"),
-            "current_equity": Decimal("10"),
-            "target": Decimal("1000000"),
-            "required_multiple": Decimal("100000"),
-            "reporting_only": True,
-        },
+        kill_switches=(DashboardSafetyState(True, "LIVE_SERVICE_UNAVAILABLE"),),
+        interlocks=(DashboardSafetyState(True, "LIVE_SERVICE_UNAVAILABLE"),),
+        aspirational_target=DashboardAspiration(
+            Decimal("10"),
+            Decimal("10"),
+            Decimal("1000000"),
+            Decimal("100000"),
+            Decimal("1"),
+            Decimal("999990"),
+            True,
+        ),
     )
 
 
@@ -329,9 +509,14 @@ def build_app(
             result = None
         if proposal_failed:
             _error("PROPOSAL_FAILED", 30)
-        if not isinstance(result, Mapping):
+        if type(result) is not OrderProposal:
             _error("PROPOSAL_RESPONSE_INVALID", 30)
-        _emit(request.safe_mapping())
+        if not _proposal_matches_request(result, request):
+            _error("PROPOSAL_RESPONSE_INVALID", 30)
+        if not result.accepted:
+            _emit({"accepted": False, "reason_codes": list(result.reason_codes)})
+            raise typer.Exit(30)
+        _emit(_proposal_mapping(result, request))
 
     @application.command("submit-confirmed-order")
     def submit_confirmed_order(
@@ -366,15 +551,35 @@ def build_app(
         container = _get_container(factory)
         if container.live_submission is None:
             _error("LIVE_SERVICE_UNAVAILABLE", 30)
+        if type(container.live_submission) is not Task14CliLiveFacade:
+            _error("LIVE_SERVICE_INVALID", 30)
+        if container.proposal is None:
+            _error("PROPOSAL_SERVICE_UNAVAILABLE", 30)
+        proposal_failed = False
+        try:
+            proposal = container.proposal.propose(request)
+        except Exception:
+            proposal_failed = True
+            proposal = None
+        if proposal_failed:
+            _error("PROPOSAL_FAILED", 30)
+        if (
+            type(proposal) is not OrderProposal
+            or not proposal.accepted
+            or not _proposal_matches_request(proposal, request)
+        ):
+            _error("PROPOSAL_RESPONSE_INVALID", 30)
         submission_failed = False
         try:
-            result = container.live_submission.submit(request, confirm_real_money)
+            result = container.live_submission.submit(proposal, confirm_real_money)
         except Exception:
             submission_failed = True
             result = None
         if submission_failed:
             _error("LIVE_SUBMISSION_REJECTED", 30)
-        _emit_service_result(result)
+        if type(result) is not BrokerOrder:
+            _error("LIVE_RESPONSE_INVALID", 30)
+        _emit_broker_order(result)
 
     @application.command("export-dashboard")
     def export_dashboard(
@@ -539,6 +744,97 @@ def _require_broker(value: object) -> str:
     if type(value) is not str or value not in _BROKERS:
         _error("BROKER_INVALID", 2)
     return value
+
+
+def _proposal_matches_request(proposal: OrderProposal, request: BoundOrderRequest) -> bool:
+    try:
+        return (
+            proposal.broker == request.broker
+            and proposal.intent == request.domain_intent()
+            and proposal.risk_decision == request.domain_risk()
+            and proposal.request_fingerprint == request.fingerprint()
+        )
+    except (TypeError, ValueError, CanonicalEncodingError):
+        return False
+
+
+def _proposal_mapping(
+    proposal: OrderProposal,
+    request: BoundOrderRequest,
+) -> dict[str, object]:
+    mapping = request.safe_mapping()
+    mapping.update(
+        {
+            "accepted": True,
+            "reason_codes": [],
+            "request_fingerprint": proposal.request_fingerprint,
+        }
+    )
+    if any(
+        _secret_shaped(value)
+        for value in mapping.values()
+        if type(value) is str
+    ):
+        _error("PROPOSAL_RESPONSE_INVALID", 30)
+    return mapping
+
+
+def _emit_broker_order(order: BrokerOrder) -> None:
+    if any(
+        _secret_shaped(value)
+        for value in (order.order_id, order.client_order_id, order.broker, order.instrument_id)
+    ):
+        _error("LIVE_RESPONSE_INVALID", 30)
+    _emit(
+        {
+            "order_id": order.order_id,
+            "client_order_id": order.client_order_id,
+            "broker": order.broker,
+            "instrument": order.instrument_id,
+            "status": order.status.value,
+            "requested_quantity": _decimal_text(order.requested_quantity),
+            "requested_notional": _decimal_text(order.requested_notional),
+            "filled_quantity": _decimal_text(order.filled_quantity),
+            "average_fill_price": _decimal_text(order.average_fill_price),
+            "submitted_at": _utc_text(order.submitted_at),
+            "updated_at": _utc_text(order.updated_at),
+        }
+    )
+
+
+def _proposal_fingerprint(broker: str, intent: OrderIntent, risk: RiskDecision) -> str:
+    if broker not in _BROKERS or type(intent) is not OrderIntent or type(risk) is not RiskDecision:
+        raise ValueError("proposal fingerprint input is malformed")
+    payload = {
+        "broker": broker,
+        "intent": {
+            "intent_id": intent.intent_id,
+            "instrument_id": intent.instrument_id,
+            "side": intent.side.value,
+            "quantity": _decimal_text(intent.quantity),
+            "notional": _decimal_text(intent.notional),
+            "order_type": intent.order_type.value,
+            "limit_price": _decimal_text(intent.limit_price),
+            "trigger_price": _decimal_text(intent.trigger_price),
+            "stop_loss": _decimal_text(intent.stop_loss),
+            "take_profit": _decimal_text(intent.take_profit),
+            "time_in_force": intent.time_in_force,
+            "product": intent.product,
+            "session": intent.session,
+            "snapshot_hash": intent.snapshot_hash,
+            "created_at": _utc_text(intent.created_at),
+            "expires_at": _utc_text(intent.expires_at),
+        },
+        "risk_decision_hash": risk_decision_hash(risk),
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(
+        b"omnimarket-sentinel:cli-order-proposal:v1\x00" + encoded.encode("ascii")
+    ).hexdigest()
+
+
+def _secret_shaped(value: object) -> bool:
+    return type(value) is str and _SECRET_TEXT.search(value) is not None
 
 
 def _validated_preflight(

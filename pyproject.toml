@@ -41,6 +41,12 @@ market-sentinel = "market_sentinel.cli:app"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.data-files]
+"share/omnimarket-sentinel/scripts" = [
+  "scripts/check-readiness.ps1",
+  "scripts/export-dashboard-status.ps1",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"

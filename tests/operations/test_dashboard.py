@@ -12,12 +12,25 @@ from pathlib import Path
 
 import pytest
 
+from market_sentinel.brokers.preflight import required_gate_names
 from market_sentinel.domain.clock import FrozenClock
+from market_sentinel.domain.enums import OrderStatus
+from market_sentinel.domain.models import GateResult
 from market_sentinel.operations.audit import AuditLog
 from market_sentinel.operations.dashboard import (
+    DashboardAspiration,
+    DashboardBroker,
+    DashboardOrder,
+    DashboardPortfolio,
+    DashboardPromotion,
+    DashboardResearch,
+    DashboardRisk,
+    DashboardSafetyState,
     DashboardStatus,
+    DashboardStrategy,
     DashboardValidationError,
     export_dashboard,
+    safe_json_mapping,
 )
 from market_sentinel.operations.scheduler import ScheduledJob, Scheduler
 from market_sentinel.storage.db import create_engine_and_schema
@@ -30,21 +43,38 @@ def _status() -> DashboardStatus:
     return DashboardStatus(
         generated_at=AT,
         data_as_of=AT - timedelta(seconds=5),
-        research={"version": "tauric-v1", "fresh": True, "api_key": "do-not-write"},
-        strategies=({"id": "intraday", "version": "v2"},),
-        promotion={"status": "paper"},
-        portfolio={"currency": "USD", "equity": Decimal("10.000")},
-        risk={"max_position_fraction": Decimal("0.10")},
-        brokers=({"name": "alpaca", "missing_gates": ("A", "B")},),
-        orders=({"id": "order-1", "status": "proposed"},),
-        kill_switches=({"active": False},),
-        interlocks=({"active": False},),
-        aspirational_target={
-            "starting_capital": Decimal("10"),
-            "target": Decimal("1000000"),
-            "required_multiple": Decimal("100000"),
-            "reporting_only": True,
-        },
+        research=DashboardResearch("tauric-v1", True),
+        strategies=(DashboardStrategy("intraday", "v2"),),
+        promotion=DashboardPromotion("paper"),
+        portfolio=DashboardPortfolio("USD", Decimal("10.000")),
+        risk=DashboardRisk(
+            Decimal("0.005"),
+            Decimal("0.10"),
+            Decimal("0.50"),
+            Decimal("0.02"),
+            Decimal("0.10"),
+        ),
+        brokers=(
+            DashboardBroker(
+                "alpaca",
+                tuple(
+                    GateResult(name=name, passed=True, reason_code="OK")
+                    for name in sorted(required_gate_names("alpaca"))
+                ),
+            ),
+        ),
+        orders=(DashboardOrder("order-1", OrderStatus.PROPOSED),),
+        kill_switches=(DashboardSafetyState(False, "OK"),),
+        interlocks=(DashboardSafetyState(False, "OK"),),
+        aspirational_target=DashboardAspiration(
+            Decimal("10"),
+            Decimal("10.000"),
+            Decimal("1000000"),
+            Decimal("100000"),
+            Decimal("1"),
+            Decimal("999990"),
+            True,
+        ),
     )
 
 
@@ -65,8 +95,11 @@ def test_dashboard_is_schema_v1_canonical_redacted_and_risk_separate(tmp_path: P
     assert data["aspirational_target"]["required_multiple"] == "100000"
     assert data["aspirational_target"]["reporting_only"] is True
     assert data["risk"]["max_position_fraction"] == "0.1"
+    assert data["brokers"][0]["gates"] == [
+        {"name": name, "passed": True, "reason_code": "OK"}
+        for name in sorted(required_gate_names("alpaca"))
+    ]
     assert "api_key" not in text.lower()
-    assert "do-not-write" not in text
 
 
 def test_dashboard_rejects_provider_objects_callbacks_and_unsafe_paths(tmp_path: Path) -> None:
@@ -127,13 +160,8 @@ def test_dashboard_rejects_unc_destination_before_path_resolution(
 
 def test_dashboard_redacts_secret_shaped_values_even_under_innocent_keys(tmp_path: Path) -> None:
     """A bearer value must not escape merely because its field name looks harmless."""
-    status = _status()
-    object.__setattr__(status, "research", {"note": "Bearer live-value-that-must-not-leak"})
-    destination = tmp_path / "status.json"
-
-    export_dashboard(status, destination)
-
-    text = destination.read_text(encoding="utf-8")
+    prepared = safe_json_mapping({"note": "Bearer live-value-that-must-not-leak"})
+    text = json.dumps(prepared)
     assert "live-value-that-must-not-leak" not in text
     assert "[REDACTED]" in text
 
@@ -221,7 +249,7 @@ def test_scheduler_rechecks_exchange_session_at_current_run_time(tmp_path: Path)
         clock=clock,
         calendar=_ClosingCalendar(),
         audit=AuditLog(store, clock),
-        event_id_factory=lambda: "event",
+        event_id_factory=iter(("event-1", "event-2")).__next__,
     )
     calls: list[str] = []
 
@@ -236,10 +264,10 @@ def test_scheduler_rechecks_exchange_session_at_current_run_time(tmp_path: Path)
         clock=clock,
         calendar=_Calendar(opened=False),
         audit=scheduler.audit,
-        event_id_factory=lambda: "closed-event",
+        event_id_factory=iter(("closed-event-1", "closed-event-2")).__next__,
     )
     closed_job = ScheduledJob(
-        "swing", "AAPL@alpaca", AT, 10, lambda: calls.append("closed")
+        "swing-closed", "AAPL@alpaca", AT, 10, lambda: calls.append("closed")
     )
     assert closed.run_due(closed_job).reason_code == "EXCHANGE_CLOSED"
     assert calls == []
@@ -248,16 +276,23 @@ def test_scheduler_rechecks_exchange_session_at_current_run_time(tmp_path: Path)
 def test_scheduler_persists_start_then_atomic_end_health_for_success(tmp_path: Path) -> None:
     """A completed run must have ordered durable lifecycle and healthy audit rows."""
     scheduler, store = _scheduler(tmp_path, FrozenClock(AT))
-    outcome = scheduler.run_due(ScheduledJob("swing", "AAPL@alpaca", AT, 10, lambda: "ok"))
+    job = ScheduledJob("swing", "AAPL@alpaca", AT, 10, lambda: "ok")
+    outcome = scheduler.run_due(job)
 
     assert outcome.reason_code == "COMPLETED"
-    rows = tuple(store.stream("scheduler:swing:AAPL@alpaca"))
+    rows = tuple(store.stream(job.aggregate_id))
     assert [row.kind for row in rows] == [
         "scheduler.started",
         "scheduler.ended",
         "scheduler.healthy",
     ]
-    assert [row.sequence for row in rows] == [1, 2, 3]
+    exclusion_rows = tuple(store.stream(job.exclusion_id))
+    assert [row.kind for row in exclusion_rows] == [
+        "scheduler.exclusion_started",
+        "scheduler.exclusion_released",
+    ]
+    assert [row.sequence for row in rows] == [1, 3, 4]
+    assert [row.sequence for row in exclusion_rows] == [2, 5]
 
 
 def test_scheduler_excludes_same_strategy_instrument_while_running(tmp_path: Path) -> None:

@@ -96,6 +96,16 @@ class LiveOrderService:
         self._ledger = ledger
         self._broker_name = broker_name
 
+    @property
+    def safety_store_identity(self) -> object:
+        """Return the opaque shared safety-store identity used by live execution."""
+        return self._approval.safety_store_identity
+
+    @property
+    def broker_name(self) -> str:
+        """Return the validated broker identity bound at construction."""
+        return self._broker_name
+
     def submit_confirmed(
         self,
         *,

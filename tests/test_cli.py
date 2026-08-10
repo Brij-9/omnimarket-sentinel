@@ -16,11 +16,23 @@ from market_sentinel.brokers.preflight import PreflightReport, gate, required_ga
 from market_sentinel.cli import (
     CONFIRMATION_PHRASE,
     BoundOrderRequest,
+    OrderProposal,
     ServiceContainer,
     WorkflowRequest,
     build_app,
 )
-from market_sentinel.operations.dashboard import DashboardStatus
+from market_sentinel.domain.models import GateResult
+from market_sentinel.operations.dashboard import (
+    DashboardAspiration,
+    DashboardBroker,
+    DashboardPortfolio,
+    DashboardPromotion,
+    DashboardResearch,
+    DashboardRisk,
+    DashboardSafetyState,
+    DashboardStatus,
+    DashboardStrategy,
+)
 
 COMMANDS = {
     "research",
@@ -44,6 +56,17 @@ class _FailingWorkflow:
         raise RuntimeError("provider-secret-must-not-survive")
 
 
+class _SecretShapedWorkflow:
+    def run(self, request: WorkflowRequest) -> Mapping[str, object]:
+        del request
+        return {
+            "assignment": "api_key=secret-token-123",
+            "header": "Authorization: Bearer header-value",
+            "query": "https://local.invalid/?credential=live-value",
+            "encoded": "https://local.invalid/?api%5Fkey=encoded-value",
+        }
+
+
 class _Preflight:
     def run(self, broker: str) -> PreflightReport:
         normalized = "ccxt-spot" if broker == "ccxt" else broker
@@ -55,8 +78,8 @@ class _Preflight:
 
 
 class _Proposal:
-    def propose(self, request: BoundOrderRequest) -> Mapping[str, object]:
-        return request.safe_mapping()
+    def propose(self, request: BoundOrderRequest) -> OrderProposal:
+        return OrderProposal.accept(request)
 
 
 class _PartialProposal:
@@ -93,21 +116,42 @@ def _dashboard_status() -> DashboardStatus:
     return DashboardStatus(
         generated_at=at,
         data_as_of=at,
-        research={"version": "research-v1", "fresh": True},
-        strategies=({"id": "swing", "version": "v1"},),
-        promotion={"status": "paper"},
-        portfolio={"currency": "USD", "equity": Decimal("10")},
-        risk={"max_position_fraction": Decimal("0.10")},
-        brokers=({"name": "alpaca", "missing_gates": ("MARKET_SENTINEL_MODE",)},),
+        research=DashboardResearch("research-v1", True),
+        strategies=(DashboardStrategy("swing", "v1"),),
+        promotion=DashboardPromotion("paper"),
+        portfolio=DashboardPortfolio("USD", Decimal("10")),
+        risk=DashboardRisk(
+            Decimal("0.005"),
+            Decimal("0.10"),
+            Decimal("0.50"),
+            Decimal("0.02"),
+            Decimal("0.10"),
+        ),
+        brokers=(
+            DashboardBroker(
+                "alpaca",
+                tuple(
+                    GateResult(
+                        name=name,
+                        passed=name == "MARKET_SENTINEL_MODE",
+                        reason_code="OK" if name == "MARKET_SENTINEL_MODE" else "NOT_READY",
+                    )
+                    for name in sorted(required_gate_names("alpaca"))
+                ),
+            ),
+        ),
         orders=(),
-        kill_switches=({"active": False},),
-        interlocks=({"active": False},),
-        aspirational_target={
-            "starting_capital": Decimal("10"),
-            "target": Decimal("1000000"),
-            "required_multiple": Decimal("100000"),
-            "reporting_only": True,
-        },
+        kill_switches=(DashboardSafetyState(False, "OK"),),
+        interlocks=(DashboardSafetyState(False, "OK"),),
+        aspirational_target=DashboardAspiration(
+            Decimal("10"),
+            Decimal("10"),
+            Decimal("1000000"),
+            Decimal("100000"),
+            Decimal("1"),
+            Decimal("999990"),
+            True,
+        ),
     )
 
 
@@ -247,6 +291,31 @@ def test_service_failure_has_stable_output_and_zero_provider_exception_context()
         exception = exception.__cause__ or exception.__context__
 
 
+def test_workflow_output_redacts_assignment_query_header_and_encoded_secrets() -> None:
+    """Free-form provider text must pass through the same normalized output sanitizer."""
+    result = CliRunner().invoke(
+        build_app(lambda: ServiceContainer(research=_SecretShapedWorkflow())),
+        [
+            "research",
+            "--instrument",
+            "AAPL@alpaca",
+            "--as-of",
+            "2026-08-09T10:00:00+00:00",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.exception is None
+    assert json.loads(result.stdout) == {
+        "assignment": "[REDACTED]",
+        "encoded": "[REDACTED]",
+        "header": "[REDACTED]",
+        "query": "[REDACTED]",
+    }
+    for forbidden in ("secret-token-123", "header-value", "live-value", "encoded-value"):
+        assert forbidden not in result.stdout
+
+
 def test_submit_requires_all_bound_fields_and_exact_phrase_before_service() -> None:
     """Missing approval identity or an inexact phrase must never reach live authority."""
     submission = _Submission()
@@ -272,20 +341,20 @@ def test_submit_requires_all_bound_fields_and_exact_phrase_before_service() -> N
     assert "traceback" not in incomplete.stdout.lower()
 
 
-def test_complete_submit_delegates_one_exact_notional_request() -> None:
-    """Changing or omitting a bound field must not produce an acknowledged live request."""
+def test_structural_submitter_cannot_acknowledge_an_exact_notional_request() -> None:
+    """A structurally compatible submitter cannot replace the concrete Task 14 facade."""
     submission = _Submission()
     app = build_app(lambda: _container(submission))
     result = CliRunner().invoke(app, _complete_submit_args())
 
-    assert result.exit_code == 0
-    assert submission.accepted == 1
-    assert submission.confirmation_phrase == CONFIRMATION_PHRASE
-    assert json.loads(result.stdout) == {"intent_id": "intent-1", "status": "ACKNOWLEDGED"}
+    assert result.exit_code == 50
+    assert submission.accepted == 0
+    assert submission.confirmation_phrase is None
+    assert result.stdout.strip() == '{"error":"SERVICE_CONTAINER_UNAVAILABLE"}'
 
 
-def test_proposal_output_is_complete_even_if_service_returns_partial_metadata() -> None:
-    """The approval surface must emit every exact bound field, never a partial service shape."""
+def test_proposal_rejects_partial_mapping_metadata() -> None:
+    """The approval surface rejects a Mapping instead of echoing it as approval."""
     container = _container()
     partial = ServiceContainer(
         research=container.research,
@@ -297,32 +366,8 @@ def test_proposal_output_is_complete_even_if_service_returns_partial_metadata() 
     )
     result = CliRunner().invoke(build_app(lambda: partial), _complete_proposal_args())
 
-    assert result.exit_code == 0
-    payload = json.loads(result.stdout)
-    assert set(payload) == {
-        "broker",
-        "intent_id",
-        "instrument",
-        "side",
-        "quantity",
-        "notional",
-        "order_type",
-        "limit_price",
-        "trigger_price",
-        "stop_loss",
-        "take_profit",
-        "time_in_force",
-        "product",
-        "session",
-        "snapshot_hash",
-        "created_at",
-        "expires_at",
-        "risk_approved_quantity",
-        "risk_approved_notional",
-        "portfolio_hash",
-        "risk_decided_at",
-        "risk_expires_at",
-    }
+    assert result.exit_code == 30
+    assert result.stdout.strip() == '{"error":"PROPOSAL_RESPONSE_INVALID"}'
 
 
 def test_default_container_fails_before_live_submission_without_external_calls() -> None:
@@ -401,6 +446,8 @@ def _complete_proposal_args(command: str = "propose-order") -> list[str]:
         "2026-08-09T10:01:00+00:00",
         "--risk-approved-notional",
         "10",
+        "--risk-approved-quantity",
+        "0.1",
         "--portfolio-hash",
         "a" * 64,
         "--risk-decided-at",

@@ -11,6 +11,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+if ($Path.StartsWith('\\') -or $Path.StartsWith('//')) {
+    throw 'Network dashboard paths are not permitted.'
+}
 if ([System.IO.Path]::IsPathRooted($Path)) {
     $destination = [System.IO.Path]::GetFullPath($Path)
 }
@@ -25,11 +28,55 @@ if ([System.IO.Path]::GetExtension($destination) -ne '.json') {
     throw 'Dashboard destination must use the .json extension.'
 }
 
+function Assert-LocalPathComponents {
+    param([Parameter(Mandatory = $true)][string]$Candidate)
+    if ($Candidate.StartsWith('\\') -or $Candidate.StartsWith('//')) {
+        throw 'Network dashboard paths are not permitted.'
+    }
+    $root = [System.IO.Path]::GetPathRoot($Candidate)
+    if ([string]::IsNullOrEmpty($root)) {
+        throw 'Dashboard path root is invalid.'
+    }
+    try {
+        $drive = [System.IO.DriveInfo]::new($root)
+        if ($drive.DriveType -eq [System.IO.DriveType]::Network) {
+            throw 'Network dashboard paths are not permitted.'
+        }
+    }
+    catch {
+        throw 'Dashboard path root is unavailable or unsafe.'
+    }
+    $current = $root
+    $relative = $Candidate.Substring($root.Length)
+    foreach ($component in $relative.Split([System.IO.Path]::DirectorySeparatorChar, [System.StringSplitOptions]::RemoveEmptyEntries)) {
+        $current = Join-Path $current $component
+        if (Test-Path -LiteralPath $current) {
+            $item = Get-Item -LiteralPath $current -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'Dashboard path cannot contain a link or reparse point.'
+            }
+        }
+    }
+}
+
+Assert-LocalPathComponents -Candidate $destination
+$arguments = @(
+    '-m',
+    'market_sentinel.cli',
+    'export-dashboard',
+    '--broker',
+    $Broker,
+    '--path',
+    $destination
+)
+$exitCode = 1
+
 Push-Location -LiteralPath $repositoryRoot
 try {
-    & python -m market_sentinel.cli export-dashboard --broker $Broker --path $destination
-    exit $LASTEXITCODE
+    & python @arguments
+    $exitCode = $LASTEXITCODE
 }
 finally {
     Pop-Location
 }
+exit $exitCode

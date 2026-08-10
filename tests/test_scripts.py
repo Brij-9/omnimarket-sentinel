@@ -63,25 +63,27 @@ def test_export_wrapper_handles_quoted_absolute_path_without_injection(tmp_path:
     assert destination.exists()
     assert not (tmp_path / "still-safe.json").exists()
     dashboard = json.loads(destination.read_text(encoding="utf-8"))
-    assert dashboard["brokers"] == [
-        {
-            "missing_gates": sorted(
-                (
-                    "ALPACA_ACCOUNT_ACTIVE",
-                    "ALPACA_ACCOUNT_ID_MATCHED",
-                    "ALPACA_ACCOUNT_ID_PRESENT",
-                    "ALPACA_ACCOUNT_UNBLOCKED",
-                    "ALPACA_LIVE_ENDPOINT",
-                    "ALPACA_LIVE_TRADING_ENABLED",
-                    "ALPACA_LOCAL_CREDENTIALS_PRESENT",
-                    "ALPACA_REAL_API_ENABLED",
-                    "ALPACA_SUFFICIENT_BUYING_POWER",
-                    "MARKET_SENTINEL_MODE",
-                )
-            ),
-            "name": "alpaca",
-            "ready": False,
-        }
+    expected_gates = sorted(
+        (
+            "ALPACA_ACCOUNT_ACTIVE",
+            "ALPACA_ACCOUNT_ID_MATCHED",
+            "ALPACA_ACCOUNT_ID_PRESENT",
+            "ALPACA_ACCOUNT_UNBLOCKED",
+            "ALPACA_LIVE_ENDPOINT",
+            "ALPACA_LIVE_TRADING_ENABLED",
+            "ALPACA_LOCAL_CREDENTIALS_PRESENT",
+            "ALPACA_REAL_API_ENABLED",
+            "ALPACA_SUFFICIENT_BUYING_POWER",
+            "MARKET_SENTINEL_MODE",
+        )
+    )
+    broker = dashboard["brokers"][0]
+    assert broker["name"] == "alpaca"
+    assert broker["ready"] is False
+    assert broker["missing_gates"] == expected_gates
+    assert broker["gates"] == [
+        {"name": name, "passed": False, "reason_code": "GATE_NOT_SATISFIED"}
+        for name in expected_gates
     ]
 
 
