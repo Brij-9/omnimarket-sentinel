@@ -13,6 +13,8 @@ from decimal import Decimal
 from market_sentinel.domain.clock import Clock
 from market_sentinel.domain.enums import OrderType, Side
 from market_sentinel.domain.models import OrderIntent, RiskDecision
+from market_sentinel.execution.canonical import CanonicalEncodingError, canonical_decimal
+from market_sentinel.execution.safety import SafetyEvent, SafetyIntegrityError, SafetyRepository
 
 CONFIRMATION_PHRASE = "I_CONFIRM_REAL_MONEY_ORDER"
 DEFAULT_CONFIRMATION_LIFETIME = timedelta(minutes=5)
@@ -34,13 +36,23 @@ class OrderConfirmation:
     broker: str
     created_at: datetime
     expires_at: datetime
+    nonce: str
+    mac: str
 
 
 class ApprovalService:
     """Create and verify exact, expiring confirmation fingerprints."""
 
-    def __init__(self, *, clock: Clock) -> None:
+    def __init__(self, *, clock: Clock, safety_repository: SafetyRepository) -> None:
+        if type(safety_repository) is not SafetyRepository:
+            raise ValueError("approval requires an authenticated safety repository")
         self._clock = clock
+        self._safety = safety_repository
+
+    @property
+    def safety_repository(self) -> SafetyRepository:
+        """Return the exact authenticated durability boundary used for issuance."""
+        return self._safety
 
     def create(
         self,
@@ -65,12 +77,49 @@ class ApprovalService:
         _validate_risk(intent, risk_decision, instant)
         expires_at = instant + lifetime
         fingerprint = _fingerprint(intent, risk_decision, resolved_broker, expires_at)
+        try:
+            issuance_seed = self._safety.new_nonce()
+            nonce = self._safety.new_nonce()
+        except (TypeError, ValueError):
+            nonce_pair = None
+        else:
+            nonce_pair = (issuance_seed, nonce)
+        if nonce_pair is None:
+            raise ApprovalError("confirmation nonce source failed")
+        issuance_seed, nonce = nonce_pair
+        confirmation_id = hashlib.sha256(
+            b"omnimarket-sentinel:confirmation-issuance-id:v1\x00" + bytes.fromhex(issuance_seed)
+        ).hexdigest()
+        aggregate = f"live-confirmation:{confirmation_id}"
+        event_id = f"confirmation-issued-{confirmation_id}"
+        payload = {
+            "broker": resolved_broker,
+            "created_at": _time_text(instant),
+            "expires_at": _time_text(expires_at),
+            "fingerprint": fingerprint,
+            "nonce": nonce,
+            "risk_decision_hash": risk_decision_hash(risk_decision),
+        }
+        try:
+            self._safety.record_many(
+                (SafetyEvent(event_id, "confirmation.issued", aggregate, payload, instant),)
+            )
+            [issued] = self._safety.stream_verified(aggregate)
+        except BaseException:
+            issued = None
+        if issued is None:
+            raise ApprovalError("confirmation persistence failed") from None
+        mac = issued.payload.get("safety_mac")
+        if type(mac) is not str:
+            raise ApprovalError("confirmation persistence failed")
         return OrderConfirmation(
-            confirmation_id=fingerprint,
+            confirmation_id=confirmation_id,
             fingerprint=fingerprint,
             broker=resolved_broker,
             created_at=instant,
             expires_at=expires_at,
+            nonce=nonce,
+            mac=mac,
         )
 
     def verify(
@@ -89,7 +138,12 @@ class ApprovalService:
             created_at = _aware_utc(confirmation.created_at)
             expires_at = _aware_utc(confirmation.expires_at)
         except (TypeError, ValueError):
-            raise ApprovalError("confirmation is malformed") from None
+            timestamps = None
+        else:
+            timestamps = (instant, created_at, expires_at)
+        if timestamps is None:
+            raise ApprovalError("confirmation is malformed")
+        instant, created_at, expires_at = timestamps
         if created_at > instant:
             raise ApprovalError("confirmation is from the future")
         if expires_at <= instant:
@@ -101,13 +155,38 @@ class ApprovalService:
             _validate_intent(intent, instant)
             expected = _fingerprint(intent, risk_decision, resolved_broker, expires_at)
         except (TypeError, ValueError, ApprovalError):
-            raise ApprovalError("confirmation input is malformed") from None
+            fingerprint_input = None
+        else:
+            fingerprint_input = (resolved_broker, expected)
+        if fingerprint_input is None:
+            raise ApprovalError("confirmation input is malformed")
+        resolved_broker, expected = fingerprint_input
+        aggregate = f"live-confirmation:{confirmation.confirmation_id}"
+        try:
+            rows = self._safety.stream_verified(aggregate)
+        except SafetyIntegrityError:
+            rows = ()
+        if not rows:
+            raise ApprovalError("confirmation issuance is not authenticated")
+        issued = rows[0]
+        payload = issued.payload
         if (
             confirmation.broker != resolved_broker
             or not _sha256_text(confirmation.confirmation_id)
             or not _sha256_text(confirmation.fingerprint)
-            or confirmation.confirmation_id != confirmation.fingerprint
+            or not _hex_text(confirmation.nonce, minimum_bytes=16, maximum_bytes=64)
+            or not _sha256_text(confirmation.mac)
             or confirmation.fingerprint != expected
+            or issued.kind != "confirmation.issued"
+            or issued.event_id != f"confirmation-issued-{confirmation.confirmation_id}"
+            or issued.occurred_at != created_at
+            or payload.get("broker") != resolved_broker
+            or payload.get("created_at") != _time_text(created_at)
+            or payload.get("expires_at") != _time_text(expires_at)
+            or payload.get("fingerprint") != confirmation.fingerprint
+            or payload.get("nonce") != confirmation.nonce
+            or payload.get("risk_decision_hash") != risk_decision_hash(risk_decision)
+            or payload.get("safety_mac") != confirmation.mac
         ):
             raise ApprovalError("confirmation fingerprint mismatch")
         _validate_risk(intent, risk_decision, instant)
@@ -174,7 +253,12 @@ def _validate_risk(intent: OrderIntent, decision: RiskDecision, now: datetime) -
         notional = _positive_optional_decimal(decision.approved_notional)
         portfolio_hash = _text(decision.portfolio_hash)
     except (TypeError, ValueError, ApprovalError):
-        raise ApprovalError("risk decision is malformed") from None
+        fields = None
+    else:
+        fields = (decided_at, expires_at, approved, reasons, quantity, notional, portfolio_hash)
+    if fields is None:
+        raise ApprovalError("risk decision is malformed")
+    decided_at, expires_at, approved, reasons, quantity, notional, portfolio_hash = fields
     if decided_at > now:
         raise ApprovalError("risk decision is from the future")
     if expires_at <= now:
@@ -217,7 +301,12 @@ def _validate_intent(intent: object, now: datetime | None = None) -> None:
         ):
             _positive_optional_decimal(value)
     except (TypeError, ValueError, ApprovalError):
-        raise ApprovalError("order intent is malformed") from None
+        fields = None
+    else:
+        fields = (created_at, expires_at, quantity, notional)
+    if fields is None:
+        raise ApprovalError("order intent is malformed")
+    created_at, expires_at, quantity, notional = fields
     expected_price_fields = {
         OrderType.MARKET: (False, False),
         OrderType.LIMIT: (True, False),
@@ -312,9 +401,13 @@ def _decimal(value: object) -> Decimal:
 
 
 def _decimal_text(value: Decimal) -> str:
-    if value.is_zero():
-        return "0"
-    return format(value.normalize(), "f")
+    try:
+        result = canonical_decimal(value)
+    except CanonicalEncodingError:
+        result = None
+    if result is None:
+        raise ApprovalError("numeric field is malformed")
+    return result
 
 
 def _aware_utc(value: object) -> datetime:
@@ -334,3 +427,12 @@ def _domain_hash(domain: bytes, payload: Mapping[str, object]) -> str:
 
 def _sha256_text(value: object) -> bool:
     return type(value) is str and len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+
+
+def _hex_text(value: object, *, minimum_bytes: int, maximum_bytes: int) -> bool:
+    return (
+        type(value) is str
+        and minimum_bytes * 2 <= len(value) <= maximum_bytes * 2
+        and len(value) % 2 == 0
+        and all(ch in "0123456789abcdef" for ch in value)
+    )

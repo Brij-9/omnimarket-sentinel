@@ -135,7 +135,13 @@ class CcxtSpotBroker:
             gate("CCXT_NO_SANDBOX_ACKNOWLEDGED", s.ccxt_sandbox or s.ccxt_no_sandbox_acknowledged),
         ]
         if not all(g.passed for g in gates):
-            gates.append(gate("CCXT_MARKETS_ACCESSIBLE", False, "MARKETS_UNAVAILABLE"))
+            gates.extend(
+                [
+                    gate("CCXT_EXCHANGE_CONFIGURED", False, "EXCHANGE_INVALID"),
+                    gate("CCXT_SPOT_MARKETS_AVAILABLE", False, "MARKETS_UNAVAILABLE"),
+                    gate("CCXT_CREATE_ORDER_SUPPORTED", False, "ORDERS_UNSUPPORTED"),
+                ]
+            )
             return PreflightReport(self.broker_name, tuple(gates))
         try:
             exchange = self._prepare_exchange()
@@ -150,7 +156,8 @@ class CcxtSpotBroker:
             gates.extend(
                 [
                     gate("CCXT_EXCHANGE_CONFIGURED", False, "EXCHANGE_INVALID"),
-                    gate("CCXT_MARKETS_ACCESSIBLE", False, "MARKETS_UNAVAILABLE"),
+                    gate("CCXT_SPOT_MARKETS_AVAILABLE", False, "MARKETS_UNAVAILABLE"),
+                    gate("CCXT_CREATE_ORDER_SUPPORTED", False, "ORDERS_UNSUPPORTED"),
                 ]
             )
         return PreflightReport(self.broker_name, tuple(gates))

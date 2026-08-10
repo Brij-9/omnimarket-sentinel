@@ -13,9 +13,14 @@ from uuid import uuid4
 
 from market_sentinel.domain.clock import Clock
 from market_sentinel.domain.enums import OrderStatus, Side
-from market_sentinel.operations.audit import AuditEvent, AuditLog
+from market_sentinel.execution.canonical import CanonicalEncodingError, canonical_decimal
+from market_sentinel.execution.safety import (
+    SafetyEvent,
+    SafetyIntegrityError,
+    SafetyRepository,
+)
 from market_sentinel.portfolio.ledger import PortfolioLedger, PortfolioLedgerPositionState
-from market_sentinel.storage.events import EventRecord
+from market_sentinel.storage.events import EventHeadConflict, EventRecord
 
 KILL_SWITCH_ACKNOWLEDGEMENT = "I_ACKNOWLEDGE_HEALTHY_RECONCILIATION"
 RECONCILIATION_MAX_AGE = timedelta(seconds=60)
@@ -139,16 +144,16 @@ class SafetyFence:
 class Reconciler:
     """Compare exact states and persist every report plus fail-closed switch changes."""
 
-    def __init__(self, *, audit_log: AuditLog, clock: Clock) -> None:
-        if type(audit_log) is not AuditLog:
-            raise ValueError("reconciliation durability requires an exact AuditLog")
-        self._audit = audit_log
+    def __init__(self, *, safety_repository: SafetyRepository, clock: Clock) -> None:
+        if type(safety_repository) is not SafetyRepository:
+            raise ValueError("reconciliation requires an authenticated safety repository")
+        self._safety = safety_repository
         self._clock = clock
 
     @property
-    def audit_log(self) -> AuditLog:
-        """Expose the sealed durable facade used to establish report provenance."""
-        return self._audit
+    def safety_repository(self) -> SafetyRepository:
+        """Expose the exact authenticated durability boundary used for safety state."""
+        return self._safety
 
     def compare(
         self,
@@ -202,6 +207,11 @@ class Reconciler:
         try:
             snapshot = source()
         except BaseException:
+            snapshot = None
+            unavailable = True
+        else:
+            unavailable = False
+        if unavailable:
             instant = _aware_utc(self._clock.now())
             return self._record_report(
                 broker="unavailable",
@@ -237,7 +247,10 @@ class Reconciler:
             return False
         if checked_at > now or now - checked_at > RECONCILIATION_MAX_AGE:
             return False
-        rows = tuple(self._audit.event_store.stream(RECONCILIATION_AGGREGATE))
+        try:
+            rows = self._safety.stream_verified(RECONCILIATION_AGGREGATE)
+        except SafetyIntegrityError:
+            return False
         if not rows:
             return False
         head = rows[-1]
@@ -255,8 +268,11 @@ class Reconciler:
 
     def kill_switch_active(self) -> bool:
         """Replay generations: a clear covers only activations it explicitly observed."""
-        kill_rows = tuple(self._audit.event_store.stream(KILL_SWITCH_AGGREGATE))
-        interlock_rows = tuple(self._audit.event_store.stream(LIVE_INTERLOCK_AGGREGATE))
+        try:
+            kill_rows = self._safety.stream_verified(KILL_SWITCH_AGGREGATE)
+            interlock_rows = self._safety.stream_verified(LIVE_INTERLOCK_AGGREGATE)
+        except SafetyIntegrityError:
+            return True
         return _kill_rows_active(kill_rows) or _interlock_rows_active(interlock_rows)
 
     def safety_fence(
@@ -278,9 +294,17 @@ class Reconciler:
         ):
             raise KillSwitchError("reconciliation report is not current")
         now = _aware_utc(self._clock.now())
-        reconciliation_rows = tuple(self._audit.event_store.stream(RECONCILIATION_AGGREGATE))
-        kill_rows = tuple(self._audit.event_store.stream(KILL_SWITCH_AGGREGATE))
-        interlock_rows = tuple(self._audit.event_store.stream(LIVE_INTERLOCK_AGGREGATE))
+        try:
+            reconciliation_rows = self._safety.stream_verified(RECONCILIATION_AGGREGATE)
+            kill_rows = self._safety.stream_verified(KILL_SWITCH_AGGREGATE)
+            interlock_rows = self._safety.stream_verified(LIVE_INTERLOCK_AGGREGATE)
+        except SafetyIntegrityError:
+            safety_state = None
+        else:
+            safety_state = (reconciliation_rows, kill_rows, interlock_rows)
+        if safety_state is None:
+            raise KillSwitchError("safety state failed authentication")
+        reconciliation_rows, kill_rows, interlock_rows = safety_state
         if not reconciliation_rows:
             raise KillSwitchError("reconciliation report is not current")
         head = reconciliation_rows[-1]
@@ -305,46 +329,85 @@ class Reconciler:
         """Clear only through a newly healthy generation with exact local acknowledgement."""
         if type(acknowledgement) is not str or acknowledgement != KILL_SWITCH_ACKNOWLEDGEMENT:
             raise KillSwitchError("kill-switch acknowledgement is not exact")
-        if _interlock_rows_active(tuple(self._audit.event_store.stream(LIVE_INTERLOCK_AGGREGATE))):
+        try:
+            interlock_rows = self._safety.stream_verified(LIVE_INTERLOCK_AGGREGATE)
+            kill_rows = self._safety.stream_verified(KILL_SWITCH_AGGREGATE)
+            reconciliation_rows = self._safety.stream_verified(RECONCILIATION_AGGREGATE)
+        except SafetyIntegrityError:
+            safety_state = None
+        else:
+            safety_state = (interlock_rows, kill_rows, reconciliation_rows)
+        if safety_state is None:
+            raise KillSwitchError("safety state failed authentication")
+        interlock_rows, kill_rows, reconciliation_rows = safety_state
+        if _interlock_rows_active(interlock_rows):
             raise KillSwitchError("a live submission remains unresolved")
-        kill_rows = tuple(self._audit.event_store.stream(KILL_SWITCH_AGGREGATE))
-        latest_activation = max(
-            (row.sequence for row in kill_rows if row.kind == "kill_switch.activated"),
-            default=0,
-        )
-        reconciliation_rows = tuple(self._audit.event_store.stream(RECONCILIATION_AGGREGATE))
+        if not _kill_rows_active(kill_rows):
+            return
+        activations = [row for row in kill_rows if row.kind == "kill_switch.activated"]
+        if not activations:
+            raise KillSwitchError("kill-switch state is malformed")
+        latest_activation = activations[-1]
         if not reconciliation_rows:
             raise KillSwitchError("a new healthy reconciliation is required")
         head = reconciliation_rows[-1]
         now = _aware_utc(self._clock.now())
         if (
             head.kind != "reconciliation.healthy"
-            or head.sequence <= latest_activation
+            or head.sequence <= latest_activation.sequence
             or head.occurred_at > now
             or now - head.occurred_at > RECONCILIATION_MAX_AGE
         ):
             raise KillSwitchError("a new healthy reconciliation is required")
-        self._audit.record(
+        clear = SafetyEvent(
             f"kill-clear-{uuid4().hex}",
             "kill_switch.cleared",
             KILL_SWITCH_AGGREGATE,
-            {"cleared_through_sequence": latest_activation},
+            {
+                "activation_event_id": latest_activation.event_id,
+                "activation_sequence": latest_activation.sequence,
+            },
+            now,
         )
+        try:
+            self._safety.record_many_if_heads(
+                (clear,),
+                {
+                    KILL_SWITCH_AGGREGATE: kill_rows[-1].event_id if kill_rows else None,
+                    RECONCILIATION_AGGREGATE: head.event_id,
+                    LIVE_INTERLOCK_AGGREGATE: (
+                        interlock_rows[-1].event_id if interlock_rows else None
+                    ),
+                },
+            )
+        except EventHeadConflict:
+            conflicted = True
+            persistence_failed = False
+        except BaseException:
+            conflicted = False
+            persistence_failed = True
+        else:
+            conflicted = False
+            persistence_failed = False
+        if persistence_failed:
+            raise KillSwitchError("kill-switch persistence failed")
+        if conflicted:
+            raise KillSwitchError("safety state changed")
 
     def record_submission_unknown(self, intent_id: str, submission_id: str) -> None:
         """Atomically persist UNKNOWN, resolve its interlock, and activate the kill switch."""
         instant = _aware_utc(self._clock.now())
         nonce = uuid4().hex
-        self._audit.record_many(
+        self._safety.record_many(
             (
-                AuditEvent(
+                SafetyEvent(
                     f"live-unknown-{nonce}",
                     "live.unknown",
                     _nonempty_text(intent_id),
                     {"reason_code": "SUBMISSION_UNKNOWN"},
                     instant,
                 ),
-                AuditEvent(
+                SafetyEvent(
                     f"interlock-unknown-{nonce}",
                     "live.interlock_resolved",
                     LIVE_INTERLOCK_AGGREGATE,
@@ -354,7 +417,7 @@ class Reconciler:
                     },
                     instant,
                 ),
-                AuditEvent(
+                SafetyEvent(
                     f"kill-unknown-{nonce}",
                     "kill_switch.activated",
                     KILL_SWITCH_AGGREGATE,
@@ -376,7 +439,7 @@ class Reconciler:
         ordered = tuple(code for code in _REASON_ORDER if code in reasons)
         healthy = not ordered
         report_id = f"reconciliation-{uuid4().hex}"
-        report_event = AuditEvent(
+        report_event = SafetyEvent(
             report_id,
             "reconciliation.healthy" if healthy else "reconciliation.unhealthy",
             RECONCILIATION_AGGREGATE,
@@ -389,26 +452,29 @@ class Reconciler:
             },
             checked_at,
         )
-        if healthy:
-            self._audit.record_many((report_event,))
-        else:
-            self._audit.record_many(
-                (
-                    report_event,
-                    AuditEvent(
-                        f"kill-{uuid4().hex}",
-                        "kill_switch.activated",
-                        KILL_SWITCH_AGGREGATE,
-                        {"reason_codes": list(ordered)},
-                        checked_at,
-                    ),
+        try:
+            if healthy:
+                self._safety.record_many((report_event,))
+            else:
+                self._safety.record_many(
+                    (
+                        report_event,
+                        SafetyEvent(
+                            f"kill-{uuid4().hex}",
+                            "kill_switch.activated",
+                            KILL_SWITCH_AGGREGATE,
+                            {"reason_codes": list(ordered)},
+                            checked_at,
+                        ),
+                    )
                 )
-            )
-        matching = [
-            row
-            for row in self._audit.event_store.stream(RECONCILIATION_AGGREGATE)
-            if row.event_id == report_id
-        ]
+            matching = [
+                row
+                for row in self._safety.stream_verified(RECONCILIATION_AGGREGATE)
+                if row.event_id == report_id
+            ]
+        except BaseException:
+            matching = []
         if len(matching) != 1:
             raise RuntimeError("reconciliation persistence could not be verified")
         return ReconciliationReport(
@@ -424,18 +490,37 @@ class Reconciler:
 
 
 def _kill_rows_active(rows: tuple[EventRecord, ...]) -> bool:
-    latest_activation = 0
-    cleared_through = 0
+    latest_activation: EventRecord | None = None
+    active = False
     for row in rows:
         if row.kind == "kill_switch.activated":
-            latest_activation = max(latest_activation, row.sequence)
+            reasons = row.payload.get("reason_codes")
+            if (
+                type(reasons) is not tuple
+                or not reasons
+                or not all(type(reason) is str and reason for reason in reasons)
+            ):
+                return True
+            latest_activation = row
+            active = True
         elif row.kind == "kill_switch.cleared":
-            value = row.payload.get("cleared_through_sequence")
-            if type(value) is int:
-                cleared_through = max(cleared_through, value)
+            activation_event_id = row.payload.get("activation_event_id")
+            activation_sequence = row.payload.get("activation_sequence")
+            if (
+                latest_activation is None
+                or type(activation_event_id) is not str
+                or not activation_event_id
+                or type(activation_sequence) is not int
+                or activation_sequence <= 0
+                or latest_activation.event_id != activation_event_id
+                or latest_activation.sequence != activation_sequence
+                or activation_sequence >= row.sequence
+            ):
+                return True
+            active = False
         else:
             return True
-    return latest_activation > cleared_through
+    return active
 
 
 def _interlock_rows_active(rows: tuple[EventRecord, ...]) -> bool:
@@ -626,9 +711,13 @@ def _nonnegative_decimal(value: object) -> Decimal:
 
 
 def _decimal_text(value: Decimal) -> str:
-    if value.is_zero():
-        return "0"
-    return format(value.normalize(), "f")
+    try:
+        result = canonical_decimal(value)
+    except CanonicalEncodingError:
+        result = None
+    if result is None:
+        raise ValueError("numeric field is malformed")
+    return result
 
 
 def _aware_utc(value: object) -> datetime:

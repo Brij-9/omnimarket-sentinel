@@ -85,6 +85,7 @@ def broker_order(record: object, *, broker: str, default_client_order_id: str = 
         record, "client_order_id", value(record, "clientOrderId", default_client_order_id)
     )
     requested = value(record, "qty", value(record, "quantity", value(record, "amount")))
+    requested_notional = value(record, "notional")
     filled = value(record, "filled_qty", value(record, "filled_quantity", value(record, "filled")))
     submitted = value(
         record, "submitted_at", value(record, "created_at", value(record, "timestamp"))
@@ -98,6 +99,9 @@ def broker_order(record: object, *, broker: str, default_client_order_id: str = 
         instrument_id=f"{_identifier(value(record, 'symbol'), 'symbol')}@{broker}",
         status=order_status(value(record, "status")),
         requested_quantity=None if requested is None else decimal(requested, positive=True),
+        requested_notional=(
+            None if requested_notional is None else decimal(requested_notional, positive=True)
+        ),
         filled_quantity=decimal(filled, nonnegative=True),
         average_fill_price=None if average is None else decimal(average, positive=True),
         submitted_at=timestamp(submitted),

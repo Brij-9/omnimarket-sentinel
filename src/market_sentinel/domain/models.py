@@ -244,6 +244,7 @@ class BrokerOrder(FrozenModel):
     instrument_id: str
     status: OrderStatus
     requested_quantity: Decimal | None
+    requested_notional: Decimal | None = None
     filled_quantity: Decimal
     average_fill_price: Decimal | None
     submitted_at: datetime

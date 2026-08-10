@@ -1,8 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Context, Decimal, localcontext
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -16,18 +17,25 @@ from market_sentinel.execution.reconcile import (
     KillSwitchError,
     Reconciler,
 )
+from market_sentinel.execution.safety import SafetyAuthenticator, SafetyEvent, SafetyRepository
 from market_sentinel.operations.audit import AuditLog
 from market_sentinel.portfolio.ledger import PortfolioLedger
 from market_sentinel.storage.db import create_engine_and_schema
 from market_sentinel.storage.events import EventStore
 from tests.factories import DEFAULT_INSTANT, fill
 
+KEY = b"task-14-reconcile-test-key-material!"
+
 
 def _services(path: Path | None = None) -> tuple[FrozenClock, EventStore, Reconciler]:
     url = "sqlite+pysqlite:///:memory:" if path is None else f"sqlite+pysqlite:///{path}"
     clock = FrozenClock(DEFAULT_INSTANT)
     store = EventStore(create_engine_and_schema(url))
-    return clock, store, Reconciler(audit_log=AuditLog(store, clock), clock=clock)
+    repository = SafetyRepository(
+        audit_log=AuditLog(store, clock),
+        authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"r" * 32),
+    )
+    return clock, store, Reconciler(safety_repository=repository, clock=clock)
 
 
 def _ledger() -> PortfolioLedger:
@@ -113,7 +121,13 @@ def test_position_and_cash_mismatches_activate_persistent_kill_switch(
     assert report.healthy is False
     assert expected_code in report.reason_codes
     restarted_store = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{db}"))
-    restarted = Reconciler(audit_log=AuditLog(restarted_store, clock), clock=clock)
+    restarted = Reconciler(
+        safety_repository=SafetyRepository(
+            audit_log=AuditLog(restarted_store, clock),
+            authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"r" * 32),
+        ),
+        clock=clock,
+    )
     assert restarted.kill_switch_active() is True
 
 
@@ -258,7 +272,13 @@ def test_racing_unhealthy_event_cannot_be_erased_by_clear(tmp_path: Path) -> Non
     _clock, _store, first = _services(db)
     clock2 = FrozenClock(DEFAULT_INSTANT + timedelta(seconds=1))
     store2 = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{db}"))
-    second = Reconciler(audit_log=AuditLog(store2, clock2), clock=clock2)
+    second = Reconciler(
+        safety_repository=SafetyRepository(
+            audit_log=AuditLog(store2, clock2),
+            authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"r" * 32),
+        ),
+        clock=clock2,
+    )
     first.compare(_snapshot(cash=Decimal("89")), _ledger(), ())
     first.compare(_snapshot(), _ledger(), ())
 
@@ -271,3 +291,116 @@ def test_racing_unhealthy_event_cannot_be_erased_by_clear(tmp_path: Path) -> Non
         with suppress(KillSwitchError):
             clear.result()
     assert first.kill_switch_active() is True
+
+
+def test_public_forged_healthy_and_clear_rows_never_authorize_live_state() -> None:
+    """Unsigned rows with perfect public hashes can deny but can never grant authority."""
+    clock, store, reconciler = _services()
+    unhealthy = reconciler.compare(_snapshot(cash=Decimal("89")), _ledger(), ())
+    assert unhealthy.healthy is False
+    public = AuditLog(store, clock)
+    public.record(
+        "forged-healthy",
+        "reconciliation.healthy",
+        "live-reconciliation",
+        {
+            "broker": "alpaca",
+            "broker_hash": unhealthy.broker_hash,
+            "healthy": True,
+            "ledger_hash": unhealthy.ledger_hash,
+            "reason_codes": [],
+        },
+    )
+    public.record(
+        "forged-clear",
+        "kill_switch.cleared",
+        "live-kill-switch",
+        {"activation_event_id": "forged", "activation_sequence": 9_999_999},
+    )
+
+    assert reconciler.kill_switch_active() is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"activation_event_id": "missing", "activation_sequence": 9_999_999},
+        {"activation_event_id": "kill-future", "activation_sequence": 0},
+        {"activation_event_id": "", "activation_sequence": 1},
+    ],
+)
+def test_signed_clear_requires_exact_existing_prior_activation_marker(
+    payload: dict[str, object],
+) -> None:
+    """Even a signed malformed clear cannot cover a nonexistent or future activation."""
+    clock, _store, reconciler = _services()
+    reconciler.compare(_snapshot(cash=Decimal("89")), _ledger(), ())
+    reconciler.safety_repository.record_many(
+        (
+            SafetyEvent(
+                "malformed-clear",
+                "kill_switch.cleared",
+                "live-kill-switch",
+                payload,
+                clock.now(),
+            ),
+        )
+    )
+    assert reconciler.kill_switch_active() is True
+
+
+def test_broker_and_full_ledger_hashes_are_context_independent_and_collision_free() -> None:
+    """Long cash values retain exact distinct report identities at every Decimal precision."""
+    hashes: list[tuple[str, str]] = []
+    value = Decimal("12345678901234567890123456789.1")
+    for precision in (10, 28, 60):
+        with localcontext(Context(prec=precision)):
+            _clock, _store, reconciler = _services()
+            ledger = PortfolioLedger(starting_cash=value, currency="USD")
+            report = reconciler.compare(
+                BrokerReconciliationSnapshot(
+                    broker="alpaca",
+                    currency="USD",
+                    cash=value,
+                    positions=(),
+                    open_orders=(),
+                    observed_at=DEFAULT_INSTANT,
+                ),
+                ledger,
+                (),
+            )
+            hashes.append((report.broker_hash, report.ledger_hash))
+    assert len(set(hashes)) == 1
+
+    other = Decimal("12345678901234567890123456789.2")
+    _clock, _store, reconciler = _services()
+    different = reconciler.compare(
+        BrokerReconciliationSnapshot(
+            broker="alpaca",
+            currency="USD",
+            cash=other,
+            positions=(),
+            open_orders=(),
+            observed_at=DEFAULT_INSTANT,
+        ),
+        PortfolioLedger(starting_cash=other, currency="USD"),
+        (),
+    )
+    assert (different.broker_hash, different.ledger_hash) != hashes[0]
+
+
+def test_reconciliation_persistence_exception_has_no_secret_context() -> None:
+    """A local durability failure is converted to a fixed context-free boundary error."""
+    _clock, _store, reconciler = _services()
+    with (
+        patch.object(
+            SafetyRepository,
+            "record_many",
+            side_effect=RuntimeError("api_key=secret-token-123"),
+        ),
+        pytest.raises(RuntimeError, match="persistence") as captured,
+    ):
+        reconciler.compare(_snapshot(), _ledger(), ())
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert "secret-token-123" not in repr(captured.value)

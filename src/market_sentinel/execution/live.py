@@ -9,11 +9,18 @@ from uuid import uuid4
 
 from sqlalchemy.exc import IntegrityError
 
-from market_sentinel.brokers.preflight import PreflightReport
+from market_sentinel.brokers.preflight import PreflightReport, required_gate_names
 from market_sentinel.domain.clock import Clock
 from market_sentinel.domain.enums import OrderStatus
-from market_sentinel.domain.models import BrokerOrder, MarketSnapshot, OrderIntent, RiskDecision
+from market_sentinel.domain.models import (
+    BrokerOrder,
+    GateResult,
+    MarketSnapshot,
+    OrderIntent,
+    RiskDecision,
+)
 from market_sentinel.execution.approval import ApprovalError, ApprovalService, OrderConfirmation
+from market_sentinel.execution.base import BrokerCapabilities
 from market_sentinel.execution.reconcile import (
     KILL_SWITCH_AGGREGATE,
     LIVE_INTERLOCK_AGGREGATE,
@@ -23,7 +30,7 @@ from market_sentinel.execution.reconcile import (
     ReconciliationReport,
     SafetyFence,
 )
-from market_sentinel.operations.audit import AuditEvent, AuditLog
+from market_sentinel.execution.safety import SafetyEvent, SafetyIntegrityError, SafetyRepository
 from market_sentinel.portfolio.ledger import PortfolioLedger
 from market_sentinel.storage.events import EventHeadConflict
 
@@ -40,6 +47,8 @@ class LiveBroker(Protocol):
 
     def preflight(self) -> PreflightReport: ...
 
+    def capabilities(self) -> BrokerCapabilities: ...
+
     def submit(self, intent: OrderIntent, snapshot: MarketSnapshot) -> BrokerOrder: ...
 
     def get_order_by_client_id(self, client_intent_id: str) -> BrokerOrder: ...
@@ -54,7 +63,7 @@ class LiveOrderService:
         broker: LiveBroker,
         approval_service: ApprovalService,
         reconciler: Reconciler,
-        audit_log: AuditLog,
+        safety_repository: SafetyRepository,
         clock: Clock,
         ledger: PortfolioLedger,
     ) -> None:
@@ -62,10 +71,15 @@ class LiveOrderService:
             raise ValueError("live execution requires the exact approval service")
         if type(reconciler) is not Reconciler:
             raise ValueError("live execution requires the exact reconciler")
-        if type(audit_log) is not AuditLog:
-            raise ValueError("live execution durability requires an exact AuditLog")
-        if audit_log.event_store is not reconciler.audit_log.event_store:
-            raise ValueError("live execution and reconciliation must share one EventStore")
+        if type(safety_repository) is not SafetyRepository:
+            raise ValueError("live execution requires an authenticated safety repository")
+        if (
+            safety_repository.event_store_identity
+            is not reconciler.safety_repository.event_store_identity
+            or safety_repository.event_store_identity
+            is not approval_service.safety_repository.event_store_identity
+        ):
+            raise ValueError("live safety services must share one EventStore")
         if type(ledger) is not PortfolioLedger:
             raise ValueError("live execution requires an exact PortfolioLedger")
         broker_name = getattr(broker, "broker_name", None)
@@ -74,7 +88,7 @@ class LiveOrderService:
         self._broker = broker
         self._approval = approval_service
         self._reconciler = reconciler
-        self._audit = audit_log
+        self._safety = safety_repository
         self._clock = clock
         self._ledger = ledger
         self._broker_name = broker_name
@@ -91,6 +105,7 @@ class LiveOrderService:
     ) -> BrokerOrder:
         """Submit once after gates, atomically claimed confirmation, and start audit."""
         self._require_preflight(preflight)
+        self._require_capabilities(intent)
         instant = _aware_utc(self._clock.now())
         self._require_risk(intent, risk_decision, instant)
         try:
@@ -100,13 +115,13 @@ class LiveOrderService:
                 ledger=self._ledger,
             )
         except BaseException:
-            raise LiveOrderError("RECONCILIATION_NOT_CURRENT") from None
+            current = False
         if not current:
             raise LiveOrderError("RECONCILIATION_NOT_CURRENT")
         try:
             kill_switch_active = self._reconciler.kill_switch_active()
         except BaseException:
-            raise LiveOrderError("KILL_SWITCH_ACTIVE") from None
+            kill_switch_active = True
         if kill_switch_active:
             raise LiveOrderError("KILL_SWITCH_ACTIVE")
         try:
@@ -117,7 +132,11 @@ class LiveOrderService:
                 broker=self._broker_name,
             )
         except (ApprovalError, TypeError, ValueError):
-            raise LiveOrderError("CONFIRMATION_INVALID") from None
+            confirmation_valid = False
+        else:
+            confirmation_valid = True
+        if not confirmation_valid:
+            raise LiveOrderError("CONFIRMATION_INVALID")
         self._require_snapshot(intent, snapshot, instant)
         try:
             fence = self._reconciler.safety_fence(
@@ -126,9 +145,15 @@ class LiveOrderService:
                 ledger=self._ledger,
             )
         except KillSwitchError:
-            raise LiveOrderError("SAFETY_STATE_CHANGED") from None
+            fence = None
+            fence_reason = "SAFETY_STATE_CHANGED"
         except BaseException:
-            raise LiveOrderError("AUDIT_PERSISTENCE_FAILED") from None
+            fence = None
+            fence_reason = "AUDIT_PERSISTENCE_FAILED"
+        else:
+            fence_reason = ""
+        if fence is None:
+            raise LiveOrderError(fence_reason)
         claim_instant = _aware_utc(self._clock.now())
         self._require_risk(intent, risk_decision, claim_instant)
         try:
@@ -139,7 +164,11 @@ class LiveOrderService:
                 broker=self._broker_name,
             )
         except (ApprovalError, TypeError, ValueError):
-            raise LiveOrderError("CONFIRMATION_INVALID") from None
+            confirmation_valid = False
+        else:
+            confirmation_valid = True
+        if not confirmation_valid:
+            raise LiveOrderError("CONFIRMATION_INVALID")
         self._require_snapshot(intent, snapshot, claim_instant)
         self._claim_and_start(intent, confirmation, claim_instant, fence)
 
@@ -164,9 +193,9 @@ class LiveOrderService:
         try:
             acknowledged_at = _aware_utc(self._clock.now())
             nonce = uuid4().hex
-            self._audit.record_many(
+            self._safety.record_many(
                 (
-                    AuditEvent(
+                    SafetyEvent(
                         f"live-ack-{nonce}",
                         "live.acknowledged",
                         intent.intent_id,
@@ -178,7 +207,7 @@ class LiveOrderService:
                         },
                         acknowledged_at,
                     ),
-                    AuditEvent(
+                    SafetyEvent(
                         f"interlock-ack-{nonce}",
                         "live.interlock_resolved",
                         LIVE_INTERLOCK_AGGREGATE,
@@ -191,6 +220,10 @@ class LiveOrderService:
                 )
             )
         except BaseException:
+            acknowledgement_persisted = False
+        else:
+            acknowledgement_persisted = True
+        if not acknowledgement_persisted:
             self._persist_unknown(intent.intent_id, confirmation.confirmation_id)
             raise LiveOrderError("SUBMISSION_UNKNOWN") from None
         return submitted
@@ -199,11 +232,23 @@ class LiveOrderService:
         try:
             fresh = self._broker.preflight()
         except BaseException:
-            raise LiveOrderError("PREFLIGHT_NOT_READY") from None
+            fresh = None
         if type(report) is not PreflightReport or type(fresh) is not PreflightReport:
             raise LiveOrderError("PREFLIGHT_NOT_READY")
         if not _valid_preflight(fresh, self._broker_name) or report != fresh:
             raise LiveOrderError("PREFLIGHT_NOT_READY")
+
+    def _require_capabilities(self, intent: OrderIntent) -> None:
+        try:
+            capabilities = self._broker.capabilities()
+        except BaseException:
+            capabilities = None
+        if (
+            type(capabilities) is not BrokerCapabilities
+            or capabilities.broker != self._broker_name
+            or (intent.notional is not None and not capabilities.supports_notional_orders)
+        ):
+            raise LiveOrderError("ORDER_UNSUPPORTED")
 
     def _require_risk(
         self,
@@ -219,7 +264,12 @@ class LiveOrderService:
             intent_created = _aware_utc(intent.created_at)
             intent_expires = _aware_utc(intent.expires_at)
         except (TypeError, ValueError):
-            raise LiveOrderError("RISK_NOT_APPROVED") from None
+            timestamps = None
+        else:
+            timestamps = (decided_at, expires_at, intent_created, intent_expires)
+        if timestamps is None:
+            raise LiveOrderError("RISK_NOT_APPROVED")
+        decided_at, expires_at, intent_created, intent_expires = timestamps
         if (
             decided_at > now
             or expires_at <= now
@@ -257,7 +307,12 @@ class LiveOrderService:
             observed_at = _aware_utc(snapshot.observed_at)
             source_at = _aware_utc(snapshot.source_at)
         except (TypeError, ValueError):
-            raise LiveOrderError("SNAPSHOT_INVALID") from None
+            timestamps = None
+        else:
+            timestamps = (observed_at, source_at)
+        if timestamps is None:
+            raise LiveOrderError("SNAPSHOT_INVALID")
+        observed_at, source_at = timestamps
         if (
             type(snapshot.max_age_seconds) is not int
             or snapshot.max_age_seconds < 0
@@ -279,9 +334,21 @@ class LiveOrderService:
         claim_event_id = f"live-confirmation-{confirmation.confirmation_id}"
         nonce = uuid4().hex
         try:
-            self._audit.record_many_if_heads(
+            confirmation_rows = self._safety.stream_verified(confirmation_aggregate)
+        except SafetyIntegrityError:
+            confirmation_rows = ()
+        if (
+            len(confirmation_rows) > 1
+            and confirmation_rows[-1].kind == "live.confirmation_consumed"
+        ):
+            raise LiveOrderError("CONFIRMATION_USED")
+        if len(confirmation_rows) != 1 or confirmation_rows[0].kind != "confirmation.issued":
+            raise LiveOrderError("CONFIRMATION_INVALID")
+        issuance_head = confirmation_rows[0].event_id
+        try:
+            self._safety.record_many_if_heads(
                 (
-                    AuditEvent(
+                    SafetyEvent(
                         f"live-claim-audit-{nonce}",
                         "live.confirmation_claimed",
                         intent.intent_id,
@@ -292,14 +359,14 @@ class LiveOrderService:
                         },
                         instant,
                     ),
-                    AuditEvent(
+                    SafetyEvent(
                         claim_event_id,
                         "live.confirmation_consumed",
                         confirmation_aggregate,
                         {"intent_id": intent.intent_id},
                         instant,
                     ),
-                    AuditEvent(
+                    SafetyEvent(
                         f"live-start-{nonce}",
                         "live.submission_started",
                         intent.intent_id,
@@ -309,7 +376,7 @@ class LiveOrderService:
                         },
                         instant,
                     ),
-                    AuditEvent(
+                    SafetyEvent(
                         f"interlock-start-{nonce}",
                         "live.interlock_started",
                         LIVE_INTERLOCK_AGGREGATE,
@@ -324,25 +391,34 @@ class LiveOrderService:
                     RECONCILIATION_AGGREGATE: fence.reconciliation_head,
                     KILL_SWITCH_AGGREGATE: fence.kill_switch_head,
                     LIVE_INTERLOCK_AGGREGATE: fence.interlock_head,
-                    confirmation_aggregate: None,
+                    confirmation_aggregate: issuance_head,
                 },
             )
         except EventHeadConflict:
-            if tuple(self._audit.event_store.stream(confirmation_aggregate)):
-                raise LiveOrderError("CONFIRMATION_USED") from None
-            raise LiveOrderError("SAFETY_STATE_CHANGED") from None
+            failure = "conflict"
         except IntegrityError:
-            if tuple(self._audit.event_store.stream(confirmation_aggregate)):
-                raise LiveOrderError("CONFIRMATION_USED") from None
-            raise LiveOrderError("AUDIT_PERSISTENCE_FAILED") from None
+            failure = "persistence"
         except BaseException:
-            raise LiveOrderError("AUDIT_PERSISTENCE_FAILED") from None
+            failure = "persistence"
+        else:
+            failure = ""
+        if not failure:
+            return
+        try:
+            after = self._safety.stream_verified(confirmation_aggregate)
+        except SafetyIntegrityError:
+            after = ()
+        if len(after) > 1 and after[-1].kind == "live.confirmation_consumed":
+            raise LiveOrderError("CONFIRMATION_USED")
+        if failure == "conflict":
+            raise LiveOrderError("SAFETY_STATE_CHANGED")
+        raise LiveOrderError("AUDIT_PERSISTENCE_FAILED")
 
     def _query_ambiguous(self, intent: OrderIntent) -> BrokerOrder | None:
         try:
             candidate = self._broker.get_order_by_client_id(intent.intent_id)
         except BaseException:
-            return None
+            candidate = None
         if not _valid_acknowledgement(
             candidate,
             intent,
@@ -356,7 +432,11 @@ class LiveOrderService:
         try:
             self._reconciler.record_submission_unknown(intent_id, submission_id)
         except BaseException:
-            raise LiveOrderError("UNKNOWN_PERSISTENCE_FAILED") from None
+            persisted = False
+        else:
+            persisted = True
+        if not persisted:
+            raise LiveOrderError("UNKNOWN_PERSISTENCE_FAILED")
 
 
 def _valid_acknowledgement(
@@ -372,40 +452,68 @@ def _valid_acknowledgement(
         updated_at = _aware_utc(order.updated_at)
         filled = order.filled_quantity
         requested = order.requested_quantity
+        requested_notional = order.requested_notional
         average = order.average_fill_price
+        if (
+            type(order.order_id) is not str
+            or not order.order_id
+            or type(order.client_order_id) is not str
+            or order.client_order_id != intent.intent_id
+            or type(order.broker) is not str
+            or order.broker != broker
+            or type(order.instrument_id) is not str
+            or order.instrument_id != intent.instrument_id
+            or type(order.status) is not OrderStatus
+            or type(filled) is not Decimal
+            or not filled.is_finite()
+            or filled < 0
+            or (average is not None and not _positive_decimal(average))
+        ):
+            return False
+        if intent.quantity is not None:
+            if (
+                type(requested) is not Decimal
+                or not requested.is_finite()
+                or requested <= 0
+                or requested != intent.quantity
+                or requested_notional is not None
+                or filled > requested
+            ):
+                return False
+        elif (
+            intent.notional is None
+            or requested is not None
+            or type(requested_notional) is not Decimal
+            or not requested_notional.is_finite()
+            or requested_notional <= 0
+            or requested_notional != intent.notional
+        ):
+            return False
         status_consistent = (
-            (order.status is OrderStatus.ACKNOWLEDGED and filled == 0 and average is None)
+            (
+                order.status is OrderStatus.ACKNOWLEDGED
+                and filled == Decimal("0")
+                and average is None
+            )
             or (
                 order.status is OrderStatus.PARTIALLY_FILLED
-                and type(filled) is Decimal
                 and filled > 0
                 and average is not None
-                and (requested is None or filled < requested)
+                and type(requested) is Decimal
+                and filled < requested
             )
             or (
                 order.status is OrderStatus.FILLED
-                and type(filled) is Decimal
                 and filled > 0
                 and average is not None
-                and (requested is None or filled == requested)
+                and type(requested) is Decimal
+                and filled == requested
             )
         )
         return (
-            type(order.order_id) is str
-            and bool(order.order_id)
-            and order.client_order_id == intent.intent_id
-            and order.broker == broker
-            and order.instrument_id == intent.instrument_id
-            and type(order.status) is OrderStatus
-            and order.status
+            order.status
             in {OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED}
             and status_consistent
-            and requested == intent.quantity
-            and type(filled) is Decimal
-            and filled.is_finite()
-            and filled >= 0
-            and (requested is None or filled <= requested)
-            and (average is None or _positive_decimal(average))
             and (filled == 0 or average is not None)
             and intent.created_at <= submitted_at <= updated_at <= now
         )
@@ -420,16 +528,18 @@ def _valid_preflight(report: PreflightReport, broker: str) -> bool:
         names: set[str] = set()
         for gate in report.gates:
             if (
-                type(gate.name) is not str
+                type(gate) is not GateResult
+                or type(gate.name) is not str
                 or not gate.name
                 or gate.name in names
                 or type(gate.passed) is not bool
                 or type(gate.reason_code) is not str
                 or not gate.reason_code
+                or (gate.passed and gate.reason_code != "OK")
             ):
                 return False
             names.add(gate.name)
-        return report.ready
+        return names == required_gate_names(broker) and report.ready
     except (AttributeError, TypeError, ValueError):
         return False
 

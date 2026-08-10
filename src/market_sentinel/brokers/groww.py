@@ -125,43 +125,32 @@ class GrowwBroker:
                 bool(s.groww_access_token) or bool(s.groww_api_key and s.groww_secret_key),
             ),
         ]
-        if not all(item.passed for item in local):
-            local.extend(
-                [
-                    gate("GROWW_AUTH_SESSION_FRESH", False, "AUTH_NOT_ATTEMPTED"),
-                    gate("GROWW_READ_ONLY_PROFILE_ACCESS", False, "PROFILE_UNAVAILABLE"),
-                ]
-            )
-            return PreflightReport(self.broker_name, tuple(local))
-        try:
-            now = self._now()
-            session = self._authenticated_session(now)
-            fresh = _is_fresh(session.expires_at, now)
-            local.append(gate("GROWW_AUTH_SESSION_FRESH", fresh))
-            if not fresh:
-                return PreflightReport(self.broker_name, tuple(local))
-            profile = self._call(session.client.profile)
-            capabilities = self._call(session.client.capabilities)
-            local.extend(
-                [
-                    gate("GROWW_PROFILE_ACTIVE", value(profile, "active") is True),
-                    gate(
-                        "GROWW_REGULAR_SESSION_SUPPORTED",
-                        value(capabilities, "regular_session") is True,
-                    ),
-                    gate(
-                        "GROWW_PROTECTED_ORDERS_SUPPORTED",
-                        value(capabilities, "protected_orders") is True,
-                    ),
-                ]
-            )
-        except RuntimeError:
-            local.extend(
-                [
-                    gate("GROWW_AUTH_SESSION_FRESH", False, "AUTH_UNAVAILABLE"),
-                    gate("GROWW_READ_ONLY_PROFILE_ACCESS", False, "PROFILE_UNAVAILABLE"),
-                ]
-            )
+        fresh = profile_access = profile_active = regular = protected = False
+        reason = "AUTH_NOT_ATTEMPTED"
+        if all(item.passed for item in local):
+            try:
+                now = self._now()
+                session = self._authenticated_session(now)
+                fresh = _is_fresh(session.expires_at, now)
+                reason = "AUTH_STALE"
+                if fresh:
+                    profile = self._call(session.client.profile)
+                    capabilities = self._call(session.client.capabilities)
+                    profile_access = True
+                    profile_active = value(profile, "active") is True
+                    regular = value(capabilities, "regular_session") is True
+                    protected = value(capabilities, "protected_orders") is True
+            except RuntimeError:
+                reason = "AUTH_UNAVAILABLE"
+        local.extend(
+            [
+                gate("GROWW_AUTH_SESSION_FRESH", fresh, reason),
+                gate("GROWW_READ_ONLY_PROFILE_ACCESS", profile_access, "PROFILE_UNAVAILABLE"),
+                gate("GROWW_PROFILE_ACTIVE", profile_active, "PROFILE_INACTIVE"),
+                gate("GROWW_REGULAR_SESSION_SUPPORTED", regular, "SESSION_UNSUPPORTED"),
+                gate("GROWW_PROTECTED_ORDERS_SUPPORTED", protected, "ORDERS_UNSUPPORTED"),
+            ]
+        )
         return PreflightReport(self.broker_name, tuple(local))
 
     def submit(self, intent: OrderIntent, snapshot: MarketSnapshot) -> BrokerOrder:

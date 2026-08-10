@@ -3,8 +3,72 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Final
 
 from market_sentinel.domain import GateResult
+
+REQUIRED_PREFLIGHT_GATES: Final = MappingProxyType(
+    {
+        "alpaca": frozenset(
+            {
+                "MARKET_SENTINEL_MODE",
+                "ALPACA_LIVE_TRADING_ENABLED",
+                "ALPACA_REAL_API_ENABLED",
+                "ALPACA_LIVE_ENDPOINT",
+                "ALPACA_ACCOUNT_ID_PRESENT",
+                "ALPACA_LOCAL_CREDENTIALS_PRESENT",
+                "ALPACA_ACCOUNT_ID_MATCHED",
+                "ALPACA_ACCOUNT_ACTIVE",
+                "ALPACA_ACCOUNT_UNBLOCKED",
+                "ALPACA_SUFFICIENT_BUYING_POWER",
+            }
+        ),
+        "groww": frozenset(
+            {
+                "GROWW_PRIMARY_BROKER",
+                "MARKET_SENTINEL_MODE",
+                "INDIA_LIVE_TRADING_ENABLED",
+                "INDIA_ALGO_COMPLIANCE_VERIFIED",
+                "GROWW_REAL_API_ENABLED",
+                "GROWW_API_SUBSCRIPTION_ACTIVE",
+                "GROWW_PROTECTED_ORDER_CLIENT",
+                "GROWW_STATIC_OUTBOUND_IPV4",
+                "GROWW_STATIC_IP_ALLOWLISTED",
+                "GROWW_BROKER_APPROVED_ALGO_ID",
+                "GROWW_LOCAL_CREDENTIALS_PRESENT",
+                "GROWW_AUTH_SESSION_FRESH",
+                "GROWW_READ_ONLY_PROFILE_ACCESS",
+                "GROWW_PROFILE_ACTIVE",
+                "GROWW_REGULAR_SESSION_SUPPORTED",
+                "GROWW_PROTECTED_ORDERS_SUPPORTED",
+            }
+        ),
+        "ccxt-spot": frozenset(
+            {
+                "MARKET_SENTINEL_MODE",
+                "CCXT_LIVE_TRADING_ENABLED",
+                "CCXT_REAL_API_ENABLED",
+                "CCXT_EXCHANGE_ID_CONFIGURED",
+                "CCXT_SPOT_ONLY",
+                "CCXT_LOCAL_CREDENTIALS_PRESENT",
+                "CCXT_WITHDRAWALS_DISABLED_CONFIRMED",
+                "CCXT_IP_RESTRICTED_CONFIRMED",
+                "CCXT_NO_SANDBOX_ACKNOWLEDGED",
+                "CCXT_EXCHANGE_CONFIGURED",
+                "CCXT_SPOT_MARKETS_AVAILABLE",
+                "CCXT_CREATE_ORDER_SUPPORTED",
+            }
+        ),
+    }
+)
+
+
+def required_gate_names(broker: object) -> frozenset[str]:
+    """Return the immutable exact readiness manifest for one known live adapter."""
+    if type(broker) is not str or broker not in REQUIRED_PREFLIGHT_GATES:
+        raise ValueError("unknown live broker preflight manifest")
+    return REQUIRED_PREFLIGHT_GATES[broker]
 
 
 @dataclass(frozen=True, slots=True)

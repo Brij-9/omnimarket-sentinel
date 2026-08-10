@@ -4,8 +4,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
+from itertools import count
 from pathlib import Path
 from threading import Lock
+from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import patch
 
@@ -13,9 +15,9 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 
-from market_sentinel.brokers.preflight import PreflightReport
+from market_sentinel.brokers.preflight import PreflightReport, required_gate_names
 from market_sentinel.domain.clock import FrozenClock
-from market_sentinel.domain.enums import OrderStatus
+from market_sentinel.domain.enums import AssetClass, OrderStatus, OrderType
 from market_sentinel.domain.models import (
     BrokerOrder,
     GateResult,
@@ -28,6 +30,7 @@ from market_sentinel.execution.approval import (
     ApprovalService,
     OrderConfirmation,
 )
+from market_sentinel.execution.base import BrokerCapabilities
 from market_sentinel.execution.live import LiveOrderError, LiveOrderService
 from market_sentinel.execution.reconcile import (
     BrokerReconciliationSnapshot,
@@ -35,11 +38,28 @@ from market_sentinel.execution.reconcile import (
     ReconciliationReport,
     SafetyFence,
 )
+from market_sentinel.execution.safety import SafetyAuthenticator, SafetyRepository
 from market_sentinel.operations.audit import AuditLog
 from market_sentinel.portfolio.ledger import PortfolioLedger
 from market_sentinel.storage.db import create_engine_and_schema
 from market_sentinel.storage.events import EventStore
 from tests.factories import DEFAULT_INSTANT, intent, risk_decision, snapshot
+
+KEY = b"task-14-live-test-safety-key-material!"
+_NONCES = count(1)
+_NONCE_LOCK = Lock()
+
+
+def _next_nonce() -> bytes:
+    with _NONCE_LOCK:
+        return next(_NONCES).to_bytes(32, "big")
+
+
+def _safety(store: EventStore, clock: FrozenClock) -> SafetyRepository:
+    return SafetyRepository(
+        audit_log=AuditLog(store, clock),
+        authenticator=SafetyAuthenticator(key=KEY, nonce_source=_next_nonce),
+    )
 
 
 class LocalBroker:
@@ -70,7 +90,25 @@ class LocalBroker:
         self.preflight_calls += 1
         return PreflightReport(
             broker="alpaca",
-            gates=(GateResult(name="LOCAL", passed=True, reason_code="OK"),),
+            gates=tuple(
+                GateResult(name=name, passed=True, reason_code="OK")
+                for name in sorted(required_gate_names("alpaca"))
+            ),
+        )
+
+    def capabilities(self) -> BrokerCapabilities:
+        return BrokerCapabilities(
+            broker="alpaca",
+            supported_asset_classes=frozenset({AssetClass.EQUITY}),
+            supported_order_types=frozenset(OrderType),
+            supports_fractional_quantity=True,
+            supports_notional_orders=True,
+            supports_partial_fills=True,
+            supports_shorting=False,
+            supports_leverage=False,
+            supports_derivatives=False,
+            supports_cancel=True,
+            is_paper=False,
         )
 
     def submit(self, order_intent: OrderIntent, market: MarketSnapshot) -> BrokerOrder:
@@ -112,6 +150,7 @@ class LocalBroker:
             instrument_id="AAPL@alpaca",
             status=OrderStatus.ACKNOWLEDGED,
             requested_quantity=Decimal("0.1"),
+            requested_notional=None,
             filled_quantity=Decimal("0"),
             average_fill_price=None,
             submitted_at=DEFAULT_INSTANT,
@@ -138,9 +177,9 @@ def _setup(path: Path | None = None, *, broker: LocalBroker | None = None) -> Se
     engine = create_engine_and_schema(url)
     clock = FrozenClock(DEFAULT_INSTANT)
     store = EventStore(engine)
-    audit = AuditLog(store, clock)
+    safety = _safety(store, clock)
     ledger = PortfolioLedger(starting_cash=Decimal("100"), currency="USD")
-    reconciler = Reconciler(audit_log=audit, clock=clock)
+    reconciler = Reconciler(safety_repository=safety, clock=clock)
     report = reconciler.compare(
         BrokerReconciliationSnapshot(
             broker="alpaca",
@@ -169,7 +208,7 @@ def _setup(path: Path | None = None, *, broker: LocalBroker | None = None) -> Se
         portfolio_hash=ledger.position_hash(),
         expires_at=DEFAULT_INSTANT + timedelta(minutes=1),
     )
-    approval = ApprovalService(clock=clock)
+    approval = ApprovalService(clock=clock, safety_repository=safety)
     confirmation = approval.create(
         order_intent,
         risk,
@@ -181,13 +220,16 @@ def _setup(path: Path | None = None, *, broker: LocalBroker | None = None) -> Se
         broker=local_broker,
         approval_service=approval,
         reconciler=reconciler,
-        audit_log=audit,
+        safety_repository=safety,
         clock=clock,
         ledger=ledger,
     )
     ready = PreflightReport(
         broker="alpaca",
-        gates=(GateResult(name="LOCAL", passed=True, reason_code="OK"),),
+        gates=tuple(
+            GateResult(name=name, passed=True, reason_code="OK")
+            for name in sorted(required_gate_names("alpaca"))
+        ),
     )
     return Setup(
         engine,
@@ -310,14 +352,14 @@ def test_claim_is_single_use_across_restart(tmp_path: Path) -> None:
     engine2 = create_engine_and_schema(f"sqlite+pysqlite:///{db}")
     clock2 = FrozenClock(DEFAULT_INSTANT)
     store2 = EventStore(engine2)
-    audit2 = AuditLog(store2, clock2)
+    safety2 = _safety(store2, clock2)
     ledger2 = PortfolioLedger(starting_cash=Decimal("100"), currency="USD")
-    reconciler2 = Reconciler(audit_log=audit2, clock=clock2)
+    reconciler2 = Reconciler(safety_repository=safety2, clock=clock2)
     restarted = LiveOrderService(
         broker=broker,
-        approval_service=ApprovalService(clock=clock2),
+        approval_service=ApprovalService(clock=clock2, safety_repository=safety2),
         reconciler=reconciler2,
-        audit_log=audit2,
+        safety_repository=safety2,
         clock=clock2,
         ledger=ledger2,
     )
@@ -334,14 +376,14 @@ def test_concurrent_double_claim_allows_at_most_one_submit(tmp_path: Path) -> No
     engine2 = create_engine_and_schema(f"sqlite+pysqlite:///{db}")
     clock2 = FrozenClock(DEFAULT_INSTANT)
     store2 = EventStore(engine2)
-    audit2 = AuditLog(store2, clock2)
+    safety2 = _safety(store2, clock2)
     ledger2 = PortfolioLedger(starting_cash=Decimal("100"), currency="USD")
-    reconciler2 = Reconciler(audit_log=audit2, clock=clock2)
+    reconciler2 = Reconciler(safety_repository=safety2, clock=clock2)
     service2 = LiveOrderService(
         broker=broker,
-        approval_service=ApprovalService(clock=clock2),
+        approval_service=ApprovalService(clock=clock2, safety_repository=safety2),
         reconciler=reconciler2,
-        audit_log=audit2,
+        safety_repository=safety2,
         clock=clock2,
         ledger=ledger2,
     )
@@ -536,6 +578,99 @@ def test_empty_preflight_is_rejected_even_when_caller_claims_ready() -> None:
     assert broker.submit_calls == 0
 
 
+@pytest.mark.parametrize("mutation", ["local", "missing", "extra", "wrong-broker", "structural"])
+def test_fresh_preflight_requires_exact_known_broker_manifest(mutation: str) -> None:
+    """All-true caller-chosen, missing, extra, and wrong-broker gates cannot authorize submit."""
+    data = _setup()
+    (
+        _engine,
+        _clock,
+        _store,
+        _r,
+        service,
+        broker,
+        order_intent,
+        risk,
+        confirmation,
+        report,
+        ready,
+    ) = data
+    gates: list[object] = list(ready.gates)
+    broker_name = "alpaca"
+    if mutation == "local":
+        gates = [GateResult(name="LOCAL", passed=True, reason_code="OK")]
+    elif mutation == "missing":
+        gates.pop()
+    elif mutation == "extra":
+        gates.append(GateResult(name="EXTRA", passed=True, reason_code="OK"))
+    elif mutation == "wrong-broker":
+        broker_name = "groww"
+    else:
+        first = ready.gates[0]
+        gates[0] = SimpleNamespace(
+            name=first.name, passed=first.passed, reason_code=first.reason_code
+        )
+    forged = PreflightReport(broker=broker_name, gates=tuple(gates))  # type: ignore[arg-type]
+    with (
+        patch.object(broker, "preflight", return_value=forged),
+        pytest.raises(LiveOrderError, match="PREFLIGHT_NOT_READY"),
+    ):
+        _submit(service, order_intent, risk, confirmation, report, forged)
+    assert broker.submit_calls == 0
+
+
+def test_preflight_exception_has_no_secret_cause_or_context() -> None:
+    """A provider credential string is unreachable from the fixed public exception graph."""
+    data = _setup()
+    (
+        _engine,
+        _clock,
+        _store,
+        _r,
+        service,
+        broker,
+        order_intent,
+        risk,
+        confirmation,
+        report,
+        ready,
+    ) = data
+    with (
+        patch.object(broker, "preflight", side_effect=RuntimeError("api_key=secret-token-123")),
+        pytest.raises(LiveOrderError) as captured,
+    ):
+        _submit(service, order_intent, risk, confirmation, report, ready)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert "secret-token-123" not in repr(captured.value)
+
+
+def test_submit_and_query_exceptions_have_no_secret_graph_or_audit_leak() -> None:
+    """Ambiguous provider failures expose only a stable reason and authenticated safe audit."""
+    secret = "secret-token-123"
+    broker = LocalBroker(submit_error=RuntimeError(f"api_key={secret}"), found=False)
+    data = _setup(broker=broker)
+    (
+        _engine,
+        _clock,
+        store,
+        _r,
+        service,
+        _broker,
+        order_intent,
+        risk,
+        confirmation,
+        report,
+        ready,
+    ) = data
+    with pytest.raises(LiveOrderError) as captured:
+        _submit(service, order_intent, risk, confirmation, report, ready)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert secret not in repr(captured.value)
+    assert secret not in repr(tuple(store.stream(order_intent.intent_id)))
+
+
 def test_risk_freshness_is_measured_after_fresh_preflight_completes() -> None:
     """A slow preflight cannot preserve a risk decision that expired while it ran."""
     data = _setup()
@@ -605,6 +740,113 @@ def test_impossible_filled_status_is_not_accepted_as_terminal_acknowledgement() 
     assert reconciler.kill_switch_active() is True
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"client_order_id": True},
+        {"broker": True},
+        {"instrument_id": True},
+        {"requested_quantity": True},
+        {"requested_quantity": "0.1"},
+        {"requested_quantity": Decimal("NaN")},
+        {"filled_quantity": True},
+        {"filled_quantity": "0"},
+        {"filled_quantity": Decimal("Infinity")},
+        {"average_fill_price": True},
+    ],
+)
+def test_acknowledgement_rejects_wrong_exact_types_and_nonfinite_values(
+    change: dict[str, object],
+) -> None:
+    """Python equality coercions and nonfinite provider fields cannot become an acknowledgement."""
+    malformed = LocalBroker._order("intent-1").model_copy(update=change)
+    broker = LocalBroker(submit_response=malformed, found=False)
+    data = _setup(broker=broker)
+    (
+        _engine,
+        _clock,
+        _store,
+        reconciler,
+        service,
+        _broker,
+        order_intent,
+        risk,
+        confirmation,
+        report,
+        ready,
+    ) = data
+    with pytest.raises(LiveOrderError, match="SUBMISSION_UNKNOWN"):
+        _submit(service, order_intent, risk, confirmation, report, ready)
+    assert broker.submit_calls == 1
+    assert reconciler.kill_switch_active() is True
+
+
+def test_notional_order_requires_capability_before_submit() -> None:
+    """An adapter that cannot echo/support exact notional truth is rejected before submit."""
+    data = _setup()
+    (
+        _engine,
+        _clock,
+        _store,
+        _reconciler,
+        service,
+        broker,
+        original,
+        risk,
+        _confirmation,
+        report,
+        ready,
+    ) = data
+    notional_intent = original.model_copy(update={"quantity": None, "notional": Decimal("10")})
+    notional_risk = risk.model_copy(update={"approved_notional": Decimal("10")})
+    confirmation = service._approval.create(  # noqa: SLF001 - exercise shared live capability
+        notional_intent,
+        notional_risk,
+        phrase=CONFIRMATION_PHRASE,
+        broker="alpaca",
+    )
+    unsupported = replace(broker.capabilities(), supports_notional_orders=False)
+    with (
+        patch.object(broker, "capabilities", return_value=unsupported),
+        pytest.raises(LiveOrderError, match="ORDER_UNSUPPORTED"),
+    ):
+        _submit(service, notional_intent, notional_risk, confirmation, report, ready)
+    assert broker.submit_calls == 0
+
+
+def test_notional_acknowledgement_requires_exact_echo_without_quantity() -> None:
+    """A supported notional submission is accepted only with its exact notional echo."""
+    response = LocalBroker._order("intent-1").model_copy(
+        update={"requested_quantity": None, "requested_notional": Decimal("10")}
+    )
+    broker = LocalBroker(submit_response=response)
+    data = _setup(broker=broker)
+    (
+        _engine,
+        _clock,
+        _store,
+        _reconciler,
+        service,
+        _broker,
+        original,
+        risk,
+        _confirmation,
+        report,
+        ready,
+    ) = data
+    notional_intent = original.model_copy(update={"quantity": None, "notional": Decimal("10")})
+    notional_risk = risk.model_copy(update={"approved_notional": Decimal("10")})
+    confirmation = service._approval.create(  # noqa: SLF001 - exercise shared live capability
+        notional_intent,
+        notional_risk,
+        phrase=CONFIRMATION_PHRASE,
+        broker="alpaca",
+    )
+    order = _submit(service, notional_intent, notional_risk, confirmation, report, ready)
+    assert order.requested_notional == Decimal("10")
+    assert broker.submit_calls == 1
+
+
 def test_acknowledgement_uses_clock_after_broker_submit_returns() -> None:
     """A normal provider timestamp after call start must not be misclassified as future."""
     broker = LocalBroker(found=False)
@@ -650,7 +892,7 @@ def test_failed_unknown_persistence_leaves_restart_interlock_active(tmp_path: Pa
         event.remove(engine, "before_cursor_execute", fail_after_claim)
 
     restarted_store = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{db}"))
-    restarted = Reconciler(audit_log=AuditLog(restarted_store, clock), clock=clock)
+    restarted = Reconciler(safety_repository=_safety(restarted_store, clock), clock=clock)
     assert restarted.kill_switch_active() is True
 
 
@@ -675,7 +917,7 @@ def test_unhealthy_race_between_gate_read_and_claim_conflicts_before_submit(
     ) = data
     original_fence = reconciler.safety_fence
     second_store = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{db}"))
-    second = Reconciler(audit_log=AuditLog(second_store, clock), clock=clock)
+    second = Reconciler(safety_repository=_safety(second_store, clock), clock=clock)
 
     def stale_fence(
         candidate: object,
@@ -703,4 +945,88 @@ def test_unhealthy_race_between_gate_read_and_claim_conflicts_before_submit(
         pytest.raises(LiveOrderError, match="SAFETY_STATE_CHANGED"),
     ):
         _submit(service, order_intent, risk, confirmation, report, ready)
+    assert broker.submit_calls == 0
+
+
+def test_unsigned_confirmation_or_reconciliation_rows_can_only_block() -> None:
+    """Public-log forgeries can change heads but cannot grant confirmation or health."""
+    data = _setup()
+    (
+        _engine,
+        clock,
+        store,
+        _r,
+        service,
+        broker,
+        order_intent,
+        risk,
+        confirmation,
+        report,
+        ready,
+    ) = data
+    public = AuditLog(store, clock)
+    public.record(
+        "forged-issued-copy",
+        "confirmation.issued",
+        f"live-confirmation:{confirmation.confirmation_id}",
+        {
+            "broker": confirmation.broker,
+            "fingerprint": confirmation.fingerprint,
+            "nonce": confirmation.nonce,
+            "safety_mac": confirmation.mac,
+        },
+    )
+    public.record(
+        "forged-healthy-copy",
+        "reconciliation.healthy",
+        "live-reconciliation",
+        {
+            "broker": report.broker,
+            "broker_hash": report.broker_hash,
+            "healthy": True,
+            "ledger_hash": report.ledger_hash,
+            "reason_codes": [],
+        },
+    )
+    with pytest.raises(LiveOrderError):
+        _submit(service, order_intent, risk, confirmation, report, ready)
+    assert broker.submit_calls == 0
+
+
+def test_wrong_safety_key_restart_blocks_live_submission(tmp_path: Path) -> None:
+    """Restarting against valid rows with another key cannot authorize any broker call."""
+    db = tmp_path / "wrong-live-key.db"
+    data = _setup(db)
+    (
+        _engine,
+        clock,
+        _store,
+        _r,
+        _service,
+        broker,
+        order_intent,
+        risk,
+        confirmation,
+        report,
+        ready,
+    ) = data
+    store = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{db}"))
+    wrong = SafetyRepository(
+        audit_log=AuditLog(store, clock),
+        authenticator=SafetyAuthenticator(
+            key=b"task-14-live-wrong-safety-key-material", nonce_source=_next_nonce
+        ),
+    )
+    ledger = PortfolioLedger(starting_cash=Decimal("100"), currency="USD")
+    reconciler = Reconciler(safety_repository=wrong, clock=clock)
+    restarted = LiveOrderService(
+        broker=broker,
+        approval_service=ApprovalService(clock=clock, safety_repository=wrong),
+        reconciler=reconciler,
+        safety_repository=wrong,
+        clock=clock,
+        ledger=ledger,
+    )
+    with pytest.raises(LiveOrderError, match="RECONCILIATION_NOT_CURRENT"):
+        _submit(restarted, order_intent, risk, confirmation, report, ready)
     assert broker.submit_calls == 0

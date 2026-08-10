@@ -83,7 +83,14 @@ class AlpacaBroker:
             ),
         ]
         if not all(item.passed for item in gates) or self._client is None:
-            gates.append(gate("ALPACA_ACCOUNT_ACCESSIBLE", False, "ACCOUNT_UNAVAILABLE"))
+            gates.extend(
+                [
+                    gate("ALPACA_ACCOUNT_ID_MATCHED", False, "ACCOUNT_UNAVAILABLE"),
+                    gate("ALPACA_ACCOUNT_ACTIVE", False, "ACCOUNT_UNAVAILABLE"),
+                    gate("ALPACA_ACCOUNT_UNBLOCKED", False, "ACCOUNT_UNAVAILABLE"),
+                    gate("ALPACA_SUFFICIENT_BUYING_POWER", False, "ACCOUNT_UNAVAILABLE"),
+                ]
+            )
             return PreflightReport(self.broker_name, tuple(gates))
         try:
             account = self._call(self._client.get_account)
@@ -102,7 +109,14 @@ class AlpacaBroker:
                 ]
             )
         except RuntimeError:
-            gates.append(gate("ALPACA_ACCOUNT_ACCESSIBLE", False, "ACCOUNT_UNAVAILABLE"))
+            gates.extend(
+                [
+                    gate("ALPACA_ACCOUNT_ID_MATCHED", False, "ACCOUNT_UNAVAILABLE"),
+                    gate("ALPACA_ACCOUNT_ACTIVE", False, "ACCOUNT_UNAVAILABLE"),
+                    gate("ALPACA_ACCOUNT_UNBLOCKED", False, "ACCOUNT_UNAVAILABLE"),
+                    gate("ALPACA_SUFFICIENT_BUYING_POWER", False, "ACCOUNT_UNAVAILABLE"),
+                ]
+            )
         return PreflightReport(self.broker_name, tuple(gates))
 
     def submit(self, intent: OrderIntent, snapshot: MarketSnapshot) -> BrokerOrder:

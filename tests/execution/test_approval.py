@@ -1,6 +1,8 @@
 from dataclasses import replace
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Context, Decimal, localcontext
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -11,8 +13,30 @@ from market_sentinel.execution.approval import (
     CONFIRMATION_PHRASE,
     ApprovalError,
     ApprovalService,
+    risk_decision_hash,
 )
+from market_sentinel.execution.safety import SafetyAuthenticator, SafetyRepository
+from market_sentinel.operations.audit import AuditLog
+from market_sentinel.storage.db import create_engine_and_schema
+from market_sentinel.storage.events import EventStore
 from tests.factories import DEFAULT_INSTANT, intent, risk_decision
+
+KEY = b"task-14-approval-test-key-material!!"
+
+
+def _authenticated_service(
+    clock: FrozenClock,
+    path: Path | None = None,
+    *,
+    key: bytes = KEY,
+) -> tuple[ApprovalService, EventStore]:
+    url = "sqlite+pysqlite:///:memory:" if path is None else f"sqlite+pysqlite:///{path}"
+    store = EventStore(create_engine_and_schema(url))
+    repository = SafetyRepository(
+        audit_log=AuditLog(store, clock),
+        authenticator=SafetyAuthenticator(key=key, nonce_source=lambda: b"a" * 32),
+    )
+    return ApprovalService(clock=clock, safety_repository=repository), store
 
 
 def _approved(*, quantity: str = "0.1", snapshot_hash: str = "a" * 64) -> RiskDecision:
@@ -39,7 +63,7 @@ def _intent() -> OrderIntent:
 def test_confirmation_expires_and_is_bound_to_every_order_parameter() -> None:
     """Changing size or waiting through expiry must invalidate the exact capability."""
     clock = FrozenClock(DEFAULT_INSTANT)
-    service = ApprovalService(clock=clock)
+    service = _authenticated_service(clock)[0]
     original = _intent()
     risk = _approved()
     confirmation = service.create(original, risk, phrase=CONFIRMATION_PHRASE, broker="alpaca")
@@ -76,7 +100,7 @@ def test_confirmation_fingerprint_rejects_each_changed_intent_field(
     change: dict[str, object],
 ) -> None:
     """Dropping any intent field from the fingerprint would let that mutation pass."""
-    service = ApprovalService(clock=FrozenClock(DEFAULT_INSTANT))
+    service = _authenticated_service(FrozenClock(DEFAULT_INSTANT))[0]
     original = _intent()
     risk = _approved()
     confirmation = service.create(original, risk, phrase=CONFIRMATION_PHRASE, broker="alpaca")
@@ -87,7 +111,7 @@ def test_confirmation_fingerprint_rejects_each_changed_intent_field(
 
 def test_confirmation_binds_broker_and_complete_risk_decision() -> None:
     """A broker change or a freshly forged risk decision must require new confirmation."""
-    service = ApprovalService(clock=FrozenClock(DEFAULT_INSTANT))
+    service = _authenticated_service(FrozenClock(DEFAULT_INSTANT))[0]
     original = _intent()
     risk = _approved()
     confirmation = service.create(original, risk, phrase=CONFIRMATION_PHRASE, broker="alpaca")
@@ -105,7 +129,7 @@ def test_confirmation_binds_broker_and_complete_risk_decision() -> None:
 
 def test_confirmation_requires_exact_phrase_without_retaining_it() -> None:
     """A near-match must fail and the capability representation must not disclose the phrase."""
-    service = ApprovalService(clock=FrozenClock(DEFAULT_INSTANT))
+    service = _authenticated_service(FrozenClock(DEFAULT_INSTANT))[0]
     with pytest.raises(ApprovalError, match="phrase"):
         service.create(_intent(), _approved(), phrase=f"{CONFIRMATION_PHRASE} ", broker="alpaca")
 
@@ -117,7 +141,7 @@ def test_confirmation_requires_exact_phrase_without_retaining_it() -> None:
 
 def test_confirmation_uses_canonical_decimal_and_utc_encodings() -> None:
     """Equivalent Decimal scales and timezone offsets must produce the same exact meaning."""
-    service = ApprovalService(clock=FrozenClock(DEFAULT_INSTANT))
+    service = _authenticated_service(FrozenClock(DEFAULT_INSTANT))[0]
     original = _intent()
     risk = _approved()
     confirmation = service.create(original, risk, phrase=CONFIRMATION_PHRASE, broker="alpaca")
@@ -133,7 +157,7 @@ def test_confirmation_uses_canonical_decimal_and_utc_encodings() -> None:
 @pytest.mark.parametrize("bad", [Decimal("NaN"), Decimal("Infinity"), "0.1"])
 def test_confirmation_rejects_malformed_or_nonfinite_numeric_records(bad: object) -> None:
     """Defensive verification must reject values bypassing Pydantic validation."""
-    service = ApprovalService(clock=FrozenClock(DEFAULT_INSTANT))
+    service = _authenticated_service(FrozenClock(DEFAULT_INSTANT))[0]
     original = _intent()
     risk = _approved()
     confirmation = service.create(original, risk, phrase=CONFIRMATION_PHRASE, broker="alpaca")
@@ -145,7 +169,7 @@ def test_confirmation_rejects_malformed_or_nonfinite_numeric_records(bad: object
 
 def test_confirmation_rejects_future_and_naive_capability_times() -> None:
     """Clock rollback and context-dependent naive timestamps must fail closed."""
-    service = ApprovalService(clock=FrozenClock(DEFAULT_INSTANT))
+    service = _authenticated_service(FrozenClock(DEFAULT_INSTANT))[0]
     original = _intent()
     risk = _approved()
     confirmation = service.create(original, risk, phrase=CONFIRMATION_PHRASE, broker="alpaca")
@@ -160,7 +184,7 @@ def test_confirmation_rejects_future_and_naive_capability_times() -> None:
 
 def test_confirmation_rejects_defensively_forged_negative_intent_values() -> None:
     """A fingerprint must never normalize a domain-invalid numeric intent into a capability."""
-    service = ApprovalService(clock=FrozenClock(DEFAULT_INSTANT))
+    service = _authenticated_service(FrozenClock(DEFAULT_INSTANT))[0]
     original = _intent()
     risk = _approved()
     confirmation = service.create(original, risk, phrase=CONFIRMATION_PHRASE, broker="alpaca")
@@ -172,7 +196,7 @@ def test_confirmation_rejects_defensively_forged_negative_intent_values() -> Non
 
 def test_confirmation_rejects_a_risk_decision_with_an_overlong_freshness_window() -> None:
     """A forged far-future expiry must not extend RiskEngine's one-minute approval window."""
-    service = ApprovalService(clock=FrozenClock(DEFAULT_INSTANT))
+    service = _authenticated_service(FrozenClock(DEFAULT_INSTANT))[0]
     risk = _approved().model_copy(update={"expires_at": DEFAULT_INSTANT + timedelta(minutes=10)})
 
     with pytest.raises(ApprovalError, match="freshness"):
@@ -191,6 +215,110 @@ def test_confirmation_rejects_a_risk_decision_with_an_overlong_freshness_window(
 )
 def test_create_rejects_defensively_forged_order_invariants(forged: OrderIntent) -> None:
     """Confirmation creation must re-enforce the full OrderIntent domain boundary."""
-    service = ApprovalService(clock=FrozenClock(DEFAULT_INSTANT))
+    service = _authenticated_service(FrozenClock(DEFAULT_INSTANT))[0]
     with pytest.raises(ApprovalError, match="intent"):
         service.create(forged, _approved(), phrase=CONFIRMATION_PHRASE, broker="alpaca")
+
+
+def test_confirmation_is_issued_durably_before_return_and_replays_with_same_key(
+    tmp_path: Path,
+) -> None:
+    """A confirmation is authority only after its signed issuance survives restart."""
+    path = tmp_path / "confirmation.db"
+    clock = FrozenClock(DEFAULT_INSTANT)
+    service, store = _authenticated_service(clock, path)
+    confirmation = service.create(
+        _intent(), _approved(), phrase=CONFIRMATION_PHRASE, broker="alpaca"
+    )
+    rows = tuple(store.stream(f"live-confirmation:{confirmation.confirmation_id}"))
+    assert [row.kind for row in rows] == ["confirmation.issued"]
+    assert rows[0].payload["safety_mac"] == confirmation.mac
+    restarted, _ = _authenticated_service(clock, path)
+    restarted.verify(_intent(), _approved(), confirmation, broker="alpaca")
+
+
+def test_publicly_constructed_or_modified_confirmation_is_rejected() -> None:
+    """Knowing every public order field and digest cannot forge persisted phrase authority."""
+    clock = FrozenClock(DEFAULT_INSTANT)
+    service, _store = _authenticated_service(clock)
+    issued = service.create(_intent(), _approved(), phrase=CONFIRMATION_PHRASE, broker="alpaca")
+    forged = replace(issued, confirmation_id="f" * 64)
+    modified = replace(issued, nonce="00" * 32)
+    for candidate in (forged, modified):
+        with pytest.raises(ApprovalError):
+            service.verify(_intent(), _approved(), candidate, broker="alpaca")
+
+
+def test_wrong_key_restart_cannot_verify_an_issued_confirmation(tmp_path: Path) -> None:
+    """A copied SQLite file without the local safety key grants no live authority."""
+    path = tmp_path / "wrong-key.db"
+    clock = FrozenClock(DEFAULT_INSTANT)
+    service, _ = _authenticated_service(clock, path)
+    confirmation = service.create(
+        _intent(), _approved(), phrase=CONFIRMATION_PHRASE, broker="alpaca"
+    )
+    wrong, _ = _authenticated_service(clock, path, key=b"task-14-approval-wrong-key-material!")
+    with pytest.raises(ApprovalError):
+        wrong.verify(_intent(), _approved(), confirmation, broker="alpaca")
+
+
+def test_confirmation_issuance_persistence_failure_returns_no_capability() -> None:
+    """No confirmation object escapes when durable signed issuance fails."""
+    clock = FrozenClock(DEFAULT_INSTANT)
+    service, store = _authenticated_service(clock)
+    store._engine.dispose()  # noqa: SLF001 - deliberate local persistence failure
+    with pytest.raises(ApprovalError, match="persistence"):
+        service.create(_intent(), _approved(), phrase=CONFIRMATION_PHRASE, broker="alpaca")
+
+
+def test_intent_and_risk_hashes_do_not_collide_or_change_with_decimal_context() -> None:
+    """Long exact values retain distinct fingerprint bytes at every ambient precision."""
+    fingerprints: list[str] = []
+    risk_hashes: list[str] = []
+    for precision in (10, 28, 60):
+        with localcontext(Context(prec=precision)):
+            value = Decimal("12345678901234567890123456789.1")
+            order = _intent().model_copy(update={"quantity": value})
+            risk = _approved().model_copy(update={"approved_quantity": value})
+            service, _ = _authenticated_service(FrozenClock(DEFAULT_INSTANT))
+            fingerprints.append(
+                service.create(order, risk, phrase=CONFIRMATION_PHRASE, broker="alpaca").fingerprint
+            )
+            risk_hashes.append(risk_decision_hash(risk))
+    assert len(set(fingerprints)) == 1
+    assert len(set(risk_hashes)) == 1
+
+    other_value = Decimal("12345678901234567890123456789.2")
+    other_order = _intent().model_copy(update={"quantity": other_value})
+    other_risk = _approved().model_copy(update={"approved_quantity": other_value})
+    service, _ = _authenticated_service(FrozenClock(DEFAULT_INSTANT))
+    other = service.create(other_order, other_risk, phrase=CONFIRMATION_PHRASE, broker="alpaca")
+    assert other.fingerprint != fingerprints[0]
+    assert risk_decision_hash(other_risk) != risk_hashes[0]
+
+
+def test_huge_exponent_is_rejected_without_expanding_fingerprint_payload() -> None:
+    """Resource-hostile Decimal exponents fail at the bounded canonical boundary."""
+    huge = Decimal((0, (1,), 100_000))
+    order = _intent().model_copy(update={"quantity": huge})
+    risk = _approved().model_copy(update={"approved_quantity": huge})
+    service, _ = _authenticated_service(FrozenClock(DEFAULT_INSTANT))
+    with pytest.raises(ApprovalError, match="numeric"):
+        service.create(order, risk, phrase=CONFIRMATION_PHRASE, broker="alpaca")
+
+
+def test_issuance_persistence_exception_has_no_secret_cause_or_context() -> None:
+    """A failing local store cannot attach secret-bearing implementation exceptions."""
+    service, _ = _authenticated_service(FrozenClock(DEFAULT_INSTANT))
+    with (
+        patch.object(
+            SafetyRepository,
+            "record_many",
+            side_effect=RuntimeError("api_key=secret-token-123"),
+        ),
+        pytest.raises(ApprovalError) as captured,
+    ):
+        service.create(_intent(), _approved(), phrase=CONFIRMATION_PHRASE, broker="alpaca")
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert "secret-token-123" not in repr(captured.value)

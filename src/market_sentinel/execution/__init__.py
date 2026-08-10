@@ -23,6 +23,12 @@ from market_sentinel.execution.reconcile import (
     Reconciler,
     ReconciliationReport,
 )
+from market_sentinel.execution.safety import (
+    SafetyAuthenticator,
+    SafetyEvent,
+    SafetyIntegrityError,
+    SafetyRepository,
+)
 from market_sentinel.execution.state_machine import (
     InvalidOrderTransition,
     OrderStateMachine,
@@ -52,4 +58,8 @@ __all__ = [
     "Reconciler",
     "ReconciliationReport",
     "SessionHead",
+    "SafetyAuthenticator",
+    "SafetyEvent",
+    "SafetyIntegrityError",
+    "SafetyRepository",
 ]
