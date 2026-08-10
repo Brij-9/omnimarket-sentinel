@@ -111,6 +111,81 @@ def test_audit_log_redacts_payload_and_uses_its_clock() -> None:
     }
 
 
+def test_audit_log_persists_alternate_structured_secret_labels_as_redacted() -> None:
+    """Alternate separator and compound spellings never survive durable audit."""
+    store = EventStore(create_engine_and_schema("sqlite+pysqlite:///:memory:"))
+    at = datetime(2026, 8, 9, 10, tzinfo=UTC)
+    audit = AuditLog(store, FrozenClock(at))
+    labels = (
+        "api-key",
+        "api.key",
+        "api/key",
+        "api key",
+        "apikey",
+        "session-token",
+        "sessiontoken",
+        "secret_key",
+        "private_token",
+        "totp",
+        "key",
+    )
+
+    audit.record(
+        "evt-alternate-secrets",
+        "broker.requested",
+        "order-alternate-secrets",
+        dict.fromkeys(labels, "OpaqueValue123456"),
+    )
+
+    [event] = store.stream("order-alternate-secrets")
+    assert event.payload == dict.fromkeys(labels, "[REDACTED]")
+
+
+@pytest.mark.parametrize("container_kind", ("list", "dict", "tuple"))
+def test_audit_log_rejects_container_subclasses_without_invoking_them(
+    container_kind: str,
+) -> None:
+    """Serializable hostile subclasses cannot bypass redaction or reach durable storage."""
+    store = EventStore(create_engine_and_schema("sqlite+pysqlite:///:memory:"))
+    at = datetime(2026, 8, 9, 10, tzinfo=UTC)
+    audit = AuditLog(store, FrozenClock(at))
+    calls: list[str] = []
+
+    class HostileList(list[object]):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            calls.append("list")
+            return super().__iter__()
+
+    class HostileDict(dict[str, object]):
+        def items(self):  # type: ignore[no-untyped-def]
+            calls.append("dict")
+            return super().items()
+
+    class HostileTuple(tuple[object, ...]):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            calls.append("tuple")
+            return super().__iter__()
+
+    hostile: object
+    if container_kind == "list":
+        hostile = HostileList(({"api_key": "OpaqueValue123456"},))
+    elif container_kind == "dict":
+        hostile = HostileDict({"api_key": "OpaqueValue123456"})
+    else:
+        hostile = HostileTuple(({"api_key": "OpaqueValue123456"},))
+
+    with pytest.raises(ValueError, match="container type"):
+        audit.record(
+            f"evt-hostile-{container_kind}",
+            "broker.requested",
+            "order-hostile-container",
+            {"outer": hostile},
+        )
+
+    assert calls == []
+    assert tuple(store.stream("order-hostile-container")) == ()
+
+
 def test_append_many_is_atomic_and_preserves_order_and_supplied_utc_times() -> None:
     """A bad later row must roll back every event and allocated sequence in the batch."""
     store = EventStore(create_engine_and_schema("sqlite+pysqlite:///:memory:"))
