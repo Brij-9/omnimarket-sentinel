@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import timedelta
 from decimal import Context, Decimal, localcontext
 from pathlib import Path
 
 import pytest
 
+import market_sentinel.execution as execution_api
 from market_sentinel.domain.clock import FrozenClock
-from market_sentinel.execution import SafetyAuthenticator as PublicSafetyAuthenticator
 from market_sentinel.execution.canonical import CanonicalEncodingError, canonical_decimal
 from market_sentinel.execution.safety import (
-    SafetyAuthenticator,
+    ApprovalSafetyCapability,
+    LiveSafetyCapability,
+    ReconciliationSafetyCapability,
     SafetyIntegrityError,
-    SafetyRepository,
+    create_safety_capabilities,
 )
 from market_sentinel.operations.audit import AuditLog
 from market_sentinel.storage.db import create_engine_and_schema
@@ -23,12 +26,24 @@ KEY = b"task-14-test-safety-key-material!!"
 OTHER_KEY = b"task-14-other-safety-key-material!"
 
 
-def _repository(path: Path | None = None, *, key: bytes = KEY) -> SafetyRepository:
+def _roles(
+    path: Path | None = None,
+    *,
+    key: bytes = KEY,
+    nonce_source: Callable[[], bytes] = lambda: b"n" * 32,
+) -> tuple[
+    AuditLog,
+    ApprovalSafetyCapability,
+    ReconciliationSafetyCapability,
+    LiveSafetyCapability,
+]:
     url = "sqlite+pysqlite:///:memory:" if path is None else f"sqlite+pysqlite:///{path}"
     clock = FrozenClock(DEFAULT_INSTANT)
     audit = AuditLog(EventStore(create_engine_and_schema(url)), clock)
-    authenticator = SafetyAuthenticator(key=key, nonce_source=lambda: b"n" * 32)
-    return SafetyRepository(audit_log=audit, authenticator=authenticator)
+    approval, reconciliation, live = create_safety_capabilities(
+        audit_log=audit, key=key, nonce_source=nonce_source
+    )
+    return audit, approval, reconciliation, live
 
 
 @pytest.mark.parametrize("precision", [10, 28, 60])
@@ -57,12 +72,7 @@ def test_decimal_canonicalization_rejects_wrong_or_resource_hostile_values(bad: 
 
 def test_unsigned_public_safety_row_cannot_authorize_replay() -> None:
     """A matching public AuditLog row is not authenticated safety authority."""
-    clock = FrozenClock(DEFAULT_INSTANT)
-    audit = AuditLog(EventStore(create_engine_and_schema("sqlite+pysqlite:///:memory:")), clock)
-    repository = SafetyRepository(
-        audit_log=audit,
-        authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"n" * 32),
-    )
+    audit, _approval, reconciliation, _live = _roles()
     audit.record(
         "forged",
         "reconciliation.healthy",
@@ -71,14 +81,14 @@ def test_unsigned_public_safety_row_cannot_authorize_replay() -> None:
     )
 
     with pytest.raises(SafetyIntegrityError):
-        repository.stream_verified("live-reconciliation")
+        reconciliation.reconciliation_events()
 
 
 def test_signed_rows_survive_restart_with_same_key_and_wrong_key_fails(tmp_path: Path) -> None:
     """Only possession of the same local key can replay persisted safety authority."""
     path = tmp_path / "safety.db"
-    repository = _repository(path)
-    row = repository.reconciliation_capability().persist_report(
+    _audit, _approval, reconciliation, _live = _roles(path)
+    row = reconciliation.persist_report(
         broker="alpaca",
         broker_hash="a" * 64,
         ledger_hash="b" * 64,
@@ -86,32 +96,28 @@ def test_signed_rows_survive_restart_with_same_key_and_wrong_key_fails(tmp_path:
         checked_at=DEFAULT_INSTANT,
     )
 
-    assert _repository(path).stream_verified("live-reconciliation")[0].event_id == row.event_id
+    _audit2, _approval2, restarted, _live2 = _roles(path)
+    assert restarted.reconciliation_events()[0].event_id == row.event_id
+    _audit3, _approval3, wrong, _live3 = _roles(path, key=OTHER_KEY)
     with pytest.raises(SafetyIntegrityError):
-        _repository(path, key=OTHER_KEY).stream_verified("live-reconciliation")
+        wrong.reconciliation_events()
 
 
-def test_authenticator_repr_and_errors_never_disclose_key_or_nonce() -> None:
-    """Local authentication material must stay out of representations and errors."""
-    authenticator = SafetyAuthenticator(key=KEY, nonce_source=lambda: b"z" * 32)
-    assert KEY.decode() not in repr(authenticator)
-    assert (b"z" * 32).decode() not in repr(authenticator)
-    assert not hasattr(authenticator, "key")
-    assert not hasattr(authenticator, "nonce_source")
-    assert len(authenticator.new_nonce()) == 64
-
-
-def test_safety_authenticator_rejects_short_or_missing_key_and_nonce() -> None:
-    """There is no deterministic or empty production fallback for key/nonce material."""
+def test_key_and_nonce_validation_has_no_public_signer_fallback() -> None:
+    """The one-shot authority factory rejects malformed local key and nonce material."""
+    assert not hasattr(execution_api, "SafetyAuthenticator")
     with pytest.raises(ValueError):
-        SafetyAuthenticator(key=b"short", nonce_source=lambda: b"n" * 32)
+        _roles(key=b"short")
+    _audit, approval, _reconciliation, _live = _roles(nonce_source=lambda: b"short")
     with pytest.raises(ValueError):
-        SafetyAuthenticator(key=KEY, nonce_source=lambda: b"short").new_nonce()
-    with pytest.raises(ValueError):
-        SafetyAuthenticator(
-            key=KEY,
-            nonce_source=lambda: "not-bytes",  # type: ignore[arg-type,return-value]
-        ).new_nonce()
+        approval.issue_confirmation(
+            phrase="I_CONFIRM_REAL_MONEY_ORDER",
+            broker="alpaca",
+            created_at=DEFAULT_INSTANT,
+            expires_at=DEFAULT_INSTANT + timedelta(minutes=5),
+            fingerprint="a" * 64,
+            risk_decision_hash="b" * 64,
+        )
 
 
 def test_nonce_source_exception_is_sanitized_without_context() -> None:
@@ -120,9 +126,16 @@ def test_nonce_source_exception_is_sanitized_without_context() -> None:
     def failed() -> bytes:
         raise RuntimeError("api_key=secret-token-123")
 
-    authenticator = SafetyAuthenticator(key=KEY, nonce_source=failed)
+    _audit, approval, _reconciliation, _live = _roles(nonce_source=failed)
     with pytest.raises(ValueError) as captured:
-        authenticator.new_nonce()
+        approval.issue_confirmation(
+            phrase="I_CONFIRM_REAL_MONEY_ORDER",
+            broker="alpaca",
+            created_at=DEFAULT_INSTANT,
+            expires_at=DEFAULT_INSTANT + timedelta(minutes=5),
+            fingerprint="a" * 64,
+            risk_decision_hash="b" * 64,
+        )
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
     assert "secret-token-123" not in repr(captured.value)
@@ -130,9 +143,9 @@ def test_nonce_source_exception_is_sanitized_without_context() -> None:
 
 def test_safety_event_rejects_naive_time() -> None:
     """Safety MACs never depend on local timezone interpretation."""
-    repository = _repository()
+    _audit, _approval, reconciliation, _live = _roles()
     with pytest.raises(ValueError):
-        repository.reconciliation_capability().persist_report(
+        reconciliation.persist_report(
             broker="alpaca",
             broker_hash="a" * 64,
             ledger_hash="b" * 64,
@@ -141,26 +154,8 @@ def test_safety_event_rejects_naive_time() -> None:
         )
 
 
-def test_authenticated_safety_configuration_has_an_explicit_public_api() -> None:
-    """Task 15 can wire a local key without importing a private implementation detail."""
-    assert PublicSafetyAuthenticator is SafetyAuthenticator
-
-
-def test_safety_mac_is_stable_across_contexts_and_distinguishes_long_decimals() -> None:
-    """Canonical decimal payloads cannot collide before authenticated safety persistence."""
-    authenticator = SafetyAuthenticator(key=KEY, nonce_source=lambda: b"n" * 32)
-
-    def mac(value: Decimal, precision: int) -> str:
-        with localcontext(Context(prec=precision)):
-            return authenticator.sign(
-                event_id="decimal-event",
-                kind="reconciliation.healthy",
-                aggregate_id="live-reconciliation",
-                occurred_at=DEFAULT_INSTANT,
-                payload={"exact_decimal": canonical_decimal(value)},
-            )
-
-    first = Decimal("12345678901234567890123456789.1")
-    second = Decimal("12345678901234567890123456789.2")
-    assert len({mac(first, precision) for precision in (10, 28, 60)}) == 1
-    assert mac(first, 28) != mac(second, 28)
+def test_authenticated_safety_configuration_exports_only_the_narrow_factory() -> None:
+    """Task 15 can inject a local key without receiving generic signing authority."""
+    assert execution_api.create_safety_capabilities is create_safety_capabilities
+    assert not hasattr(execution_api, "SafetyRepository")
+    assert not hasattr(execution_api, "SafetyAuthenticator")

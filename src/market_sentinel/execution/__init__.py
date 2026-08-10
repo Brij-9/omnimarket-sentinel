@@ -27,9 +27,8 @@ from market_sentinel.execution.safety import (
     ApprovalSafetyCapability,
     LiveSafetyCapability,
     ReconciliationSafetyCapability,
-    SafetyAuthenticator,
     SafetyIntegrityError,
-    SafetyRepository,
+    create_safety_capabilities,
 )
 from market_sentinel.execution.state_machine import (
     InvalidOrderTransition,
@@ -60,10 +59,9 @@ __all__ = [
     "Reconciler",
     "ReconciliationReport",
     "SessionHead",
-    "SafetyAuthenticator",
     "ApprovalSafetyCapability",
     "LiveSafetyCapability",
     "ReconciliationSafetyCapability",
     "SafetyIntegrityError",
-    "SafetyRepository",
+    "create_safety_capabilities",
 ]

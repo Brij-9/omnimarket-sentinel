@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Final
 from uuid import uuid4
+from weakref import finalize
 
 from market_sentinel.operations.audit import AuditEvent, AuditLog
 from market_sentinel.security import redact_mapping
@@ -55,7 +56,11 @@ class SafetyIntegrityError(RuntimeError):
     """Persisted live-safety state is unsigned, malformed, or authenticated by another key."""
 
 
-class SafetyAuthenticator:
+class SafetyStateChangedError(SafetyIntegrityError):
+    """Authenticated claim prerequisites are absent, stale, unhealthy, or changed."""
+
+
+class _SafetyMac:
     """Injected local HMAC and cryptographic nonce capability; key material is never rendered."""
 
     __slots__ = ("_nonce_source", "_signer")
@@ -80,7 +85,7 @@ class SafetyAuthenticator:
         raise AttributeError("safety authenticator is immutable")
 
     def __repr__(self) -> str:
-        return "SafetyAuthenticator(configured=True)"
+        return "_SafetyMac(configured=True)"
 
     def new_nonce(self) -> str:
         """Return a bounded opaque nonce from the injected cryptographic source."""
@@ -92,7 +97,7 @@ class SafetyAuthenticator:
             raise ValueError("safety nonce source returned malformed data")
         return value.hex()
 
-    def sign(
+    def _mac(
         self,
         *,
         event_id: str,
@@ -113,7 +118,7 @@ class SafetyAuthenticator:
             version = payload.pop(_VERSION_FIELD)
             if type(mac) is not str or version != _VERSION:
                 return False
-            expected = self.sign(
+            expected = self._mac(
                 event_id=event.event_id,
                 kind=event.kind,
                 aggregate_id=event.aggregate_id,
@@ -127,7 +132,7 @@ class SafetyAuthenticator:
 
 @dataclass(frozen=True, slots=True)
 class _SafetyEvent:
-    """One typed unsigned request; SafetyRepository alone adds authentication."""
+    """One internal typed request; the unexported authority alone adds authentication."""
 
     event_id: str
     kind: str
@@ -136,13 +141,13 @@ class _SafetyEvent:
     occurred_at: datetime
 
 
-class SafetyRepository:
-    """Read-only authenticated root which grants narrowly typed role capabilities."""
+class _SafetyAuthority:
+    """Internal authenticated persistence authority; never returned by the public factory."""
 
     __slots__ = ("_audit", "_authenticator", "_store_identity")
 
-    def __init__(self, *, audit_log: AuditLog, authenticator: SafetyAuthenticator) -> None:
-        if type(audit_log) is not AuditLog or type(authenticator) is not SafetyAuthenticator:
+    def __init__(self, *, audit_log: AuditLog, authenticator: _SafetyMac) -> None:
+        if type(audit_log) is not AuditLog or type(authenticator) is not _SafetyMac:
             raise ValueError("safety repository requires exact durable authenticated capabilities")
         self._audit = audit_log
         self._authenticator = authenticator
@@ -152,15 +157,6 @@ class SafetyRepository:
     def event_store_identity(self) -> object:
         """Opaque identity used to require one shared durable transaction boundary."""
         return self._store_identity
-
-    def approval_capability(self) -> ApprovalSafetyCapability:
-        return ApprovalSafetyCapability._from_repository(self)
-
-    def reconciliation_capability(self) -> ReconciliationSafetyCapability:
-        return ReconciliationSafetyCapability._from_repository(self)
-
-    def live_capability(self) -> LiveSafetyCapability:
-        return LiveSafetyCapability._from_repository(self)
 
     def _record_many(self, batch: tuple[_SafetyEvent, ...]) -> None:
         self._audit.record_many(self._signed_batch(batch))
@@ -208,7 +204,7 @@ class SafetyRepository:
             payload = dict(redact_mapping(event.payload))
             if _MAC_FIELD in payload or _VERSION_FIELD in payload:
                 raise ValueError("reserved safety authentication field")
-            mac = self._authenticator.sign(
+            mac = self._authenticator._mac(
                 event_id=event.event_id,
                 kind=event.kind,
                 aggregate_id=event.aggregate_id,
@@ -229,11 +225,11 @@ class SafetyRepository:
         return tuple(signed)
 
 
-class _Capability:
+class _InternalRole:
     __slots__ = ("_repository",)
 
-    def __init__(self, repository: SafetyRepository, token: object) -> None:
-        if token is not _CAPABILITY_TOKEN or type(repository) is not SafetyRepository:
+    def __init__(self, repository: _SafetyAuthority, token: object) -> None:
+        if token is not _CAPABILITY_TOKEN or type(repository) is not _SafetyAuthority:
             raise ValueError("safety capability cannot be constructed directly")
         self._repository = repository
 
@@ -245,11 +241,11 @@ class _Capability:
 _CAPABILITY_TOKEN = object()
 
 
-class ApprovalSafetyCapability(_Capability):
+class _ApprovalRole(_InternalRole):
     """Only the approval role can persist and read confirmation issuance state."""
 
     @classmethod
-    def _from_repository(cls, repository: SafetyRepository) -> ApprovalSafetyCapability:
+    def _from_repository(cls, repository: _SafetyAuthority) -> _ApprovalRole:
         return cls(repository, _CAPABILITY_TOKEN)
 
     def issue_confirmation(
@@ -310,11 +306,11 @@ class ApprovalSafetyCapability(_Capability):
         return self._repository.stream_verified(f"live-confirmation:{confirmation_id}")
 
 
-class ReconciliationSafetyCapability(_Capability):
+class _ReconciliationRole(_InternalRole):
     """Persist only derived reconciliation reports and prerequisite-checked clears."""
 
     @classmethod
-    def _from_repository(cls, repository: SafetyRepository) -> ReconciliationSafetyCapability:
+    def _from_repository(cls, repository: _SafetyAuthority) -> _ReconciliationRole:
         return cls(repository, _CAPABILITY_TOKEN)
 
     def reconciliation_events(self) -> tuple[EventRecord, ...]:
@@ -389,7 +385,7 @@ class ReconciliationSafetyCapability(_Capability):
         reconciliations = self.reconciliation_events()
         if _interlock_active(interlocks):
             raise ValueError("a live submission remains unresolved")
-        if not _kill_active(kills):
+        if not _kill_active(kills, reconciliations):
             return
         activations = [row for row in kills if row.kind == "kill_switch.activated"]
         if not activations or not reconciliations:
@@ -424,11 +420,11 @@ class ReconciliationSafetyCapability(_Capability):
         )
 
 
-class LiveSafetyCapability(_Capability):
+class _LiveRole(_InternalRole):
     """Persist only exact live claim/start/acknowledgement/unknown transitions."""
 
     @classmethod
-    def _from_repository(cls, repository: SafetyRepository) -> LiveSafetyCapability:
+    def _from_repository(cls, repository: _SafetyAuthority) -> _LiveRole:
         return cls(repository, _CAPABILITY_TOKEN)
 
     def claim_and_start(
@@ -465,6 +461,31 @@ class LiveSafetyCapability(_Capability):
             or _aware_utc(expires_at) <= instant
         ):
             raise SafetyIntegrityError("confirmation issuance is invalid")
+        reconciliations = self._repository.stream_verified(_RECONCILIATION)
+        kills = self._repository.stream_verified(_KILL_SWITCH)
+        interlocks = self._repository.stream_verified(_INTERLOCK)
+        actual_reconciliation_head = reconciliations[-1].event_id if reconciliations else None
+        actual_kill_head = kills[-1].event_id if kills else None
+        actual_interlock_head = interlocks[-1].event_id if interlocks else None
+        if (
+            actual_reconciliation_head != reconciliation_head
+            or actual_kill_head != kill_switch_head
+            or actual_interlock_head != interlock_head
+            or not reconciliations
+        ):
+            raise SafetyStateChangedError("live safety heads are not exact")
+        reconciliation = reconciliations[-1]
+        if (
+            reconciliation.kind != "reconciliation.healthy"
+            or reconciliation.payload.get("healthy") is not True
+            or reconciliation.payload.get("reason_codes") != ()
+            or reconciliation.payload.get("broker") != broker
+            or reconciliation.occurred_at > instant
+            or instant - reconciliation.occurred_at > timedelta(seconds=60)
+            or _kill_active(kills, reconciliations)
+            or _interlock_active(interlocks)
+        ):
+            raise SafetyStateChangedError("live safety state is not healthy")
         nonce = uuid4().hex
         self._repository._record_many_if_heads(
             (
@@ -606,6 +627,398 @@ class LiveSafetyCapability(_Capability):
         )
 
 
+_HANDLE_TOKEN = object()
+_APPROVAL_ROLE_VAULT: dict[str, _ApprovalRole] = {}
+_RECONCILIATION_ROLE_VAULT: dict[str, _ReconciliationRole] = {}
+_LIVE_ROLE_VAULT: dict[str, _LiveRole] = {}
+_ROLE_VAULT_REFS: dict[str, int] = {}
+
+
+def _release_role_vault(authority_id: str) -> None:
+    remaining = _ROLE_VAULT_REFS.get(authority_id, 0) - 1
+    if remaining > 0:
+        _ROLE_VAULT_REFS[authority_id] = remaining
+        return
+    _ROLE_VAULT_REFS.pop(authority_id, None)
+    _APPROVAL_ROLE_VAULT.pop(authority_id, None)
+    _RECONCILIATION_ROLE_VAULT.pop(authority_id, None)
+    _LIVE_ROLE_VAULT.pop(authority_id, None)
+
+
+class ApprovalSafetyCapability:
+    """Frozen approval-only handle containing fixed-purpose closure entry points."""
+
+    __slots__ = ("_approval_issue", "_approval_read", "_approval_store_identity", "__weakref__")
+    _approval_issue: Callable[..., tuple[str, str, str]]
+    _approval_read: Callable[[str], tuple[EventRecord, ...]]
+    _approval_store_identity: object
+
+    def __init__(
+        self,
+        *,
+        token: object,
+        issue: Callable[..., tuple[str, str, str]],
+        read: Callable[[str], tuple[EventRecord, ...]],
+        store_identity: object,
+    ) -> None:
+        if token is not _HANDLE_TOKEN or not callable(issue) or not callable(read):
+            raise ValueError("approval safety handle cannot be constructed directly")
+        object.__setattr__(self, "_approval_issue", issue)
+        object.__setattr__(self, "_approval_read", read)
+        object.__setattr__(self, "_approval_store_identity", store_identity)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("approval safety handle is immutable")
+
+    @property
+    def store_identity(self) -> object:
+        return self._approval_store_identity
+
+    def issue_confirmation(
+        self,
+        *,
+        phrase: str,
+        broker: str,
+        created_at: datetime,
+        expires_at: datetime,
+        fingerprint: str,
+        risk_decision_hash: str,
+    ) -> tuple[str, str, str]:
+        return self._approval_issue(
+            phrase=phrase,
+            broker=broker,
+            created_at=created_at,
+            expires_at=expires_at,
+            fingerprint=fingerprint,
+            risk_decision_hash=risk_decision_hash,
+        )
+
+    def confirmation_events(self, confirmation_id: str) -> tuple[EventRecord, ...]:
+        return self._approval_read(confirmation_id)
+
+
+class ReconciliationSafetyCapability:
+    """Frozen reconciliation-only handle with no generic signing or live route."""
+
+    __slots__ = (
+        "_reconciliation_clear",
+        "_reconciliation_interlocks",
+        "_reconciliation_kills",
+        "_reconciliation_persist",
+        "_reconciliation_read",
+        "_reconciliation_store_identity",
+        "__weakref__",
+    )
+    _reconciliation_clear: Callable[..., None]
+    _reconciliation_interlocks: Callable[[], tuple[EventRecord, ...]]
+    _reconciliation_kills: Callable[[], tuple[EventRecord, ...]]
+    _reconciliation_persist: Callable[..., EventRecord]
+    _reconciliation_read: Callable[[], tuple[EventRecord, ...]]
+    _reconciliation_store_identity: object
+
+    def __init__(
+        self,
+        *,
+        token: object,
+        persist: Callable[..., EventRecord],
+        clear: Callable[..., None],
+        read: Callable[[], tuple[EventRecord, ...]],
+        kills: Callable[[], tuple[EventRecord, ...]],
+        interlocks: Callable[[], tuple[EventRecord, ...]],
+        store_identity: object,
+    ) -> None:
+        if token is not _HANDLE_TOKEN or not all(
+            callable(item) for item in (persist, clear, read, kills, interlocks)
+        ):
+            raise ValueError("reconciliation safety handle cannot be constructed directly")
+        object.__setattr__(self, "_reconciliation_persist", persist)
+        object.__setattr__(self, "_reconciliation_clear", clear)
+        object.__setattr__(self, "_reconciliation_read", read)
+        object.__setattr__(self, "_reconciliation_kills", kills)
+        object.__setattr__(self, "_reconciliation_interlocks", interlocks)
+        object.__setattr__(self, "_reconciliation_store_identity", store_identity)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("reconciliation safety handle is immutable")
+
+    @property
+    def store_identity(self) -> object:
+        return self._reconciliation_store_identity
+
+    def persist_report(
+        self,
+        *,
+        broker: str,
+        broker_hash: str,
+        ledger_hash: str,
+        reason_codes: tuple[str, ...],
+        checked_at: datetime,
+    ) -> EventRecord:
+        return self._reconciliation_persist(
+            broker=broker,
+            broker_hash=broker_hash,
+            ledger_hash=ledger_hash,
+            reason_codes=reason_codes,
+            checked_at=checked_at,
+        )
+
+    def clear_kill_switch(self, *, acknowledgement: str, now: datetime) -> None:
+        self._reconciliation_clear(acknowledgement=acknowledgement, now=now)
+
+    def reconciliation_events(self) -> tuple[EventRecord, ...]:
+        return self._reconciliation_read()
+
+    def kill_switch_events(self) -> tuple[EventRecord, ...]:
+        return self._reconciliation_kills()
+
+    def interlock_events(self) -> tuple[EventRecord, ...]:
+        return self._reconciliation_interlocks()
+
+
+class LiveSafetyCapability:
+    """Frozen live-only handle with fixed claim, acknowledgement, and UNKNOWN routes."""
+
+    __slots__ = (
+        "_live_acknowledge",
+        "_live_claim",
+        "_live_store_identity",
+        "_live_unknown",
+        "__weakref__",
+    )
+    _live_acknowledge: Callable[..., None]
+    _live_claim: Callable[..., None]
+    _live_store_identity: object
+    _live_unknown: Callable[..., None]
+
+    def __init__(
+        self,
+        *,
+        token: object,
+        claim: Callable[..., None],
+        acknowledge: Callable[..., None],
+        unknown: Callable[..., None],
+        store_identity: object,
+    ) -> None:
+        if token is not _HANDLE_TOKEN or not all(
+            callable(item) for item in (claim, acknowledge, unknown)
+        ):
+            raise ValueError("live safety handle cannot be constructed directly")
+        object.__setattr__(self, "_live_claim", claim)
+        object.__setattr__(self, "_live_acknowledge", acknowledge)
+        object.__setattr__(self, "_live_unknown", unknown)
+        object.__setattr__(self, "_live_store_identity", store_identity)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("live safety handle is immutable")
+
+    @property
+    def store_identity(self) -> object:
+        return self._live_store_identity
+
+    def claim_and_start(
+        self,
+        *,
+        intent_id: str,
+        broker: str,
+        confirmation_id: str,
+        fingerprint: str,
+        expires_at: datetime,
+        reconciliation_head: str,
+        kill_switch_head: str | None,
+        interlock_head: str | None,
+        occurred_at: datetime,
+    ) -> None:
+        self._live_claim(
+            intent_id=intent_id,
+            broker=broker,
+            confirmation_id=confirmation_id,
+            fingerprint=fingerprint,
+            expires_at=expires_at,
+            reconciliation_head=reconciliation_head,
+            kill_switch_head=kill_switch_head,
+            interlock_head=interlock_head,
+            occurred_at=occurred_at,
+        )
+
+    def record_acknowledgement(
+        self,
+        *,
+        intent_id: str,
+        broker: str,
+        broker_order_id: str,
+        status: str,
+        submission_id: str,
+        occurred_at: datetime,
+    ) -> None:
+        self._live_acknowledge(
+            intent_id=intent_id,
+            broker=broker,
+            broker_order_id=broker_order_id,
+            status=status,
+            submission_id=submission_id,
+            occurred_at=occurred_at,
+        )
+
+    def record_unknown(self, *, intent_id: str, submission_id: str, occurred_at: datetime) -> None:
+        self._live_unknown(
+            intent_id=intent_id,
+            submission_id=submission_id,
+            occurred_at=occurred_at,
+        )
+
+
+def create_safety_capabilities(
+    *,
+    audit_log: AuditLog,
+    key: bytes,
+    nonce_source: Callable[[], bytes],
+) -> tuple[ApprovalSafetyCapability, ReconciliationSafetyCapability, LiveSafetyCapability]:
+    """Consume local key material once and return only three narrow immutable handles."""
+    authority = _SafetyAuthority(
+        audit_log=audit_log,
+        authenticator=_SafetyMac(key=key, nonce_source=nonce_source),
+    )
+    approval_role = _ApprovalRole._from_repository(authority)
+    reconciliation_role = _ReconciliationRole._from_repository(authority)
+    live_role = _LiveRole._from_repository(authority)
+    authority_id = uuid4().hex
+    _APPROVAL_ROLE_VAULT[authority_id] = approval_role
+    _RECONCILIATION_ROLE_VAULT[authority_id] = reconciliation_role
+    _LIVE_ROLE_VAULT[authority_id] = live_role
+    _ROLE_VAULT_REFS[authority_id] = 3
+
+    def issue_confirmation(
+        *,
+        phrase: str,
+        broker: str,
+        created_at: datetime,
+        expires_at: datetime,
+        fingerprint: str,
+        risk_decision_hash: str,
+    ) -> tuple[str, str, str]:
+        return _APPROVAL_ROLE_VAULT[authority_id].issue_confirmation(
+            phrase=phrase,
+            broker=broker,
+            created_at=created_at,
+            expires_at=expires_at,
+            fingerprint=fingerprint,
+            risk_decision_hash=risk_decision_hash,
+        )
+
+    def confirmation_events(confirmation_id: str) -> tuple[EventRecord, ...]:
+        return _APPROVAL_ROLE_VAULT[authority_id].confirmation_events(confirmation_id)
+
+    def persist_report(
+        *,
+        broker: str,
+        broker_hash: str,
+        ledger_hash: str,
+        reason_codes: tuple[str, ...],
+        checked_at: datetime,
+    ) -> EventRecord:
+        return _RECONCILIATION_ROLE_VAULT[authority_id].persist_report(
+            broker=broker,
+            broker_hash=broker_hash,
+            ledger_hash=ledger_hash,
+            reason_codes=reason_codes,
+            checked_at=checked_at,
+        )
+
+    def clear_kill_switch(*, acknowledgement: str, now: datetime) -> None:
+        _RECONCILIATION_ROLE_VAULT[authority_id].clear_kill_switch(
+            acknowledgement=acknowledgement, now=now
+        )
+
+    def reconciliation_events() -> tuple[EventRecord, ...]:
+        return _RECONCILIATION_ROLE_VAULT[authority_id].reconciliation_events()
+
+    def kill_switch_events() -> tuple[EventRecord, ...]:
+        return _RECONCILIATION_ROLE_VAULT[authority_id].kill_switch_events()
+
+    def interlock_events() -> tuple[EventRecord, ...]:
+        return _RECONCILIATION_ROLE_VAULT[authority_id].interlock_events()
+
+    def claim_and_start(
+        *,
+        intent_id: str,
+        broker: str,
+        confirmation_id: str,
+        fingerprint: str,
+        expires_at: datetime,
+        reconciliation_head: str,
+        kill_switch_head: str | None,
+        interlock_head: str | None,
+        occurred_at: datetime,
+    ) -> None:
+        _LIVE_ROLE_VAULT[authority_id].claim_and_start(
+            intent_id=intent_id,
+            broker=broker,
+            confirmation_id=confirmation_id,
+            fingerprint=fingerprint,
+            expires_at=expires_at,
+            reconciliation_head=reconciliation_head,
+            kill_switch_head=kill_switch_head,
+            interlock_head=interlock_head,
+            occurred_at=occurred_at,
+        )
+
+    def record_acknowledgement(
+        *,
+        intent_id: str,
+        broker: str,
+        broker_order_id: str,
+        status: str,
+        submission_id: str,
+        occurred_at: datetime,
+    ) -> None:
+        _LIVE_ROLE_VAULT[authority_id].record_acknowledgement(
+            intent_id=intent_id,
+            broker=broker,
+            broker_order_id=broker_order_id,
+            status=status,
+            submission_id=submission_id,
+            occurred_at=occurred_at,
+        )
+
+    def record_unknown(*, intent_id: str, submission_id: str, occurred_at: datetime) -> None:
+        _LIVE_ROLE_VAULT[authority_id].record_unknown(
+            intent_id=intent_id,
+            submission_id=submission_id,
+            occurred_at=occurred_at,
+        )
+
+    identity = authority.event_store_identity
+    approval = ApprovalSafetyCapability(
+        token=_HANDLE_TOKEN,
+        issue=issue_confirmation,
+        read=confirmation_events,
+        store_identity=identity,
+    )
+    reconciliation = ReconciliationSafetyCapability(
+        token=_HANDLE_TOKEN,
+        persist=persist_report,
+        clear=clear_kill_switch,
+        read=reconciliation_events,
+        kills=kill_switch_events,
+        interlocks=interlock_events,
+        store_identity=identity,
+    )
+    live = LiveSafetyCapability(
+        token=_HANDLE_TOKEN,
+        claim=claim_and_start,
+        acknowledge=record_acknowledgement,
+        unknown=record_unknown,
+        store_identity=identity,
+    )
+    finalize(approval, _release_role_vault, authority_id)
+    finalize(reconciliation, _release_role_vault, authority_id)
+    finalize(live, _release_role_vault, authority_id)
+    return approval, reconciliation, live
+
+
 class SafetyAlreadyUsedError(RuntimeError):
     """A confirmation aggregate already contains a consumption event."""
 
@@ -623,7 +1036,7 @@ def _sha256(value: object) -> str:
     return text
 
 
-def _kill_active(rows: tuple[EventRecord, ...]) -> bool:
+def _kill_active(rows: tuple[EventRecord, ...], reconciliations: tuple[EventRecord, ...]) -> bool:
     latest: EventRecord | None = None
     active = False
     for row in rows:
@@ -633,11 +1046,20 @@ def _kill_active(rows: tuple[EventRecord, ...]) -> bool:
                 return True
             latest, active = row, True
         elif row.kind == "kill_switch.cleared":
+            newer_healthy = any(
+                candidate.kind == "reconciliation.healthy"
+                and candidate.payload.get("healthy") is True
+                and candidate.payload.get("reason_codes") == ()
+                and latest is not None
+                and latest.sequence < candidate.sequence < row.sequence
+                for candidate in reconciliations
+            )
             if (
                 latest is None
                 or row.payload.get("activation_event_id") != latest.event_id
                 or row.payload.get("activation_sequence") != latest.sequence
                 or latest.sequence >= row.sequence
+                or not newer_healthy
             ):
                 return True
             active = False

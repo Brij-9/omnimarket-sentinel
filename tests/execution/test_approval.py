@@ -15,7 +15,7 @@ from market_sentinel.execution.approval import (
     ApprovalService,
     risk_decision_hash,
 )
-from market_sentinel.execution.safety import SafetyAuthenticator, SafetyRepository
+from market_sentinel.execution.safety import create_safety_capabilities
 from market_sentinel.operations.audit import AuditLog
 from market_sentinel.storage.db import create_engine_and_schema
 from market_sentinel.storage.events import EventStore
@@ -32,11 +32,12 @@ def _authenticated_service(
 ) -> tuple[ApprovalService, EventStore]:
     url = "sqlite+pysqlite:///:memory:" if path is None else f"sqlite+pysqlite:///{path}"
     store = EventStore(create_engine_and_schema(url))
-    repository = SafetyRepository(
+    approval, _reconciliation, _live = create_safety_capabilities(
         audit_log=AuditLog(store, clock),
-        authenticator=SafetyAuthenticator(key=key, nonce_source=lambda: b"a" * 32),
+        key=key,
+        nonce_source=lambda: b"a" * 32,
     )
-    return ApprovalService(clock=clock, safety_capability=repository.approval_capability()), store
+    return ApprovalService(clock=clock, safety_capability=approval), store
 
 
 def _approved(*, quantity: str = "0.1", snapshot_hash: str = "a" * 64) -> RiskDecision:

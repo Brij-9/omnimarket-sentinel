@@ -38,7 +38,12 @@ from market_sentinel.execution.reconcile import (
     ReconciliationReport,
     SafetyFence,
 )
-from market_sentinel.execution.safety import SafetyAuthenticator, SafetyRepository
+from market_sentinel.execution.safety import (
+    ApprovalSafetyCapability,
+    LiveSafetyCapability,
+    ReconciliationSafetyCapability,
+    create_safety_capabilities,
+)
 from market_sentinel.operations.audit import AuditLog
 from market_sentinel.portfolio.ledger import PortfolioLedger
 from market_sentinel.storage.db import create_engine_and_schema
@@ -55,10 +60,13 @@ def _next_nonce() -> bytes:
         return next(_NONCES).to_bytes(32, "big")
 
 
-def _safety(store: EventStore, clock: FrozenClock) -> SafetyRepository:
-    return SafetyRepository(
+def _safety(
+    store: EventStore, clock: FrozenClock, *, key: bytes = KEY
+) -> tuple[ApprovalSafetyCapability, ReconciliationSafetyCapability, LiveSafetyCapability]:
+    return create_safety_capabilities(
         audit_log=AuditLog(store, clock),
-        authenticator=SafetyAuthenticator(key=KEY, nonce_source=_next_nonce),
+        key=key,
+        nonce_source=_next_nonce,
     )
 
 
@@ -177,9 +185,9 @@ def _setup(path: Path | None = None, *, broker: LocalBroker | None = None) -> Se
     engine = create_engine_and_schema(url)
     clock = FrozenClock(DEFAULT_INSTANT)
     store = EventStore(engine)
-    safety = _safety(store, clock)
+    approval_safety, reconciliation_safety, live_safety = _safety(store, clock)
     ledger = PortfolioLedger(starting_cash=Decimal("100"), currency="USD")
-    reconciler = Reconciler(safety_capability=safety.reconciliation_capability(), clock=clock)
+    reconciler = Reconciler(safety_capability=reconciliation_safety, clock=clock)
     report = reconciler.compare(
         BrokerReconciliationSnapshot(
             broker="alpaca",
@@ -208,7 +216,7 @@ def _setup(path: Path | None = None, *, broker: LocalBroker | None = None) -> Se
         portfolio_hash=ledger.position_hash(),
         expires_at=DEFAULT_INSTANT + timedelta(minutes=1),
     )
-    approval = ApprovalService(clock=clock, safety_capability=safety.approval_capability())
+    approval = ApprovalService(clock=clock, safety_capability=approval_safety)
     confirmation = approval.create(
         order_intent,
         risk,
@@ -220,7 +228,7 @@ def _setup(path: Path | None = None, *, broker: LocalBroker | None = None) -> Se
         broker=local_broker,
         approval_service=approval,
         reconciler=reconciler,
-        safety_capability=safety.live_capability(),
+        safety_capability=live_safety,
         clock=clock,
         ledger=ledger,
     )
@@ -352,16 +360,14 @@ def test_claim_is_single_use_across_restart(tmp_path: Path) -> None:
     engine2 = create_engine_and_schema(f"sqlite+pysqlite:///{db}")
     clock2 = FrozenClock(DEFAULT_INSTANT)
     store2 = EventStore(engine2)
-    safety2 = _safety(store2, clock2)
+    approval_safety2, reconciliation_safety2, live_safety2 = _safety(store2, clock2)
     ledger2 = PortfolioLedger(starting_cash=Decimal("100"), currency="USD")
-    reconciler2 = Reconciler(safety_capability=safety2.reconciliation_capability(), clock=clock2)
+    reconciler2 = Reconciler(safety_capability=reconciliation_safety2, clock=clock2)
     restarted = LiveOrderService(
         broker=broker,
-        approval_service=ApprovalService(
-            clock=clock2, safety_capability=safety2.approval_capability()
-        ),
+        approval_service=ApprovalService(clock=clock2, safety_capability=approval_safety2),
         reconciler=reconciler2,
-        safety_capability=safety2.live_capability(),
+        safety_capability=live_safety2,
         clock=clock2,
         ledger=ledger2,
     )
@@ -378,16 +384,14 @@ def test_concurrent_double_claim_allows_at_most_one_submit(tmp_path: Path) -> No
     engine2 = create_engine_and_schema(f"sqlite+pysqlite:///{db}")
     clock2 = FrozenClock(DEFAULT_INSTANT)
     store2 = EventStore(engine2)
-    safety2 = _safety(store2, clock2)
+    approval_safety2, reconciliation_safety2, live_safety2 = _safety(store2, clock2)
     ledger2 = PortfolioLedger(starting_cash=Decimal("100"), currency="USD")
-    reconciler2 = Reconciler(safety_capability=safety2.reconciliation_capability(), clock=clock2)
+    reconciler2 = Reconciler(safety_capability=reconciliation_safety2, clock=clock2)
     service2 = LiveOrderService(
         broker=broker,
-        approval_service=ApprovalService(
-            clock=clock2, safety_capability=safety2.approval_capability()
-        ),
+        approval_service=ApprovalService(clock=clock2, safety_capability=approval_safety2),
         reconciler=reconciler2,
-        safety_capability=safety2.live_capability(),
+        safety_capability=live_safety2,
         clock=clock2,
         ledger=ledger2,
     )
@@ -896,10 +900,8 @@ def test_failed_unknown_persistence_leaves_restart_interlock_active(tmp_path: Pa
         event.remove(engine, "before_cursor_execute", fail_after_claim)
 
     restarted_store = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{db}"))
-    restarted_safety = _safety(restarted_store, clock)
-    restarted = Reconciler(
-        safety_capability=restarted_safety.reconciliation_capability(), clock=clock
-    )
+    _approval_safety, restarted_safety, _live_safety = _safety(restarted_store, clock)
+    restarted = Reconciler(safety_capability=restarted_safety, clock=clock)
     assert restarted.kill_switch_active() is True
 
 
@@ -924,8 +926,8 @@ def test_unhealthy_race_between_gate_read_and_claim_conflicts_before_submit(
     ) = data
     original_fence = reconciler.safety_fence
     second_store = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{db}"))
-    second_safety = _safety(second_store, clock)
-    second = Reconciler(safety_capability=second_safety.reconciliation_capability(), clock=clock)
+    _approval_safety, second_safety, _live_safety = _safety(second_store, clock)
+    second = Reconciler(safety_capability=second_safety, clock=clock)
 
     def stale_fence(
         candidate: object,
@@ -1019,21 +1021,18 @@ def test_wrong_safety_key_restart_blocks_live_submission(tmp_path: Path) -> None
         ready,
     ) = data
     store = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{db}"))
-    wrong = SafetyRepository(
-        audit_log=AuditLog(store, clock),
-        authenticator=SafetyAuthenticator(
-            key=b"task-14-live-wrong-safety-key-material", nonce_source=_next_nonce
-        ),
+    wrong_approval, wrong_reconciliation, wrong_live = _safety(
+        store,
+        clock,
+        key=b"task-14-live-wrong-safety-key-material",
     )
     ledger = PortfolioLedger(starting_cash=Decimal("100"), currency="USD")
-    reconciler = Reconciler(safety_capability=wrong.reconciliation_capability(), clock=clock)
+    reconciler = Reconciler(safety_capability=wrong_reconciliation, clock=clock)
     restarted = LiveOrderService(
         broker=broker,
-        approval_service=ApprovalService(
-            clock=clock, safety_capability=wrong.approval_capability()
-        ),
+        approval_service=ApprovalService(clock=clock, safety_capability=wrong_approval),
         reconciler=reconciler,
-        safety_capability=wrong.live_capability(),
+        safety_capability=wrong_live,
         clock=clock,
         ledger=ledger,
     )

@@ -17,7 +17,7 @@ from market_sentinel.execution.reconcile import (
     KillSwitchError,
     Reconciler,
 )
-from market_sentinel.execution.safety import SafetyAuthenticator, SafetyRepository
+from market_sentinel.execution.safety import create_safety_capabilities
 from market_sentinel.operations.audit import AuditLog
 from market_sentinel.portfolio.ledger import PortfolioLedger
 from market_sentinel.storage.db import create_engine_and_schema
@@ -31,14 +31,15 @@ def _services(path: Path | None = None) -> tuple[FrozenClock, EventStore, Reconc
     url = "sqlite+pysqlite:///:memory:" if path is None else f"sqlite+pysqlite:///{path}"
     clock = FrozenClock(DEFAULT_INSTANT)
     store = EventStore(create_engine_and_schema(url))
-    repository = SafetyRepository(
+    _approval, reconciliation, _live = create_safety_capabilities(
         audit_log=AuditLog(store, clock),
-        authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"r" * 32),
+        key=KEY,
+        nonce_source=lambda: b"r" * 32,
     )
     return (
         clock,
         store,
-        Reconciler(safety_capability=repository.reconciliation_capability(), clock=clock),
+        Reconciler(safety_capability=reconciliation, clock=clock),
     )
 
 
@@ -125,12 +126,11 @@ def test_position_and_cash_mismatches_activate_persistent_kill_switch(
     assert report.healthy is False
     assert expected_code in report.reason_codes
     restarted_store = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{db}"))
-    restarted_repository = SafetyRepository(
-        audit_log=AuditLog(restarted_store, clock),
-        authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"r" * 32),
+    _approval, restarted_reconciliation, _live = create_safety_capabilities(
+        audit_log=AuditLog(restarted_store, clock), key=KEY, nonce_source=lambda: b"r" * 32
     )
     restarted = Reconciler(
-        safety_capability=restarted_repository.reconciliation_capability(),
+        safety_capability=restarted_reconciliation,
         clock=clock,
     )
     assert restarted.kill_switch_active() is True
@@ -277,12 +277,11 @@ def test_racing_unhealthy_event_cannot_be_erased_by_clear(tmp_path: Path) -> Non
     _clock, _store, first = _services(db)
     clock2 = FrozenClock(DEFAULT_INSTANT + timedelta(seconds=1))
     store2 = EventStore(create_engine_and_schema(f"sqlite+pysqlite:///{db}"))
-    second_repository = SafetyRepository(
-        audit_log=AuditLog(store2, clock2),
-        authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"r" * 32),
+    _approval, second_reconciliation, _live = create_safety_capabilities(
+        audit_log=AuditLog(store2, clock2), key=KEY, nonce_source=lambda: b"r" * 32
     )
     second = Reconciler(
-        safety_capability=second_repository.reconciliation_capability(),
+        safety_capability=second_reconciliation,
         clock=clock2,
     )
     first.compare(_snapshot(cash=Decimal("89")), _ledger(), ())
@@ -341,11 +340,9 @@ def test_signed_clear_requires_exact_existing_prior_activation_marker(
     """Even a signed malformed clear cannot cover a nonexistent or future activation."""
     clock = FrozenClock(DEFAULT_INSTANT)
     store = EventStore(create_engine_and_schema("sqlite+pysqlite:///:memory:"))
-    repository = SafetyRepository(
-        audit_log=AuditLog(store, clock),
-        authenticator=SafetyAuthenticator(key=KEY, nonce_source=lambda: b"r" * 32),
+    _approval, capability, _live = create_safety_capabilities(
+        audit_log=AuditLog(store, clock), key=KEY, nonce_source=lambda: b"r" * 32
     )
-    capability = repository.reconciliation_capability()
     with pytest.raises(TypeError):
         capability.clear_kill_switch(**payload)  # type: ignore[arg-type]
 

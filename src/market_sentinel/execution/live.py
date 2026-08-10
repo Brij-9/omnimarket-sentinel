@@ -28,6 +28,7 @@ from market_sentinel.execution.safety import (
     LiveSafetyCapability,
     SafetyAlreadyUsedError,
     SafetyIntegrityError,
+    SafetyStateChangedError,
 )
 from market_sentinel.portfolio.ledger import PortfolioLedger
 from market_sentinel.storage.events import EventHeadConflict
@@ -321,6 +322,8 @@ class LiveOrderService:
             )
         except SafetyAlreadyUsedError:
             raise LiveOrderError("CONFIRMATION_USED") from None
+        except SafetyStateChangedError:
+            raise LiveOrderError("SAFETY_STATE_CHANGED") from None
         except SafetyIntegrityError:
             raise LiveOrderError("CONFIRMATION_INVALID") from None
         except EventHeadConflict:
