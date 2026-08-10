@@ -48,15 +48,30 @@ class AuditLog:
         """Redact and persist separate supplied-time rows in one transaction."""
         if not isinstance(batch, tuple) or not batch:
             raise ValueError("audit batch must be a nonempty tuple")
-        self._store.append_many(
-            tuple(
-                EventAppend(
-                    event_id=event.event_id,
-                    kind=event.kind,
-                    aggregate_id=event.aggregate_id,
-                    payload=redact_mapping(event.payload),
-                    occurred_at=event.occurred_at,
-                )
-                for event in batch
-            )
+        self._store.append_many(_redacted_appends(batch))
+
+    def record_many_if_heads(
+        self,
+        batch: tuple[AuditEvent, ...],
+        expected_heads: Mapping[str, str | None],
+    ) -> None:
+        """Conditionally persist a redacted batch against exact durable aggregate heads."""
+        if not isinstance(batch, tuple) or not batch:
+            raise ValueError("audit batch must be a nonempty tuple")
+        self._store.append_many_if_heads(
+            _redacted_appends(batch),
+            expected_heads,
         )
+
+
+def _redacted_appends(batch: tuple[AuditEvent, ...]) -> tuple[EventAppend, ...]:
+    return tuple(
+        EventAppend(
+            event_id=event.event_id,
+            kind=event.kind,
+            aggregate_id=event.aggregate_id,
+            payload=redact_mapping(event.payload),
+            occurred_at=event.occurred_at,
+        )
+        for event in batch
+    )

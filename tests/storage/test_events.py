@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from market_sentinel.domain.clock import FrozenClock
 from market_sentinel.operations.audit import AuditEvent, AuditLog
 from market_sentinel.storage.db import create_engine_and_schema
-from market_sentinel.storage.events import EventAppend, EventStore
+from market_sentinel.storage.events import EventAppend, EventHeadConflict, EventStore
 
 
 def test_event_store_is_ordered_and_event_ids_are_immutable() -> None:
@@ -200,3 +200,23 @@ def test_audit_log_rejects_non_event_store_sink_and_exposes_sealed_store() -> No
     store = EventStore(create_engine_and_schema("sqlite+pysqlite:///:memory:"))
     audit = AuditLog(store, FrozenClock(at))
     assert audit.event_store is store
+
+
+def test_conditional_append_conflict_consumes_no_rows_or_sequence(tmp_path: Path) -> None:
+    """A stale aggregate-head fence must roll back both its batch and sequence allocation."""
+    url = f"sqlite+pysqlite:///{tmp_path / 'guarded.db'}"
+    first = EventStore(create_engine_and_schema(url))
+    second = EventStore(create_engine_and_schema(url))
+    at = datetime(2026, 8, 9, 10, tzinfo=UTC)
+    first.append("healthy", "reconciliation.healthy", "reconciliation", {}, at)
+    second.append("unhealthy", "reconciliation.unhealthy", "reconciliation", {}, at)
+
+    with pytest.raises(EventHeadConflict):
+        first.append_many_if_heads(
+            (EventAppend("claim", "live.claimed", "intent", {}, at),),
+            {"reconciliation": "healthy", "new-aggregate": None},
+        )
+
+    first.append("after", "recorded", "other", {}, at)
+    assert tuple(first.stream("intent")) == ()
+    assert [row.sequence for row in first.stream("other")] == [3]
