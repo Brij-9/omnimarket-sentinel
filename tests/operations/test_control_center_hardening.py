@@ -19,10 +19,13 @@ from decimal import Decimal
 from itertools import count
 from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
+from time import monotonic
 from types import MappingProxyType
 
 import pytest
 import typer
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 from sqlalchemy import func, select
 from typer.testing import CliRunner
 
@@ -1129,6 +1132,348 @@ _ENCODED_BROKER_IDENTIFIERS = (
     ("instrument_id", "%70rivate%2Ekey%3DOpaqueValue123456", "private.key="),
     ("order_id", "%61pi%2Fkey%3DOpaqueValue123456", "api/key="),
 )
+
+_OPAQUE_RESPONSE_CREDENTIAL = "OpaqueValue123456"
+_GENERALIZED_SECRET_LABELS = (
+    "secret_key",
+    "api_token",
+    "private_token",
+    "session_key",
+    "SeSsIoN_ToKeN",
+    "client_secret",
+    "refresh_token",
+    "id_token",
+    "jwt",
+    "api-key",
+    "access.key",
+    "private/key",
+    "session/id",
+)
+_QUOTED_SECRET_ASSIGNMENTS = (
+    f'"api_key":"{_OPAQUE_RESPONSE_CREDENTIAL}"',
+    f"'session_token'='{_OPAQUE_RESPONSE_CREDENTIAL}'",
+    f'"private key" is "{_OPAQUE_RESPONSE_CREDENTIAL}"',
+    f"[api_key]={_OPAQUE_RESPONSE_CREDENTIAL}",
+)
+_GENERALIZED_SECRET_TOKENS = (
+    "secret",
+    "token",
+    "password",
+    "credential",
+    "authorization",
+    "auth",
+    "cookie",
+    "bearer",
+    "private",
+    "access",
+    "api",
+    "session",
+    "key",
+    "id",
+    "jwt",
+    "refresh",
+    "client",
+    "totp",
+    "otp",
+    "passphrase",
+    "passwd",
+    "pwd",
+)
+_GENERALIZED_LABEL_SEPARATORS = (
+    "",
+    " ",
+    "  ",
+    "\t",
+    "\u00a0",
+    "_",
+    "-",
+    ".",
+    "/",
+    ":",
+)
+_CANONICAL_SECRET_LABELS = (
+    "authorization",
+    "auth",
+    "basic",
+    "bearer",
+    "api_key",
+    "access_key",
+    "secret_key",
+    "access_token",
+    "private_key",
+    "private_token",
+    "session_key",
+    "session_token",
+    "client_secret",
+    "refresh_token",
+    "id_token",
+    "password",
+    "credential",
+    "cookie",
+    "secret",
+    "token",
+    "jwt",
+    "totp",
+    "otp",
+    "passphrase",
+    "passwd",
+    "pwd",
+)
+
+
+def _percent_plus_encode(value: str) -> str:
+    """Encode every non-alphanumeric UTF-8 byte, using plus for ASCII spaces."""
+    encoded: list[str] = []
+    for octet in value.encode("utf-8"):
+        if 0x30 <= octet <= 0x39 or 0x41 <= octet <= 0x5A or 0x61 <= octet <= 0x7A:
+            encoded.append(chr(octet))
+        elif octet == 0x20:
+            encoded.append("+")
+        else:
+            encoded.append(f"%{octet:02X}")
+    return "".join(encoded)
+
+
+def _encoded_rounds(value: str, depth: int) -> str:
+    for _round in range(depth):
+        value = _percent_plus_encode(value)
+    return value
+
+
+def _assert_context_does_not_contain(error: BaseException | None, unsafe: str) -> None:
+    while error is not None:
+        assert unsafe not in str(error)
+        if error.__cause__ is not None:
+            assert unsafe not in str(error.__cause__)
+        error = error.__context__
+
+
+def _assert_truthful_redacted_ack(
+    harness: _LiveHarness,
+    result: object,
+    *,
+    unsafe_values: tuple[str, ...],
+) -> None:
+    audit_rows = harness.audit_rows()
+    audit_text = json.dumps(audit_rows, ensure_ascii=False)
+    acknowledged = [
+        json.loads(payload)
+        for kind, payload in audit_rows
+        if kind == "live.acknowledged"
+    ]
+
+    assert result.exit_code == 30
+    assert result.stdout.strip() == '{"error":"LIVE_RESPONSE_INVALID"}'
+    assert harness.broker.submit_calls == 1
+    assert harness.broker.query_calls == 0
+    assert len(acknowledged) == 1
+    assert acknowledged[0]["broker_order_id"] == "[REDACTED]"
+    assert "live.submission_unknown" not in {kind for kind, _payload in audit_rows}
+    for unsafe in unsafe_values:
+        assert unsafe not in result.stdout
+        assert unsafe not in audit_text
+        _assert_context_does_not_contain(result.exception, unsafe)
+
+
+@pytest.mark.parametrize("label", _GENERALIZED_SECRET_LABELS)
+@pytest.mark.parametrize("encoding_depth", range(4), ids=("raw", "single", "double", "triple"))
+def test_real_task14_cli_rejects_generalized_secret_labels_at_every_encoding_depth(
+    tmp_path: Path,
+    label: str,
+    encoding_depth: int,
+) -> None:
+    """The full required label/encoding matrix is redacted after exactly one real submit."""
+    raw_assignment = f"{label}={_OPAQUE_RESPONSE_CREDENTIAL}"
+    encoded_assignment = _encoded_rounds(raw_assignment, encoding_depth)
+    harness = _LiveHarness(tmp_path)
+    harness.broker.order_id = encoded_assignment
+
+    result = _live_cli_result(harness)
+
+    _assert_truthful_redacted_ack(
+        harness,
+        result,
+        unsafe_values=(encoded_assignment, raw_assignment, _OPAQUE_RESPONSE_CREDENTIAL),
+    )
+
+
+@settings(
+    deadline=None,
+    max_examples=24,
+    suppress_health_check=(HealthCheck.function_scoped_fixture,),
+)
+@given(
+    tokens=st.lists(
+        st.sampled_from(_GENERALIZED_SECRET_TOKENS),
+        min_size=1,
+        max_size=3,
+    ),
+    separator=st.sampled_from(_GENERALIZED_LABEL_SEPARATORS),
+    assignment_form=st.sampled_from(("=", ":", "is", "was")),
+    encoding_depth=st.integers(min_value=0, max_value=3),
+    mixed_case=st.booleans(),
+)
+def test_real_task14_cli_property_rejects_sensitive_assignment_grammar(
+    tmp_path: Path,
+    tokens: list[str],
+    separator: str,
+    assignment_form: str,
+    encoding_depth: int,
+    mixed_case: bool,
+) -> None:
+    """Sensitive token combinations cannot escape through any supported assignment form."""
+    label = separator.join(tokens)
+    if mixed_case:
+        label = "".join(
+            character.upper() if offset % 2 == 0 else character.lower()
+            for offset, character in enumerate(label)
+        )
+    operator = assignment_form if assignment_form in {"=", ":"} else f" {assignment_form} "
+    raw_assignment = f"{label}{operator}{_OPAQUE_RESPONSE_CREDENTIAL}"
+    encoded_assignment = _encoded_rounds(raw_assignment, encoding_depth)
+    case_path = tmp_path / f"case-{sum(1 for _entry in tmp_path.iterdir())}"
+    case_path.mkdir()
+    harness = _LiveHarness(case_path)
+    harness.broker.order_id = encoded_assignment
+
+    result = _live_cli_result(harness)
+
+    _assert_truthful_redacted_ack(
+        harness,
+        result,
+        unsafe_values=(encoded_assignment, raw_assignment, _OPAQUE_RESPONSE_CREDENTIAL),
+    )
+
+
+@pytest.mark.parametrize("identifier", ("broker-order-1", "order_2026", "AAPL"))
+def test_real_task14_cli_allows_benign_broker_identifiers(
+    tmp_path: Path,
+    identifier: str,
+) -> None:
+    """General secret detection must retain ordinary broker identifier output."""
+    harness = _LiveHarness(tmp_path)
+    harness.broker.order_id = identifier
+
+    result = _live_cli_result(harness)
+
+    assert result.exit_code == 0
+    assert harness.broker.submit_calls == 1
+    assert harness.broker.query_calls == 0
+    assert json.loads(result.stdout)["order_id"] == identifier
+
+
+@pytest.mark.parametrize("raw_assignment", _QUOTED_SECRET_ASSIGNMENTS)
+@pytest.mark.parametrize("encoding_depth", range(4), ids=("raw", "single", "double", "triple"))
+def test_real_task14_cli_rejects_quoted_sensitive_labels_at_every_encoding_depth(
+    tmp_path: Path,
+    raw_assignment: str,
+    encoding_depth: int,
+) -> None:
+    """Quotes and brackets around labels cannot bypass the generalized grammar."""
+    encoded_assignment = _encoded_rounds(raw_assignment, encoding_depth)
+    harness = _LiveHarness(tmp_path)
+    harness.broker.order_id = encoded_assignment
+
+    result = _live_cli_result(harness)
+
+    _assert_truthful_redacted_ack(
+        harness,
+        result,
+        unsafe_values=(encoded_assignment, raw_assignment, _OPAQUE_RESPONSE_CREDENTIAL),
+    )
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    ("monkey=123456", "rapid:123456", "author=alice", "clientele=retail", "keynote=annual"),
+)
+def test_real_task14_cli_allows_benign_assignment_like_identifiers(
+    tmp_path: Path,
+    identifier: str,
+) -> None:
+    """Sensitive substrings inside unrelated label tokens are not credentials."""
+    harness = _LiveHarness(tmp_path)
+    harness.broker.order_id = identifier
+
+    result = _live_cli_result(harness)
+
+    assert result.exit_code == 0
+    assert harness.broker.submit_calls == 1
+    assert harness.broker.query_calls == 0
+    assert json.loads(result.stdout)["order_id"] == identifier
+
+
+@pytest.mark.parametrize(
+    ("hostile_text", "expected"),
+    (
+        (":" * 4096, False),
+        (("\"[]/_-: " * 512)[:4096], False),
+        (("%25" * 1365)[:4095], True),
+        ("z" * 4088 + "=value", False),
+    ),
+)
+def test_secret_assignment_tokenizer_has_a_linear_maximum_input_budget(
+    hostile_text: str,
+    expected: bool,
+) -> None:
+    """Every bounded adversarial input finishes far below a multi-second DoS budget."""
+    started = monotonic()
+
+    detected = security_module.secret_text_present(hostile_text)
+
+    assert detected is expected
+    assert monotonic() - started < 2.0
+
+
+def test_every_canonical_secret_label_is_detected_and_structurally_redacted() -> None:
+    """One canonical vocabulary covers separators, operators, encodings, and mappings."""
+    assert frozenset(_CANONICAL_SECRET_LABELS) == security_module._CANONICAL_SENSITIVE_LABELS
+    for canonical_label in _CANONICAL_SECRET_LABELS:
+        label_tokens = canonical_label.split("_")
+        for separator in _GENERALIZED_LABEL_SEPARATORS:
+            label = separator.join(label_tokens)
+            for assignment_form in ("=", ":", "is", "was"):
+                operator = (
+                    assignment_form
+                    if assignment_form in {"=", ":"}
+                    else f" {assignment_form} "
+                )
+                raw_assignment = f"{label}{operator}{_OPAQUE_RESPONSE_CREDENTIAL}"
+                for encoding_depth in range(4):
+                    encoded_assignment = _encoded_rounds(raw_assignment, encoding_depth)
+                    assert security_module.secret_text_present(encoded_assignment), (
+                        canonical_label,
+                        separator,
+                        assignment_form,
+                        encoding_depth,
+                    )
+
+    redacted = security_module.redact_mapping(
+        dict.fromkeys(_CANONICAL_SECRET_LABELS, _OPAQUE_RESPONSE_CREDENTIAL)
+    )
+    assert set(redacted.values()) == {"[REDACTED]"}
+
+
+@pytest.mark.parametrize("label", ("totp", "otp", "passphrase", "passwd", "pwd"))
+@pytest.mark.parametrize("encoding_depth", range(4), ids=("raw", "single", "double", "triple"))
+def test_real_task14_cli_rejects_one_time_secret_aliases_at_every_encoding_depth(
+    tmp_path: Path,
+    label: str,
+    encoding_depth: int,
+) -> None:
+    """OTP and password aliases receive the same truthful post-submit redaction."""
+    raw_assignment = f"{label}={_OPAQUE_RESPONSE_CREDENTIAL}"
+    encoded_assignment = _encoded_rounds(raw_assignment, encoding_depth)
+    harness = _LiveHarness(tmp_path)
+    harness.broker.order_id = encoded_assignment
+
+    result = _live_cli_result(harness)
+
+    _assert_truthful_redacted_ack(
+        harness,
+        result,
+        unsafe_values=(encoded_assignment, raw_assignment, _OPAQUE_RESPONSE_CREDENTIAL),
+    )
 
 
 @pytest.mark.parametrize(("field", "encoded_value", "decoded_marker"), _ENCODED_BROKER_IDENTIFIERS)
