@@ -1,0 +1,164 @@
+name: ci
+
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  MARKET_SENTINEL_MODE: paper
+  ALPACA_LIVE_TRADING_ENABLED: "false"
+  ALPACA_REAL_API_ENABLED: "false"
+  INDIA_LIVE_TRADING_ENABLED: "false"
+  GROWW_REAL_API_ENABLED: "false"
+  CCXT_LIVE_TRADING_ENABLED: "false"
+  CCXT_REAL_API_ENABLED: "false"
+  CCXT_SANDBOX: "true"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  lint-type:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Prepare hash-verifiable lock
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          pin = "tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@a33fd4c0f134485a43553a2c23a63cb14adbd88f"
+          text = Path("requirements.lock").read_text(encoding="utf-8")
+          if text.count(pin) != 1:
+              raise SystemExit("exact Tauric VCS pin missing or duplicated")
+          Path("requirements-hashed.lock").write_text(text.replace(pin + "\n", ""), encoding="utf-8")
+          PY
+      - name: Install exact locked dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements-hashed.lock
+          python -m pip install --no-deps "tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@a33fd4c0f134485a43553a2c23a63cb14adbd88f"
+          python -m pip install --no-deps -e .
+          python -m pip check
+      - run: python -m ruff check .
+      - run: python -m mypy --strict src/market_sentinel
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Prepare hash-verifiable lock
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          pin = "tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@a33fd4c0f134485a43553a2c23a63cb14adbd88f"
+          text = Path("requirements.lock").read_text(encoding="utf-8")
+          if text.count(pin) != 1:
+              raise SystemExit("exact Tauric VCS pin missing or duplicated")
+          Path("requirements-hashed.lock").write_text(text.replace(pin + "\n", ""), encoding="utf-8")
+          PY
+      - name: Install exact locked dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements-hashed.lock
+          python -m pip install --no-deps "tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@a33fd4c0f134485a43553a2c23a63cb14adbd88f"
+          python -m pip install --no-deps -e .
+      - run: python -m pytest -m "not integration and not e2e" --ignore=tests/e2e --cov=market_sentinel --cov-report=term-missing
+
+  fixture-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Prepare hash-verifiable lock
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          pin = "tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@a33fd4c0f134485a43553a2c23a63cb14adbd88f"
+          text = Path("requirements.lock").read_text(encoding="utf-8")
+          if text.count(pin) != 1:
+              raise SystemExit("exact Tauric VCS pin missing or duplicated")
+          Path("requirements-hashed.lock").write_text(text.replace(pin + "\n", ""), encoding="utf-8")
+          PY
+      - name: Install exact locked dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements-hashed.lock
+          python -m pip install --no-deps "tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@a33fd4c0f134485a43553a2c23a63cb14adbd88f"
+          python -m pip install --no-deps -e .
+      - run: python -m pytest -m "integration or e2e" tests
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Prepare hash-verifiable lock
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          pin = "tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@a33fd4c0f134485a43553a2c23a63cb14adbd88f"
+          text = Path("requirements.lock").read_text(encoding="utf-8")
+          if text.count(pin) != 1:
+              raise SystemExit("exact Tauric VCS pin missing or duplicated")
+          Path("requirements-hashed.lock").write_text(text.replace(pin + "\n", ""), encoding="utf-8")
+          PY
+      - name: Install audit tool from exact lock
+        run: python -m pip install --require-hashes -r requirements-hashed.lock
+      - name: Audit index-backed locked dependencies
+        run: pip-audit -r requirements-hashed.lock
+      - name: Verify separately reviewed VCS boundary
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          pin = "tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@a33fd4c0f134485a43553a2c23a63cb14adbd88f"
+          if Path("pyproject.toml").read_text(encoding="utf-8").count(pin) != 1:
+              raise SystemExit("pyproject Tauric VCS pin mismatch")
+          if Path("requirements.lock").read_text(encoding="utf-8").count(pin) != 1:
+              raise SystemExit("lock Tauric VCS pin mismatch")
+          PY
+      - name: Scan tracked repository without printing matches
+        run: python scripts/scan_repository_secrets.py
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Prepare hash-verifiable lock
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          pin = "tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@a33fd4c0f134485a43553a2c23a63cb14adbd88f"
+          text = Path("requirements.lock").read_text(encoding="utf-8")
+          if text.count(pin) != 1:
+              raise SystemExit("exact Tauric VCS pin missing or duplicated")
+          Path("requirements-hashed.lock").write_text(text.replace(pin + "\n", ""), encoding="utf-8")
+          PY
+      - run: python -m pip install --require-hashes -r requirements-hashed.lock
+      - run: python -m build
+      - name: Install wheel into a clean environment and smoke it
+        run: |
+          python -m venv "$RUNNER_TEMP/package-smoke"
+          "$RUNNER_TEMP/package-smoke/bin/python" -m pip install --require-hashes -r requirements-hashed.lock
+          "$RUNNER_TEMP/package-smoke/bin/python" -m pip install --no-deps "tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@a33fd4c0f134485a43553a2c23a63cb14adbd88f"
+          "$RUNNER_TEMP/package-smoke/bin/python" -m pip install --no-deps dist/*.whl
+          "$RUNNER_TEMP/package-smoke/bin/python" -c "import market_sentinel"
+          "$RUNNER_TEMP/package-smoke/bin/python" -m market_sentinel.cli status
+          "$RUNNER_TEMP/package-smoke/bin/python" -m market_sentinel.cli research --instrument RELIANCE@groww --as-of 2026-08-10T03:48:30+00:00
+          "$RUNNER_TEMP/package-smoke/bin/python" -m market_sentinel.cli backtest --instrument AAPL@alpaca --start 2026-08-10T13:30:00+00:00 --end 2026-08-10T13:33:30+00:00
+          "$RUNNER_TEMP/package-smoke/bin/python" -m market_sentinel.cli paper-run --instrument BTC-USDT@ccxt-spot --as-of 2026-08-10T00:20:30+00:00
