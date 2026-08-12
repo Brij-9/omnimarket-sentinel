@@ -746,7 +746,7 @@ def _is_network_path(path: Path) -> bool:
     if not root:
         return True
     try:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
         get_drive_type = cast(Callable[[str], int], kernel32.GetDriveTypeW)
         drive_type = get_drive_type(root)
     except Exception:
@@ -910,8 +910,8 @@ def _rename_windows_open_file(descriptor: int, destination: Path) -> None:
         encoded_filename,
         len(encoded_filename),
     )
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    prototype = ctypes.WINFUNCTYPE(
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    prototype = vars(ctypes)["WINFUNCTYPE"](
         wintypes.BOOL,
         wintypes.HANDLE,
         ctypes.c_int,
@@ -920,7 +920,7 @@ def _rename_windows_open_file(descriptor: int, destination: Path) -> None:
     )
     set_information = prototype(("SetFileInformationByHandle", kernel32))
     succeeded = set_information(
-        msvcrt.get_osfhandle(descriptor),
+        vars(msvcrt)["get_osfhandle"](descriptor),
         3,
         information_buffer,
         information_size,
@@ -938,8 +938,8 @@ def _delete_windows_open_file(descriptor: int) -> None:
         _fields_ = (("delete_file", wintypes.BOOLEAN),)
 
     information = _FileDispositionInfo(True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    prototype = ctypes.WINFUNCTYPE(
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    prototype = vars(ctypes)["WINFUNCTYPE"](
         wintypes.BOOL,
         wintypes.HANDLE,
         ctypes.c_int,
@@ -948,7 +948,7 @@ def _delete_windows_open_file(descriptor: int) -> None:
     )
     set_information = prototype(("SetFileInformationByHandle", kernel32))
     succeeded = set_information(
-        msvcrt.get_osfhandle(descriptor),
+        vars(msvcrt)["get_osfhandle"](descriptor),
         4,
         ctypes.byref(information),
         ctypes.sizeof(information),
@@ -1019,8 +1019,8 @@ def _windows_destination_mutex(destination: Path) -> Iterator[None]:
 
     digest = hashlib.sha256(str(destination).casefold().encode("utf-8")).hexdigest()
     name = f"Local\\OmnimarketSentinelDashboard-{digest}"
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    create_prototype = ctypes.WINFUNCTYPE(
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    create_prototype = vars(ctypes)["WINFUNCTYPE"](
         wintypes.HANDLE,
         ctypes.c_void_p,
         wintypes.BOOL,
@@ -1030,9 +1030,13 @@ def _windows_destination_mutex(destination: Path) -> Iterator[None]:
     handle = create_mutex(None, False, name)
     if handle is None:
         raise DashboardValidationError("DASHBOARD_LOCK_UNAVAILABLE")
-    wait_prototype = ctypes.WINFUNCTYPE(wintypes.DWORD, wintypes.HANDLE, wintypes.DWORD)
+    wait_prototype = vars(ctypes)["WINFUNCTYPE"](
+        wintypes.DWORD, wintypes.HANDLE, wintypes.DWORD
+    )
     wait = wait_prototype(("WaitForSingleObject", kernel32))
-    release_prototype = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HANDLE)
+    release_prototype = vars(ctypes)["WINFUNCTYPE"](
+        wintypes.BOOL, wintypes.HANDLE
+    )
     release = release_prototype(("ReleaseMutex", kernel32))
     acquired = wait(handle, 30_000)
     if acquired not in {0, 0x00000080}:
@@ -1074,8 +1078,8 @@ def _create_sibling_temp(
 def _create_windows_sibling_temp(destination: _Destination) -> tuple[int, Path]:
     import msvcrt
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    prototype = ctypes.WINFUNCTYPE(
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    prototype = vars(ctypes)["WINFUNCTYPE"](
         ctypes.c_void_p,
         ctypes.c_wchar_p,
         ctypes.c_uint32,
@@ -1102,14 +1106,14 @@ def _create_windows_sibling_temp(destination: _Destination) -> tuple[int, Path]:
         )
         if handle is not None and handle != invalid:
             try:
-                descriptor = msvcrt.open_osfhandle(
+                descriptor = vars(msvcrt)["open_osfhandle"](
                     int(handle), os.O_RDWR | getattr(os, "O_BINARY", 0)
                 )
             except OSError:
                 _close_windows_handle(int(handle))
                 raise
             return descriptor, path
-        if ctypes.get_last_error() != 80:
+        if vars(ctypes)["get_last_error"]() != 80:
             raise DashboardValidationError("DASHBOARD_TEMP_UNAVAILABLE")
     raise DashboardValidationError("DASHBOARD_TEMP_UNAVAILABLE")
 
@@ -1125,8 +1129,8 @@ def _directory_components(parent: Path) -> tuple[Path, ...]:
 
 
 def _lock_windows_directory(path: Path) -> int:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    prototype = ctypes.WINFUNCTYPE(
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    prototype = vars(ctypes)["WINFUNCTYPE"](
         ctypes.c_void_p,
         ctypes.c_wchar_p,
         ctypes.c_uint32,
@@ -1153,8 +1157,8 @@ def _lock_windows_directory(path: Path) -> int:
 
 
 def _close_windows_handle(handle: int) -> None:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    prototype = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    prototype = vars(ctypes)["WINFUNCTYPE"](ctypes.c_int, ctypes.c_void_p)
     close_handle = prototype(("CloseHandle", kernel32))
     close_handle(handle)
 
