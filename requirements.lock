@@ -3006,6 +3006,9 @@ urllib3==2.7.0 \
     # via
     #   ccxt
     #   requests
+uvloop==0.22.1 ; platform_system != "Windows" and implementation_name == "cpython" \
+    --hash=sha256:7b5b1ac819a3f946d3b2ee07f09149578ae76066d70b44df3fa990add49a82e4
+    # via ccxt
 uuid-utils==0.17.0 \
     --hash=sha256:03815cea572c8a693cab5475b9d750cc161470961c7defa27e9286cad62f38f5 \
     --hash=sha256:04452640d8b6920c480c16e5afe91ff896d236e0c972830f9247e0898d38c803 \
@@ -3192,7 +3195,7 @@ wheel==0.47.0 \
     --hash=sha256:212281cab4dff978f6cedd499cd893e1f620791ca6ff7107cf270781e587eced \
     --hash=sha256:cc72bd1009ba0cf63922e28f94d9d83b920aa2bb28f798a31d0691b02fa3c9b3
     # via pip-tools
-winloop==0.6.3 \
+winloop==0.6.3 ; platform_system == "Windows" and implementation_name == "cpython" and python_version < "3.15" and platform_machine in "AMD64 ARM64" \
     --hash=sha256:17332c0348f3274fb0e3e5acead90c9aaa1e1d5f699703475974c51116a7d99b \
     --hash=sha256:1e4460ac1b067d868759d84c821dfee2deab8615d2a6db1731400f46e14aed69 \
     --hash=sha256:1ea7b90487f720eccf984dc65b793550bc86fcdc7c2f9b9f4fbfeac23f2b8dd0 \

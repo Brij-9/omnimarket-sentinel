@@ -9,6 +9,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import yaml  # type: ignore[import-untyped]
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -182,6 +184,55 @@ def test_lock_boundary_keeps_exact_tauric_commit_without_fake_hash() -> None:
     assert exact in workflow_text
     assert not re.search(rf"{re.escape(exact)}\s*\\\s*--hash", lock)
     assert "requirements-hashed.lock" in workflow_text
+
+
+def test_lock_preserves_ccxt_event_loop_dependencies_across_platforms() -> None:
+    """The checked-in lock must resolve CCXT's event loop dependency on CI and Windows."""
+    lines = (ROOT / "requirements.lock").read_text(encoding="utf-8").splitlines()
+
+    def requirement_block(name: str) -> list[str]:
+        start = next(
+            (index for index, line in enumerate(lines) if line.startswith(f"{name}==")),
+            None,
+        )
+        assert start is not None, f"{name} is missing from requirements.lock"
+        end = next(
+            (
+                index
+                for index in range(start + 1, len(lines))
+                if lines[index]
+                and not lines[index].startswith((" ", "#"))
+            ),
+            len(lines),
+        )
+        return lines[start:end]
+
+    uvloop = requirement_block("uvloop")
+    winloop = requirement_block("winloop")
+    uvloop_requirement = Requirement(uvloop[0].removesuffix("\\").strip())
+    winloop_requirement = Requirement(winloop[0].removesuffix("\\").strip())
+    assert uvloop_requirement.marker is not None
+    assert winloop_requirement.marker is not None
+
+    linux = default_environment()
+    linux.update(
+        platform_system="Linux",
+        implementation_name="cpython",
+        python_version="3.12",
+        platform_machine="x86_64",
+    )
+    windows = dict(linux)
+    windows.update(platform_system="Windows", platform_machine="AMD64")
+
+    assert uvloop_requirement.marker.evaluate(linux)
+    assert not uvloop_requirement.marker.evaluate(windows)
+    assert not winloop_requirement.marker.evaluate(linux)
+    assert winloop_requirement.marker.evaluate(windows)
+    assert any(
+        "--hash=sha256:7b5b1ac819a3f946d3b2ee07f09149578ae76066d70b44df3fa990add49a82e4"
+        in line
+        for line in uvloop
+    )
 
 
 def test_package_includes_cli_and_powershell_wrappers() -> None:
