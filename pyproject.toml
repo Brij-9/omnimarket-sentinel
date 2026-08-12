@@ -41,6 +41,9 @@ market-sentinel = "market_sentinel.cli:app"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"market_sentinel.operations" = ["fixtures/*.json"]
+
 [tool.setuptools.data-files]
 "share/omnimarket-sentinel/scripts" = [
   "scripts/check-readiness.ps1",

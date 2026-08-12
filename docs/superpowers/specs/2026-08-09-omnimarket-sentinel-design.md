@@ -268,6 +268,10 @@ Implementation follows red-green-refactor: each behavior begins with a failing t
 - GitHub Actions runs lint, type, unit, integration-fixture, security, and packaging checks.
 - Documentation explains setup, paper operation, live gates, limitations, and why no profit is guaranteed.
 
+Implementation evidence is indexed in
+`docs/verification/2026-08-09-completion-audit.md`; release still requires fresh
+verification of the cited commands and retains every documented limitation.
+
 ## 18. Authoritative references
 
 - Tauric Research TradingAgents: https://github.com/TauricResearch/TradingAgents

@@ -564,6 +564,93 @@ class ServiceContainer:
                 ) from None
 
 
+@dataclass(frozen=True, slots=True)
+class _FixtureWorkflowService:
+    """Expose only the three packaged, sanitized, no-network fixture workflows."""
+
+    workflow: str
+
+    def run(self, request: WorkflowRequest) -> Mapping[str, object]:
+        from market_sentinel.operations.fixture_pipeline import FixturePipelineRunner
+
+        specifications = {
+            "RELIANCE@groww": (
+                "india",
+                datetime(2026, 8, 10, 3, 45, tzinfo=UTC),
+                datetime(2026, 8, 10, 3, 48, 30, tzinfo=UTC),
+            ),
+            "AAPL@alpaca": (
+                "us",
+                datetime(2026, 8, 10, 13, 30, tzinfo=UTC),
+                datetime(2026, 8, 10, 13, 33, 30, tzinfo=UTC),
+            ),
+            "BTC-USDT@ccxt-spot": (
+                "crypto",
+                datetime(2026, 8, 10, 0, 0, tzinfo=UTC),
+                datetime(2026, 8, 10, 0, 20, 30, tzinfo=UTC),
+            ),
+        }
+        if request.workflow != self.workflow or request.instrument_id not in specifications:
+            raise ValueError("fixture workflow request is not allowlisted")
+        market, start, cutoff = specifications[request.instrument_id]
+        if self.workflow == "backtest":
+            if request.start_at != start or request.end_at != cutoff or request.as_of is not None:
+                raise ValueError("fixture backtest interval is not exact")
+        elif (
+            request.as_of != cutoff
+            or request.start_at is not None
+            or request.end_at is not None
+        ):
+            raise ValueError("fixture point-in-time request is not exact")
+
+        result = FixturePipelineRunner().run(
+            market,
+            requested_as_of=cutoff,
+            expected_instrument_id=request.instrument_id,
+        )
+        common: dict[str, object] = {
+            "instrument": result.instrument_id,
+            "live_ready": False,
+            "market": result.market,
+            "workflow": self.workflow,
+        }
+        if self.workflow == "research":
+            common.update(
+                {
+                    "as_of": result.research_packet.as_of.isoformat(),
+                    "evidence_count": len(result.research_packet.evidence),
+                    "model_id": result.research_packet.model_id,
+                    "risk_approved": result.risk_decision.approved,
+                }
+            )
+            return common
+        if self.workflow == "backtest":
+            metrics = result.backtest.metrics
+            common.update(
+                {
+                    "after_cost": result.backtest.after_cost,
+                    "benchmark_excess_return": (
+                        None
+                        if metrics.benchmark_excess_return is None
+                        else str(metrics.benchmark_excess_return)
+                    ),
+                    "fees": str(result.backtest.total_fees),
+                    "maximum_drawdown": str(metrics.maximum_drawdown),
+                    "robustness_stressed_return": str(
+                        result.backtest.robustness_stressed_return
+                    ),
+                }
+            )
+            return common
+        common.update(
+            {
+                "reconciliation_healthy": result.reconciliation.healthy,
+                "status": result.paper_order.status.value,
+            }
+        )
+        return common
+
+
 class _OfflinePreflight:
     def run(self, broker: str) -> PreflightReport:
         normalized = "ccxt-spot" if broker == "ccxt" else broker
@@ -618,7 +705,13 @@ def _default_dashboard(broker: str) -> DashboardStatus:
 
 
 def _default_container() -> ServiceContainer:
-    return ServiceContainer(preflight=_OfflinePreflight(), dashboard=_default_dashboard)
+    return ServiceContainer(
+        research=_FixtureWorkflowService("research"),
+        backtest=_FixtureWorkflowService("backtest"),
+        paper=_FixtureWorkflowService("paper-run"),
+        preflight=_OfflinePreflight(),
+        dashboard=_default_dashboard,
+    )
 
 
 def build_app(

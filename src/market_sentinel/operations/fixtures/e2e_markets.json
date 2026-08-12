@@ -1,0 +1,193 @@
+{
+  "india": {
+    "instrument": {
+      "symbol": "RELIANCE",
+      "venue": "groww",
+      "asset_class": "equity",
+      "quote_currency": "INR",
+      "timezone": "Asia/Kolkata",
+      "price_tick": "0.0001",
+      "quantity_step": "1",
+      "minimum_notional": "0.5",
+      "session_calendar": "NSE"
+    },
+    "broker_capabilities": {
+      "broker": "groww",
+      "supported_asset_classes": ["equity"],
+      "supported_order_types": ["market", "limit", "stop", "stop_limit"],
+      "supports_fractional_quantity": false,
+      "supports_notional_orders": false,
+      "supports_partial_fills": true,
+      "supports_shorting": false,
+      "supports_leverage": false,
+      "supports_derivatives": false,
+      "supports_cancel": true,
+      "is_paper": false
+    },
+    "account": {
+      "currency": "INR",
+      "cash": "10",
+      "equity": "10",
+      "peak_equity": "10",
+      "gross_exposure": "0",
+      "daily_pnl": "0",
+      "realized_pnl": "0",
+      "positions": []
+    },
+    "strategy": {
+      "kind": "opening_range_vwap",
+      "session_start": "09:15:00",
+      "session_end": "15:30:00",
+      "opening_range_bars": 3,
+      "spread_bps": "4"
+    },
+    "research": {
+      "thesis": "The sanitized price prefix shows a liquid range breakout.",
+      "bear_case": "The breakout can reverse after the point-in-time cutoff.",
+      "catalysts": ["fixture range expansion"],
+      "risks": ["fixture-only evidence", "market reversal"],
+      "confidence": "0.55",
+      "evidence_uri": "https://fixtures.invalid/india/range-observation",
+      "evidence_title": "Sanitized India range observation"
+    },
+    "bars": [
+      {"at": "2026-08-10T09:15:00+05:30", "open": "0.9960", "high": "0.9980", "low": "0.9940", "close": "0.9960", "volume": "1000"},
+      {"at": "2026-08-10T09:16:00+05:30", "open": "0.9960", "high": "0.9975", "low": "0.9950", "close": "0.9965", "volume": "1000"},
+      {"at": "2026-08-10T09:17:00+05:30", "open": "0.9965", "high": "0.9978", "low": "0.9955", "close": "0.9970", "volume": "1000"},
+      {"at": "2026-08-10T09:18:00+05:30", "open": "0.9980", "high": "1.0010", "low": "0.9975", "close": "1.0000", "volume": "1500"},
+      {"at": "2026-08-10T09:18:30+05:30", "open": "0.9997", "high": "1.0020", "low": "0.9980", "close": "1.0010", "volume": "1500"}
+    ]
+  },
+  "us": {
+    "instrument": {
+      "symbol": "AAPL",
+      "venue": "alpaca",
+      "asset_class": "equity",
+      "quote_currency": "USD",
+      "timezone": "America/New_York",
+      "price_tick": "0.0001",
+      "quantity_step": "0.0001",
+      "minimum_notional": "0.5",
+      "session_calendar": "NYSE"
+    },
+    "broker_capabilities": {
+      "broker": "alpaca",
+      "supported_asset_classes": ["equity"],
+      "supported_order_types": ["market", "limit", "stop", "stop_limit"],
+      "supports_fractional_quantity": true,
+      "supports_notional_orders": true,
+      "supports_partial_fills": true,
+      "supports_shorting": true,
+      "supports_leverage": false,
+      "supports_derivatives": false,
+      "supports_cancel": true,
+      "is_paper": true
+    },
+    "account": {
+      "currency": "USD",
+      "cash": "10",
+      "equity": "10",
+      "peak_equity": "10",
+      "gross_exposure": "0",
+      "daily_pnl": "0",
+      "realized_pnl": "0",
+      "positions": []
+    },
+    "strategy": {
+      "kind": "opening_range_vwap",
+      "session_start": "09:30:00",
+      "session_end": "16:00:00",
+      "opening_range_bars": 3,
+      "spread_bps": "4"
+    },
+    "research": {
+      "thesis": "The sanitized price prefix shows a liquid range breakout.",
+      "bear_case": "The breakout can reverse after the point-in-time cutoff.",
+      "catalysts": ["fixture range expansion"],
+      "risks": ["fixture-only evidence", "market reversal"],
+      "confidence": "0.55",
+      "evidence_uri": "https://fixtures.invalid/us/range-observation",
+      "evidence_title": "Sanitized US range observation"
+    },
+    "bars": [
+      {"at": "2026-08-10T09:30:00-04:00", "open": "0.9960", "high": "0.9980", "low": "0.9940", "close": "0.9960", "volume": "1000"},
+      {"at": "2026-08-10T09:31:00-04:00", "open": "0.9960", "high": "0.9975", "low": "0.9950", "close": "0.9965", "volume": "1000"},
+      {"at": "2026-08-10T09:32:00-04:00", "open": "0.9965", "high": "0.9978", "low": "0.9955", "close": "0.9970", "volume": "1000"},
+      {"at": "2026-08-10T09:33:00-04:00", "open": "0.9980", "high": "1.0010", "low": "0.9975", "close": "1.0000", "volume": "1500"},
+      {"at": "2026-08-10T09:33:30-04:00", "open": "0.9997", "high": "1.0020", "low": "0.9980", "close": "1.0010", "volume": "1500"}
+    ]
+  },
+  "crypto": {
+    "instrument": {
+      "symbol": "BTC-USDT",
+      "venue": "ccxt-spot",
+      "asset_class": "crypto_spot",
+      "quote_currency": "USDT",
+      "timezone": "UTC",
+      "price_tick": "0.000001",
+      "quantity_step": "0.000001",
+      "minimum_notional": "0.5",
+      "session_calendar": null
+    },
+    "broker_capabilities": {
+      "broker": "ccxt-spot",
+      "supported_asset_classes": ["crypto_spot"],
+      "supported_order_types": ["market", "limit"],
+      "supports_fractional_quantity": true,
+      "supports_notional_orders": false,
+      "supports_partial_fills": true,
+      "supports_shorting": false,
+      "supports_leverage": false,
+      "supports_derivatives": false,
+      "supports_cancel": false,
+      "is_paper": true
+    },
+    "account": {
+      "currency": "USDT",
+      "cash": "10",
+      "equity": "10",
+      "peak_equity": "10",
+      "gross_exposure": "0",
+      "daily_pnl": "0",
+      "realized_pnl": "0",
+      "positions": []
+    },
+    "strategy": {
+      "kind": "crypto_volatility_breakout",
+      "spread_bps": "8"
+    },
+    "research": {
+      "thesis": "The sanitized spot prefix shows a bounded volatility breakout.",
+      "bear_case": "The spot breakout can reverse after the point-in-time cutoff.",
+      "catalysts": ["fixture volatility expansion"],
+      "risks": ["fixture-only evidence", "continuous-market volatility"],
+      "confidence": "0.52",
+      "evidence_uri": "https://fixtures.invalid/crypto/spot-observation",
+      "evidence_title": "Sanitized crypto spot observation"
+    },
+    "bars": [
+      {"at": "2026-08-10T00:00:00+00:00", "open": "0.899", "high": "0.901", "low": "0.897", "close": "0.900", "volume": "1000"},
+      {"at": "2026-08-10T00:01:00+00:00", "open": "0.904", "high": "0.906", "low": "0.902", "close": "0.905", "volume": "1000"},
+      {"at": "2026-08-10T00:02:00+00:00", "open": "0.909", "high": "0.911", "low": "0.907", "close": "0.910", "volume": "1000"},
+      {"at": "2026-08-10T00:03:00+00:00", "open": "0.914", "high": "0.916", "low": "0.912", "close": "0.915", "volume": "1000"},
+      {"at": "2026-08-10T00:04:00+00:00", "open": "0.919", "high": "0.921", "low": "0.917", "close": "0.920", "volume": "1000"},
+      {"at": "2026-08-10T00:05:00+00:00", "open": "0.924", "high": "0.926", "low": "0.922", "close": "0.925", "volume": "1000"},
+      {"at": "2026-08-10T00:06:00+00:00", "open": "0.929", "high": "0.931", "low": "0.927", "close": "0.930", "volume": "1000"},
+      {"at": "2026-08-10T00:07:00+00:00", "open": "0.934", "high": "0.936", "low": "0.932", "close": "0.935", "volume": "1000"},
+      {"at": "2026-08-10T00:08:00+00:00", "open": "0.939", "high": "0.941", "low": "0.937", "close": "0.940", "volume": "1000"},
+      {"at": "2026-08-10T00:09:00+00:00", "open": "0.944", "high": "0.946", "low": "0.942", "close": "0.945", "volume": "1000"},
+      {"at": "2026-08-10T00:10:00+00:00", "open": "0.949", "high": "0.951", "low": "0.947", "close": "0.950", "volume": "1000"},
+      {"at": "2026-08-10T00:11:00+00:00", "open": "0.954", "high": "0.956", "low": "0.952", "close": "0.955", "volume": "1000"},
+      {"at": "2026-08-10T00:12:00+00:00", "open": "0.959", "high": "0.961", "low": "0.957", "close": "0.960", "volume": "1000"},
+      {"at": "2026-08-10T00:13:00+00:00", "open": "0.964", "high": "0.966", "low": "0.962", "close": "0.965", "volume": "1000"},
+      {"at": "2026-08-10T00:14:00+00:00", "open": "0.969", "high": "0.971", "low": "0.967", "close": "0.970", "volume": "1000"},
+      {"at": "2026-08-10T00:15:00+00:00", "open": "0.974", "high": "0.976", "low": "0.972", "close": "0.975", "volume": "1000"},
+      {"at": "2026-08-10T00:16:00+00:00", "open": "0.979", "high": "0.981", "low": "0.977", "close": "0.980", "volume": "1000"},
+      {"at": "2026-08-10T00:17:00+00:00", "open": "0.984", "high": "0.986", "low": "0.982", "close": "0.985", "volume": "1000"},
+      {"at": "2026-08-10T00:18:00+00:00", "open": "0.989", "high": "0.991", "low": "0.987", "close": "0.990", "volume": "1000"},
+      {"at": "2026-08-10T00:19:00+00:00", "open": "0.994", "high": "0.996", "low": "0.992", "close": "0.995", "volume": "1000"},
+      {"at": "2026-08-10T00:20:00+00:00", "open": "0.999", "high": "1.001", "low": "0.997", "close": "1.000", "volume": "1500"},
+      {"at": "2026-08-10T00:20:30+00:00", "open": "0.9997", "high": "1.002", "low": "0.998", "close": "1.001", "volume": "1500"}
+    ]
+  }
+}
