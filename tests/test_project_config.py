@@ -287,7 +287,7 @@ def test_required_operator_documents_exist_and_reject_profit_promises() -> None:
     readme = texts[0].lower()
     security = texts[1].lower()
     assert "generated with python 3.13" in readme
-    assert "python 3.12 lock installation remains unverified" in readme
+    assert "python 3.12 lock installation was verified" in readme
     assert "security tab" in security
     assert "report a vulnerability" in security
     assert "private contact method" in security
@@ -302,20 +302,22 @@ def test_required_operator_documents_exist_and_reject_profit_promises() -> None:
 
 
 def test_completion_audit_has_one_evidence_row_per_acceptance_criterion() -> None:
-    """Only the unexecuted GitHub evidence must remain visibly incomplete."""
+    """A completed CI criterion must cite the exact successful public run."""
     text = (
         ROOT / "docs" / "verification" / "2026-08-09-completion-audit.md"
     ).read_text(encoding="utf-8")
     rows = [line for line in text.splitlines() if re.match(r"\|\s*(?:10|[1-9])\s*\|", line)]
     assert len(rows) == 10
     statuses: dict[int, str] = {}
+    evidence_rows: dict[int, str] = {}
     for row in rows:
         cells = [cell.strip() for cell in row.strip("|").split("|")]
         statuses[int(cells[0])] = cells[-1]
+        evidence_rows[int(cells[0])] = row
         assert chr(96) in row
-    assert statuses[9] == "Incomplete"
-    assert all(
-        status == "Complete"
-        for criterion, status in statuses.items()
-        if criterion != 9
+    assert all(status == "Complete" for status in statuses.values())
+    assert (
+        "https://github.com/Brij-9/omnimarket-sentinel/actions/runs/31631595574"
+        in evidence_rows[9]
     )
+    assert "ea1765be95fdd9a7254e9c6c98f7f4893b5c2d35" in evidence_rows[9]

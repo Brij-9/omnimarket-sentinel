@@ -15,22 +15,22 @@ suitable for an account, or ready for live money.
 | 6 | Paper orders execute end to end and reconcile with the internal ledger | `tests/e2e/test_india_pipeline.py`; `tests/e2e/test_us_pipeline.py::test_us_fixture_reconciliation_detects_independent_broker_position_mismatch`; `tests/e2e/test_crypto_pipeline.py` | Each deterministic order reaches `filled`; reconciliation compares independent PaperBroker account state with the ledger and detects injected position drift | Complete |
 | 7 | Live submission is impossible without passing preflight and exact unexpired confirmation | `tests/e2e/test_live_lock.py`; `tests/execution/test_live.py`; `tests/execution/test_approval.py`; `tests/execution/test_safety_authority.py` | No-credential E2E rejects `PREFLIGHT_NOT_READY` with zero submit/query calls; exact authority gates have unit coverage | Complete |
 | 8 | Stale data, provider loss, duplicate requests, partial fills, and position mismatch fail closed | `tests/e2e/test_india_pipeline.py::test_fixture_runner_enforces_no_lookahead_freshness_and_request_identity`; `tests/e2e/test_us_pipeline.py::test_us_fixture_reconciliation_detects_independent_broker_position_mismatch`; `tests/data/test_freshness.py`; `tests/execution/test_paper.py`; `tests/execution/test_reconcile.py` | Lookahead, naive timestamps, stale and duplicate requests reject; broker position drift produces unhealthy reconciliation and activates the kill switch | Complete |
-| 9 | GitHub Actions runs lint, type, unit, fixture integration, security, and package gates | `tests/test_project_config.py`; `.github/workflows/ci.yml` | Required jobs and safety settings are statically parsed, but no post-upload GitHub Actions run has executed them | Incomplete |
+| 9 | GitHub Actions runs lint, type, unit, fixture integration, security, and package gates | `tests/test_project_config.py`; `.github/workflows/ci.yml`; [GitHub Actions run `31631595574`](https://github.com/Brij-9/omnimarket-sentinel/actions/runs/31631595574) | Python 3.12 run at commit `ea1765be95fdd9a7254e9c6c98f7f4893b5c2d35` completed `lint-type`, `unit`, `fixture-integration`, `security`, and `package` successfully | Complete |
 | 10 | Documentation explains setup, paper operation, live gates, limitations, and no profit assurance | `tests/test_project_config.py::test_required_operator_documents_exist_and_reject_profit_promises`; `README.md`; `SECURITY.md`; `docs/operations/` | Required operator boundaries and the 100,000x warning are present | Complete |
 
 ## Verification commands
 
 The implementing task records fresh command exits and counts in its ignored Task 16
-report. The controller must rerun them before release; this file is not evidence for
-a command that has not run. Required commands are:
+report. The linked public GitHub Actions run provides the Python 3.12 release evidence.
+Required local commands are:
 
 - `python -m pytest tests/e2e tests/test_project_config.py -v`
 - `python -m ruff check .`
 - `python -m mypy --strict src/market_sentinel`
 - `python -m pytest -v --cov=market_sentinel --cov-report=term-missing`
-- `python -m pip_audit -r requirements.lock` (expected to report the exact VCS
-  limitation; the workflow is configured to audit the hash-verifiable filtered lock
-  and separately verify the exact commit, but that workflow has not run)
+- `python -m pip_audit -r requirements.lock` (the VCS line cannot be audited under
+  `--require-hashes`; the successful workflow audited the hash-verifiable filtered
+  lock and separately verified the exact VCS commit boundary)
 - `python -m build`
 - clean-environment wheel import and hidden `status` smoke
 - `git diff --check`
@@ -39,10 +39,9 @@ a command that has not run. Required commands are:
 
 - India, US, and crypto fixtures are representative and sanitized. Other markets
   require explicit data, calendar, broker, cost, instrument, and validation adapters.
-- Criterion 9 remains incomplete until the post-upload GitHub Actions jobs run
-  successfully.
 - The checked-in lock was generated with Python 3.13. Python 3.12 lock installation
-  remains unverified; the Python 3.12 workflow is a pending validation gate.
+  was verified by public run `31631595574`; generation provenance remains Python
+  3.13 until a future lock regeneration.
 - The Tauric-style e2e packet never runs a graph. Byte-identical LLM output is not
   claimed. The exact VCS pin is not compatible with pip `--require-hashes`.
 - No fixture predicts future performance. Turning USD 10 into USD 1,000,000 in one

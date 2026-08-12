@@ -47,11 +47,12 @@ research environment, `python -m pip install -e ".[dev,research]"`.
 
 ### Lock-file boundary
 
-The checked-in lock was generated with Python 3.13. The intended project runtime
-and CI runtime are Python 3.12, but Python 3.12 lock installation remains unverified
-until the lock is regenerated under Python 3.12 or the post-upload Python 3.12
-GitHub Actions jobs complete successfully. A workflow definition is not evidence
-that those jobs passed.
+The checked-in lock was generated with Python 3.13.
+Python 3.12 lock installation was verified by successful
+[GitHub Actions run 31631595574](https://github.com/Brij-9/omnimarket-sentinel/actions/runs/31631595574)
+at commit `ea1765be95fdd9a7254e9c6c98f7f4893b5c2d35`: all hash-verifiable
+entries installed with `--require-hashes`, and the separately reviewed Tauric VCS
+dependency was verified at its exact commit boundary.
 
 `requirements.lock` hash-pins index artifacts and contains this exact 40-character
 Tauric VCS pin:
